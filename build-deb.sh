@@ -23,7 +23,7 @@ cp -r DEBIAN/ $folder_name
 bin_dir="$folder_name/usr/bin"
 mkdir -p $bin_dir
 if [ "$arch" = "$(go env GOARCH)" ]; then
-  go build -ldflags "-linkmode external -extldflags -static" -o ucmon cmd/ucmon/main.go
+  go build -o ucmon cmd/ucmon/main.go
 else
   CGO_ENABLED=0 GOARCH=$goarch go build -ldflags "-s -w" -o ucmon cmd/ucmon/main.go
 fi
