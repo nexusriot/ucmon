@@ -519,18 +519,48 @@ func (m Model) viewCPU() string {
 	b.WriteString(RenderBarWithLabel("", m.cpuSnap.TotalPercent, min(40, chartW)) + "\n")
 	b.WriteString(Spark(m.cpuHist, min(chartW, 60)) + "\n\n")
 
-	// Per-core
+	// Per-core (multi-column layout for many cores)
 	if len(m.cpuSnap.PerCorePercent) > 0 {
 		b.WriteString(titleStyle.Render("Per Core") + "\n")
-		coreChartW := min(30, chartW/2)
-		for i, pct := range m.cpuSnap.PerCorePercent {
-			label := fmt.Sprintf("Core %d", i)
-			bar := RenderBarWithLabel(label, pct, coreChartW)
-			spark := ""
-			if i < len(m.coreHists) {
-				spark = Spark(m.coreHists[i], min(20, chartW/3))
+		nCores := len(m.cpuSnap.PerCorePercent)
+
+		// Determine label width based on core count
+		labelW := 8 // "Core XX "
+		if nCores >= 100 {
+			labelW = 10
+		}
+
+		// Each column: "  " + label + bar + " " + spark
+		sparkW := min(16, chartW/4)
+		coreBarW := min(24, chartW/3)
+		colW := 2 + labelW + coreBarW + 1 + sparkW
+
+		// Calculate columns that fit the available width
+		cols := max(1, w/colW)
+		// Cap at 4 columns max for readability
+		if cols > 4 {
+			cols = 4
+		}
+
+		rows := (nCores + cols - 1) / cols
+
+		for r := 0; r < rows; r++ {
+			var line strings.Builder
+			for c := 0; c < cols; c++ {
+				i := c*rows + r
+				if i >= nCores {
+					break
+				}
+				pct := m.cpuSnap.PerCorePercent[i]
+				label := fmt.Sprintf("Core %-*d", labelW-5, i)
+				bar := RenderBarWithLabel("", pct, coreBarW)
+				spark := ""
+				if i < len(m.coreHists) {
+					spark = Spark(m.coreHists[i], sparkW)
+				}
+				line.WriteString(fmt.Sprintf("  %-*s%s %s", labelW, label, bar, spark))
 			}
-			b.WriteString(fmt.Sprintf("  %-8s %s %s\n", label, bar, spark))
+			b.WriteString(line.String() + "\n")
 		}
 		b.WriteString("\n")
 	}
