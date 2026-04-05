@@ -55,9 +55,10 @@ type Model struct {
 	coreHists   [][]float64
 
 	// Processes tab
-	procs      []probe.ProcInfo
-	procsVP    viewport.Model
-	procsText  string
+	procs        []probe.ProcInfo
+	procsVP      viewport.Model
+	procsHeader  string
+	procsText    string
 	procsSearch    textinput.Model
 	procsSearching bool
 	procsQuery     string
@@ -68,16 +69,18 @@ type Model struct {
 	diskSampler *probe.DiskSampler
 
 	// Network tab
-	netSampler  *probe.NetSampler
-	netSnap     probe.NetSnapshot
-	conns       []probe.ConnInfo
-	netVP       viewport.Model
-	netText     string
-	netSearch    textinput.Model
-	netSearching bool
-	netQuery     string
-	rxHist      map[string][]float64
-	txHist      map[string][]float64
+	netSampler    *probe.NetSampler
+	netSnap       probe.NetSnapshot
+	conns         []probe.ConnInfo
+	netVP         viewport.Model
+	netHeader     string
+	netText       string
+	netSearch     textinput.Model
+	netSearching  bool
+	netQuery      string
+	rxHist        map[string][]float64
+	txHist        map[string][]float64
+	netIfaceSel   int // selected interface index in upIfaces list (-1 = none)
 
 	tickCount int
 }
@@ -107,6 +110,7 @@ func NewModel() Model {
 		netSearch:   ns,
 		rxHist:      map[string][]float64{},
 		txHist:      map[string][]float64{},
+		netIfaceSel: -1,
 	}
 }
 
@@ -176,6 +180,39 @@ func (m Model) bodyHeight() int {
 	return max(8, m.h-headerH-footerH-2)
 }
 
+// upIfaces returns only the active interfaces.
+func (m Model) upIfaces() []probe.IfaceInfo {
+	var out []probe.IfaceInfo
+	for _, ii := range m.netSnap.Ifaces {
+		if ii.IsUp {
+			out = append(out, ii)
+		}
+	}
+	return out
+}
+
+// netIfaceLines returns the number of lines the interface summary takes.
+func (m Model) netIfaceLines() int {
+	if m.netSnap.TakenAt.IsZero() {
+		return 3 // "Interfaces …" + "Collecting…" + blank
+	}
+	up := m.upIfaces()
+	n := 2 // total traffic line + blank
+	n += len(up) // one line per interface
+	if m.netIfaceSel >= 0 && m.netIfaceSel < len(up) {
+		n += 2 // RX + TX sparklines for selected
+	}
+	n++ // blank line after
+	return n
+}
+
+func (m Model) calcNetVPHeight() int {
+	bodyH := m.bodyHeight()
+	// iface lines + search line + blank + header (2 lines) + box border/padding (4)
+	overhead := m.netIfaceLines() + 1 + 1 + 2 + 4
+	return max(3, bodyH-overhead)
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
@@ -185,10 +222,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		vpW := min(m.w-2, 140)
 		m.procsVP.Width = max(10, vpW-2)
-		m.procsVP.Height = max(5, bodyH-4)
+		m.procsVP.Height = max(5, bodyH-9) // account for search + header + separator above viewport
 		m.netVP.Width = max(10, vpW-2)
-		m.netVP.Height = max(5, bodyH-4)
+		m.netVP.Height = m.calcNetVPHeight()
 
+		m.procsHeader = m.buildProcsHeader()
+		m.netHeader = m.buildNetHeader()
 		m.procsVP.SetContent(hardClipLinesToWidth(m.procsText, m.procsVP.Width))
 		m.netVP.SetContent(hardClipLinesToWidth(m.netText, m.netVP.Width))
 		return m, nil
@@ -234,6 +273,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case procMsg:
 		m.procs = msg
+		m.procsHeader = m.buildProcsHeader()
 		m.procsText = m.renderProcsText()
 		m.procsVP.SetContent(hardClipLinesToWidth(m.procsText, m.procsVP.Width))
 		return m, nil
@@ -254,10 +294,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.txHist[ii.Name] = append(m.txHist[ii.Name], ii.TxBps)
 			m.txHist[ii.Name] = probe.ClampHistory(m.txHist[ii.Name], 200)
 		}
+		// Clamp selection if interfaces changed
+		up := m.upIfaces()
+		if m.netIfaceSel >= len(up) {
+			m.netIfaceSel = len(up) - 1
+		}
+		m.netVP.Height = m.calcNetVPHeight()
 		return m, nil
 
 	case connMsg:
 		m.conns = msg
+		m.netHeader = m.buildNetHeader()
 		m.netText = m.renderNetText()
 		m.netVP.SetContent(hardClipLinesToWidth(m.netText, m.netVP.Width))
 		return m, nil
@@ -299,6 +346,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.netSearching = true
 				m.netSearch.Focus()
 				m.netSearch.SetValue(m.netQuery)
+				return m, nil
+			}
+		case "j":
+			if m.activeTab == tabNet && !m.netSearching {
+				up := m.upIfaces()
+				if len(up) > 0 {
+					m.netIfaceSel++
+					if m.netIfaceSel >= len(up) {
+						m.netIfaceSel = -1
+					}
+					m.netVP.Height = m.calcNetVPHeight()
+				}
+				return m, nil
+			}
+		case "k":
+			if m.activeTab == tabNet && !m.netSearching {
+				up := m.upIfaces()
+				if len(up) > 0 {
+					m.netIfaceSel--
+					if m.netIfaceSel < -1 {
+						m.netIfaceSel = len(up) - 1
+					}
+					m.netVP.Height = m.calcNetVPHeight()
+				}
 				return m, nil
 			}
 		case "ctrl+u":
@@ -403,7 +474,11 @@ func (m Model) View() string {
 		body = m.viewNet()
 	}
 
-	footer := subtleStyle.Render("Keys: tab/←/→ switch • 1-4 jump • / search • ctrl+u clear • ctrl+c quit")
+	footerText := "Keys: tab/←/→ switch • 1-4 jump • / search • ctrl+u clear • ctrl+c quit"
+	if m.activeTab == tabNet && !m.netSearching {
+		footerText = "Keys: tab/←/→ switch • 1-4 jump • j/k iface • / search • ctrl+u clear • ctrl+c quit"
+	}
+	footer := subtleStyle.Render(footerText)
 	if m.err != nil {
 		footer = errStyle.Render("Error: " + m.err.Error())
 	}
@@ -606,8 +681,33 @@ func (m Model) viewProcs() string {
 		searchLine = m.procsSearch.View()
 	}
 
-	content := searchLine + "\n\n" + m.procsVP.View()
+	content := searchLine + "\n\n" + m.procsHeader + "\n" + m.procsVP.View()
 	return boxStyle.Width(procsW).Height(procsH).Render(content)
+}
+
+func (m Model) buildProcsHeader() string {
+	w := m.procsVP.Width
+	if w <= 0 {
+		w = 120
+	}
+
+	colPID, colUser, colCPU, colMem, colRSS, colStat := 7, 10, 7, 7, 10, 3
+	colName := max(12, w-colPID-colUser-colCPU-colMem-colRSS-colStat-14)
+	if colName > 30 {
+		colName = 30
+	}
+
+	h := fmt.Sprintf("%s  %s  %s  %s  %s  %s  %s",
+		padRight("PID", colPID),
+		padRight("USER", colUser),
+		padRight("NAME", colName),
+		padRight("CPU%", colCPU),
+		padRight("MEM%", colMem),
+		padRight("RSS", colRSS),
+		padRight("S", colStat),
+	)
+	sep := strings.Repeat("─", min(w, colPID+colUser+colName+colCPU+colMem+colRSS+colStat+12))
+	return "Processes (sorted by CPU)  Scroll: ↑↓ PgUp/PgDn\n\n" + h + "\n" + sep
 }
 
 func (m Model) renderProcsText() string {
@@ -618,31 +718,11 @@ func (m Model) renderProcsText() string {
 		w = 120
 	}
 
-	colPID := 7
-	colUser := 10
-	colCPU := 7
-	colMem := 7
-	colRSS := 10
-	colStat := 3
+	colPID, colUser, colCPU, colMem, colRSS, colStat := 7, 10, 7, 7, 10, 3
 	colName := max(12, w-colPID-colUser-colCPU-colMem-colRSS-colStat-14)
 	if colName > 30 {
 		colName = 30
 	}
-
-	b.WriteString("Processes (sorted by CPU)\n")
-	b.WriteString("Scroll: ↑↓ PgUp/PgDn\n\n")
-
-	h := fmt.Sprintf("%s  %s  %s  %s  %s  %s  %s\n",
-		padRight("PID", colPID),
-		padRight("USER", colUser),
-		padRight("NAME", colName),
-		padRight("CPU%", colCPU),
-		padRight("MEM%", colMem),
-		padRight("RSS", colRSS),
-		padRight("S", colStat),
-	)
-	b.WriteString(h)
-	b.WriteString(strings.Repeat("─", min(w, colPID+colUser+colName+colCPU+colMem+colRSS+colStat+12)) + "\n")
 
 	if len(m.procs) == 0 {
 		b.WriteString("No data (yet)…\n")
@@ -760,36 +840,66 @@ func (m Model) viewNet() string {
 
 	var b strings.Builder
 
-	// Interface summary with sparklines
-	b.WriteString(titleStyle.Render("Interfaces") + "\n\n")
-
 	if m.netSnap.TakenAt.IsZero() {
-		b.WriteString("Collecting network data…\n\n")
+		b.WriteString(titleStyle.Render("Interfaces") + "  Collecting network data…\n\n")
 	} else {
+		up := m.upIfaces()
 		chartW := min(25, w/4)
-		for _, ii := range m.netSnap.Ifaces {
-			if !ii.IsUp {
-				continue
+
+		// Aggregate traffic summary
+		var totalRx, totalTx float64
+		for _, ii := range up {
+			totalRx += ii.RxBps
+			totalTx += ii.TxBps
+		}
+		b.WriteString(fmt.Sprintf("%s  RX: %s  TX: %s  (%d ifaces, j/k select)\n\n",
+			titleStyle.Render("Interfaces"),
+			okStyle.Render(probe.HumanBytesPerSec(totalRx)),
+			okStyle.Render(probe.HumanBytesPerSec(totalTx)),
+			len(up),
+		))
+
+		// Compact interface list: one line each, selected gets expanded
+		for i, ii := range up {
+			selected := i == m.netIfaceSel
+			marker := "  "
+			nameStyle := subtleStyle
+			if selected {
+				marker = "▸ "
+				nameStyle = okStyle
 			}
-			b.WriteString(fmt.Sprintf("  %s  %s",
-				okStyle.Render(padRight(ii.Name, 12)),
-				subtleStyle.Render(padRight(ii.Hardware, 18)),
-			))
+
+			// Highlight interfaces with active traffic
+			rxS := probe.HumanBytesPerSec(ii.RxBps)
+			txS := probe.HumanBytesPerSec(ii.TxBps)
+			rateStyle := subtleStyle
+			if ii.RxBps > 0 || ii.TxBps > 0 {
+				rateStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+			}
+
+			addr := ""
 			if len(ii.Addrs) > 0 {
-				b.WriteString(subtleStyle.Render(trunc(ii.Addrs[0], 20)))
+				addr = trunc(ii.Addrs[0], 22)
 			}
-			b.WriteString("\n")
-			rxSpark := Spark(m.rxHist[ii.Name], chartW)
-			txSpark := Spark(m.txHist[ii.Name], chartW)
-			b.WriteString(fmt.Sprintf("    RX: %-12s %s\n", probe.HumanBytesPerSec(ii.RxBps), rxSpark))
-			b.WriteString(fmt.Sprintf("    TX: %-12s %s\n", probe.HumanBytesPerSec(ii.TxBps), txSpark))
+
+			b.WriteString(fmt.Sprintf("%s%s  %s  %s  %s\n",
+				marker,
+				nameStyle.Render(padRight(ii.Name, 16)),
+				subtleStyle.Render(padRight(addr, 22)),
+				rateStyle.Render(fmt.Sprintf("RX:%-10s", rxS)),
+				rateStyle.Render(fmt.Sprintf("TX:%-10s", txS)),
+			))
+
+			// Expanded detail for selected interface
+			if selected {
+				rxSpark := Spark(m.rxHist[ii.Name], chartW)
+				txSpark := Spark(m.txHist[ii.Name], chartW)
+				b.WriteString(fmt.Sprintf("    RX: %-12s %s\n", rxS, rxSpark))
+				b.WriteString(fmt.Sprintf("    TX: %-12s %s\n", txS, txSpark))
+			}
 		}
 		b.WriteString("\n")
 	}
-
-	// Connections section uses viewport
-	netW := min(m.w-2, 140)
-	netH := max(5, bodyH-lipgloss.Height(b.String())-4)
 
 	searchLine := subtleStyle.Render("Press / to search connections")
 	if m.netQuery != "" {
@@ -799,11 +909,35 @@ func (m Model) viewNet() string {
 		searchLine = m.netSearch.View()
 	}
 
-	// Combine iface summary + connections in one box
-	connView := searchLine + "\n" + m.netVP.View()
+	b.WriteString(searchLine + "\n\n")
+	b.WriteString(m.netHeader + "\n")
+	b.WriteString(m.netVP.View())
 
-	content := b.String() + boxStyle.Width(netW-4).Height(netH).Render(connView)
-	return boxStyle.Width(w).Height(bodyH).Render(content)
+	return boxStyle.Width(w).Height(bodyH).Render(b.String())
+}
+
+func (m Model) buildNetHeader() string {
+	w := m.netVP.Width
+	if w <= 0 {
+		w = 120
+	}
+
+	colProto := 4
+	colLocal := min(28, max(16, w/4))
+	colRemote := min(28, max(16, w/4))
+	colStatus := 12
+	colPID := 7
+
+	h := fmt.Sprintf("%s  %s  %s  %s  %s  %s",
+		padRight("PR", colProto),
+		padRight("LOCAL", colLocal),
+		padRight("REMOTE", colRemote),
+		padRight("STATUS", colStatus),
+		padRight("PID", colPID),
+		"PROCESS",
+	)
+	sep := strings.Repeat("─", min(w, colProto+colLocal+colRemote+colStatus+colPID+20))
+	return h + "\n" + sep
 }
 
 func (m Model) renderNetText() string {
@@ -819,16 +953,6 @@ func (m Model) renderNetText() string {
 	colRemote := min(28, max(16, w/4))
 	colStatus := 12
 	colPID := 7
-
-	b.WriteString(fmt.Sprintf("%s  %s  %s  %s  %s  %s\n",
-		padRight("PR", colProto),
-		padRight("LOCAL", colLocal),
-		padRight("REMOTE", colRemote),
-		padRight("STATUS", colStatus),
-		padRight("PID", colPID),
-		"PROCESS",
-	))
-	b.WriteString(strings.Repeat("─", min(w, colProto+colLocal+colRemote+colStatus+colPID+20)) + "\n")
 
 	if len(m.conns) == 0 {
 		b.WriteString("No data (yet)…\n")
