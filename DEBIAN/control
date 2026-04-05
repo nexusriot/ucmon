@@ -1,0 +1,6 @@
+Package: ucmon
+Version: _version_
+Architecture: amd64
+Maintainer: Vladislav Ananev <nexus.riot@gmail.com>
+Description: TUI system monitor for uConsole/Raspberry Pi
+Installed-Size: 8500
