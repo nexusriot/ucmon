@@ -1,3 +1,4 @@
 build/
-#ucmon
+
 *.deb
+cmd/ucmon/ucmon
