@@ -13,15 +13,21 @@ import (
 	"github.com/nexusriot/ucmon/internal/probe"
 )
 
-const version = "0.1.0"
+const version = "0.1.9"
 
 type tab int
 
 const (
-	tabCPU  tab = iota // CPU load & temperatures
-	tabProc            // processes
-	tabDisk            // disk usage
-	tabNet             // network
+	tabCPU   tab = iota // CPU load & temperatures
+	tabMem              // memory & swap
+	tabProc             // processes
+	tabDisk             // disk usage
+	tabNet              // network
+	tabPower            // battery, throttle, load
+	numTabs
+)
+
+const (
 	headerH = 1
 	footerH = 1
 )
@@ -29,6 +35,7 @@ const (
 // messages
 type tickMsg time.Time
 type cpuMsg probe.CPUSnapshot
+type memMsg probe.MemSnapshot
 type procMsg []probe.ProcInfo
 type diskMsg struct {
 	disks []probe.DiskInfo
@@ -36,6 +43,7 @@ type diskMsg struct {
 }
 type netMsg probe.NetSnapshot
 type connMsg []probe.ConnInfo
+type powerMsg probe.PowerSnapshot
 type errMsg struct{ error }
 
 func tickEvery(d time.Duration) tea.Cmd {
@@ -49,38 +57,48 @@ type Model struct {
 	err       error
 
 	// CPU tab
-	cpuSnap     probe.CPUSnapshot
-	cpuHist     []float64 // total CPU history
-	tempHist    map[string][]float64
-	coreHists   [][]float64
+	cpuSnap   probe.CPUSnapshot
+	cpuHist   []float64 // total CPU history
+	tempHist  map[string][]float64
+	coreHists [][]float64
+
+	// Memory tab
+	memSnap  probe.MemSnapshot
+	memHist  []float64 // RAM used %
+	swapHist []float64 // swap used %
+
+	// Power tab
+	powerSnap probe.PowerSnapshot
+	battHist  []float64 // battery capacity %
+	loadHist  []float64 // 1-min load average
 
 	// Processes tab
-	procs        []probe.ProcInfo
-	procsVP      viewport.Model
-	procsHeader  string
-	procsText    string
+	procs          []probe.ProcInfo
+	procsVP        viewport.Model
+	procsHeader    string
+	procsText      string
 	procsSearch    textinput.Model
 	procsSearching bool
 	procsQuery     string
 
 	// Disk tab
-	disks   []probe.DiskInfo
-	diskIOs []probe.DiskIOInfo
+	disks       []probe.DiskInfo
+	diskIOs     []probe.DiskIOInfo
 	diskSampler *probe.DiskSampler
 
 	// Network tab
-	netSampler    *probe.NetSampler
-	netSnap       probe.NetSnapshot
-	conns         []probe.ConnInfo
-	netVP         viewport.Model
-	netHeader     string
-	netText       string
-	netSearch     textinput.Model
-	netSearching  bool
-	netQuery      string
-	rxHist        map[string][]float64
-	txHist        map[string][]float64
-	netIfaceSel   int // selected interface index in upIfaces list (-1 = none)
+	netSampler   *probe.NetSampler
+	netSnap      probe.NetSnapshot
+	conns        []probe.ConnInfo
+	netVP        viewport.Model
+	netHeader    string
+	netText      string
+	netSearch    textinput.Model
+	netSearching bool
+	netQuery     string
+	rxHist       map[string][]float64
+	txHist       map[string][]float64
+	netIfaceSel  int // selected interface index in upIfaces list (-1 = none)
 
 	tickCount int
 }
@@ -117,12 +135,34 @@ func NewModel() Model {
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		fetchCPUCmd(),
+		fetchMemCmd(),
 		fetchProcsCmd(),
 		m.fetchDiskCmd(),
 		fetchNetCmd(m.netSampler),
 		fetchConnsCmd(),
+		fetchPowerCmd(),
 		tickEvery(1*time.Second),
 	)
+}
+
+func fetchMemCmd() tea.Cmd {
+	return func() tea.Msg {
+		snap, err := probe.SampleMem()
+		if err != nil {
+			return errMsg{err}
+		}
+		return memMsg(snap)
+	}
+}
+
+func fetchPowerCmd() tea.Cmd {
+	return func() tea.Msg {
+		snap, err := probe.SamplePower()
+		if err != nil {
+			return errMsg{err}
+		}
+		return powerMsg(snap)
+	}
 }
 
 func fetchCPUCmd() tea.Cmd {
@@ -176,8 +216,15 @@ func fetchConnsCmd() tea.Cmd {
 	}
 }
 
+// bodyHeight is the content height of a tab's box. The total rendered frame
+// is bodyHeight + 2 (box border) + headerH + footerH, which must never exceed
+// m.h or Bubble Tea's alt-screen renderer blanks the screen on short displays.
 func (m Model) bodyHeight() int {
-	return max(8, m.h-headerH-footerH-2)
+	bh := m.h - headerH - footerH - 2
+	if bh < 1 {
+		bh = 1
+	}
+	return bh
 }
 
 // upIfaces returns only the active interfaces.
@@ -197,7 +244,7 @@ func (m Model) netIfaceLines() int {
 		return 3 // "Interfaces …" + "Collecting…" + blank
 	}
 	up := m.upIfaces()
-	n := 2 // total traffic line + blank
+	n := 2       // total traffic line + blank
 	n += len(up) // one line per interface
 	if m.netIfaceSel >= 0 && m.netIfaceSel < len(up) {
 		n += 2 // RX + TX sparklines for selected
@@ -236,13 +283,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tickCount++
 		cmds := []tea.Cmd{
 			fetchCPUCmd(),
+			fetchMemCmd(),
 			tickEvery(1 * time.Second),
 		}
 		if m.tickCount%3 == 0 {
 			cmds = append(cmds, fetchProcsCmd(), fetchConnsCmd())
 		}
 		if m.tickCount%5 == 0 {
-			cmds = append(cmds, m.fetchDiskCmd(), fetchNetCmd(m.netSampler))
+			cmds = append(cmds, m.fetchDiskCmd(), fetchNetCmd(m.netSampler), fetchPowerCmd())
 		} else {
 			cmds = append(cmds, fetchNetCmd(m.netSampler))
 		}
@@ -269,6 +317,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.tempHist[t.Label] = append(m.tempHist[t.Label], t.Temp)
 			m.tempHist[t.Label] = probe.ClampHistory(m.tempHist[t.Label], 200)
 		}
+		return m, nil
+
+	case memMsg:
+		m.memSnap = probe.MemSnapshot(msg)
+		m.memHist = append(m.memHist, m.memSnap.UsedPct)
+		m.memHist = probe.ClampHistory(m.memHist, 200)
+		if m.memSnap.SwapTotal > 0 {
+			m.swapHist = append(m.swapHist, m.memSnap.SwapUsedPct)
+			m.swapHist = probe.ClampHistory(m.swapHist, 200)
+		}
+		return m, nil
+
+	case powerMsg:
+		m.powerSnap = probe.PowerSnapshot(msg)
+		if m.powerSnap.Battery.Present && m.powerSnap.Battery.Capacity >= 0 {
+			m.battHist = append(m.battHist, float64(m.powerSnap.Battery.Capacity))
+			m.battHist = probe.ClampHistory(m.battHist, 200)
+		}
+		m.loadHist = append(m.loadHist, m.powerSnap.Load.Load1)
+		m.loadHist = probe.ClampHistory(m.loadHist, 200)
 		return m, nil
 
 	case procMsg:
@@ -318,22 +386,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			return m, tea.Quit
 		case "tab", "right":
-			m.activeTab = (m.activeTab + 1) % 4
+			m.activeTab = (m.activeTab + 1) % numTabs
 			return m, nil
 		case "shift+tab", "left":
-			m.activeTab = (m.activeTab + 3) % 4
+			m.activeTab = (m.activeTab + numTabs - 1) % numTabs
 			return m, nil
 		case "1":
 			m.activeTab = tabCPU
 			return m, nil
 		case "2":
-			m.activeTab = tabProc
+			m.activeTab = tabMem
 			return m, nil
 		case "3":
-			m.activeTab = tabDisk
+			m.activeTab = tabProc
 			return m, nil
 		case "4":
+			m.activeTab = tabDisk
+			return m, nil
+		case "5":
 			m.activeTab = tabNet
+			return m, nil
+		case "6":
+			m.activeTab = tabPower
 			return m, nil
 		case "/":
 			if m.activeTab == tabProc {
@@ -466,17 +540,21 @@ func (m Model) View() string {
 	switch m.activeTab {
 	case tabCPU:
 		body = m.viewCPU()
+	case tabMem:
+		body = m.viewMem()
 	case tabProc:
 		body = m.viewProcs()
 	case tabDisk:
 		body = m.viewDisk()
 	case tabNet:
 		body = m.viewNet()
+	case tabPower:
+		body = m.viewPower()
 	}
 
-	footerText := "Keys: tab/←/→ switch • 1-4 jump • / search • ctrl+u clear • ctrl+c quit"
+	footerText := "Keys: tab/←/→ switch • 1-6 jump • / search • ctrl+u clear • ctrl+c quit"
 	if m.activeTab == tabNet && !m.netSearching {
-		footerText = "Keys: tab/←/→ switch • 1-4 jump • j/k iface • / search • ctrl+u clear • ctrl+c quit"
+		footerText = "Keys: tab/←/→ switch • 1-6 jump • j/k iface • / search • ctrl+u clear • ctrl+c quit"
 	}
 	footer := subtleStyle.Render(footerText)
 	if m.err != nil {
@@ -492,9 +570,11 @@ func (m Model) View() string {
 func (m Model) renderHeader() string {
 	tabs := []string{
 		renderTab("1 CPU/Temp", m.activeTab == tabCPU),
-		renderTab("2 Processes", m.activeTab == tabProc),
-		renderTab("3 Disk", m.activeTab == tabDisk),
-		renderTab("4 Network", m.activeTab == tabNet),
+		renderTab("2 Memory", m.activeTab == tabMem),
+		renderTab("3 Processes", m.activeTab == tabProc),
+		renderTab("4 Disk", m.activeTab == tabDisk),
+		renderTab("5 Network", m.activeTab == tabNet),
+		renderTab("6 Power", m.activeTab == tabPower),
 	}
 
 	left := titleStyle.Render(fmt.Sprintf("ucmon %s", version)) + " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
@@ -575,7 +655,7 @@ func (m Model) viewCPU() string {
 
 	if m.cpuSnap.TakenAt.IsZero() {
 		b.WriteString("Collecting CPU data…\n")
-		return boxStyle.Width(w).Height(bodyH).Render(b.String())
+		return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
 	}
 
 	b.WriteString(fmt.Sprintf("Time: %s\n\n", m.cpuSnap.TakenAt.Format("2006-01-02 15:04:05")))
@@ -593,6 +673,21 @@ func (m Model) viewCPU() string {
 	b.WriteString(titleStyle.Render("CPU Total") + " " + cpuStyle.Render(fmt.Sprintf("%.1f%%", m.cpuSnap.TotalPercent)) + "\n")
 	b.WriteString(RenderBarWithLabel("", m.cpuSnap.TotalPercent, min(40, chartW)) + "\n")
 	b.WriteString(Spark(m.cpuHist, min(chartW, 60)) + "\n\n")
+
+	// Load average (one-line summary; full detail on Power tab)
+	if m.powerSnap.Load.CPUCount > 0 {
+		la := m.powerSnap.Load
+		lc := "42"
+		if la.Load1 >= float64(la.CPUCount) {
+			lc = "196"
+		} else if la.Load1 >= float64(la.CPUCount)*0.7 {
+			lc = "214"
+		}
+		lStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(lc))
+		b.WriteString(titleStyle.Render("Load") + " " +
+			lStyle.Render(fmt.Sprintf("%.2f", la.Load1)) + " " +
+			subtleStyle.Render(fmt.Sprintf("%.2f %.2f  (%d CPUs)", la.Load5, la.Load15, la.CPUCount)) + "\n\n")
+	}
 
 	// Per-core (multi-column layout for many cores)
 	if len(m.cpuSnap.PerCorePercent) > 0 {
@@ -664,10 +759,50 @@ func (m Model) viewCPU() string {
 		b.WriteString(subtleStyle.Render("No temperature sensors detected") + "\n")
 	}
 
-	return boxStyle.Width(w).Height(bodyH).Render(b.String())
+	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
 }
 
-// ── Tab 2: Processes ──
+// ── Tab 2: Memory ──
+
+func (m Model) viewMem() string {
+	bodyH := m.bodyHeight()
+	w := min(m.w-2, 140)
+
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Memory") + "\n\n")
+
+	if m.memSnap.TakenAt.IsZero() {
+		b.WriteString("Collecting memory data…\n")
+		return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+	}
+
+	s := m.memSnap
+	chartW := max(10, w-20)
+	barW := min(40, chartW)
+
+	b.WriteString(titleStyle.Render("RAM") + "  " +
+		fmt.Sprintf("%s used of %s", probe.HumanBytes(s.Used), probe.HumanBytes(s.Total)) + "\n")
+	b.WriteString(RenderBarWithLabel("", s.UsedPct, barW) + "\n")
+	b.WriteString(Spark(m.memHist, min(chartW, 60)) + "\n\n")
+
+	b.WriteString(fmt.Sprintf("  %-12s %s\n", "Available", okStyle.Render(probe.HumanBytes(s.Available))))
+	b.WriteString(fmt.Sprintf("  %-12s %s\n", "Free", probe.HumanBytes(s.Free)))
+	b.WriteString(fmt.Sprintf("  %-12s %s\n", "Cached", probe.HumanBytes(s.Cached)))
+	b.WriteString(fmt.Sprintf("  %-12s %s\n\n", "Buffers", probe.HumanBytes(s.Buffers)))
+
+	b.WriteString(titleStyle.Render("Swap"))
+	if s.SwapTotal == 0 {
+		b.WriteString("  " + subtleStyle.Render("not configured") + "\n")
+	} else {
+		b.WriteString("  " + fmt.Sprintf("%s used of %s", probe.HumanBytes(s.SwapUsed), probe.HumanBytes(s.SwapTotal)) + "\n")
+		b.WriteString(RenderBarWithLabel("", s.SwapUsedPct, barW) + "\n")
+		b.WriteString(Spark(m.swapHist, min(chartW, 60)) + "\n")
+	}
+
+	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+}
+
+// ── Tab 3: Processes ──
 
 func (m Model) viewProcs() string {
 	procsW := min(m.w-2, 140)
@@ -762,7 +897,7 @@ func (m Model) renderProcsText() string {
 	return b.String()
 }
 
-// ── Tab 3: Disk ──
+// ── Tab 4: Disk ──
 
 func (m Model) viewDisk() string {
 	bodyH := m.bodyHeight()
@@ -773,7 +908,7 @@ func (m Model) viewDisk() string {
 
 	if len(m.disks) == 0 {
 		b.WriteString("Collecting disk data…\n")
-		return boxStyle.Width(w).Height(bodyH).Render(b.String())
+		return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
 	}
 
 	barW := min(30, w/3)
@@ -829,10 +964,10 @@ func (m Model) viewDisk() string {
 		}
 	}
 
-	return boxStyle.Width(w).Height(bodyH).Render(b.String())
+	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
 }
 
-// ── Tab 4: Network ──
+// ── Tab 5: Network ──
 
 func (m Model) viewNet() string {
 	bodyH := m.bodyHeight()
@@ -913,7 +1048,7 @@ func (m Model) viewNet() string {
 	b.WriteString(m.netHeader + "\n")
 	b.WriteString(m.netVP.View())
 
-	return boxStyle.Width(w).Height(bodyH).Render(b.String())
+	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
 }
 
 func (m Model) buildNetHeader() string {
@@ -992,6 +1127,149 @@ func (m Model) renderNetText() string {
 	}
 
 	return b.String()
+}
+
+// ── Tab 6: Power & System Health ──
+
+func (m Model) viewPower() string {
+	bodyH := m.bodyHeight()
+	w := min(m.w-2, 140)
+
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Power & System Health") + "\n")
+
+	if m.powerSnap.TakenAt.IsZero() {
+		b.WriteString("Collecting power data…\n")
+		return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+	}
+
+	p := m.powerSnap
+	chartW := max(10, w-20)
+	// Sparklines are nice-to-have; drop them first when the screen is short
+	// so the battery/throttle status lines always survive the height clip.
+	roomy := bodyH >= 16
+
+	// ── Battery ──
+	if !p.Battery.Present {
+		b.WriteString(titleStyle.Render("Battery ") + subtleStyle.Render("no battery detected") + "\n")
+	} else {
+		bat := p.Battery
+		col := "42"
+		if bat.Capacity >= 0 {
+			switch {
+			case bat.Capacity <= 15:
+				col = "196"
+			case bat.Capacity <= 35:
+				col = "214"
+			}
+		}
+		cStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(col))
+		capS := "n/a"
+		if bat.Capacity >= 0 {
+			capS = fmt.Sprintf("%d%%", bat.Capacity)
+		}
+		b.WriteString(fmt.Sprintf("%s %s  %s  %s\n",
+			titleStyle.Render("Battery"),
+			subtleStyle.Render(bat.Name),
+			cStyle.Render(capS),
+			statusStyled(bat.Status)))
+		if bat.Capacity >= 0 {
+			b.WriteString("  " + RenderBar(float64(bat.Capacity), min(40, chartW), col) + "\n")
+			if roomy {
+				b.WriteString("  " + Spark(m.battHist, min(chartW, 60)) + "\n")
+			}
+		}
+		var det []string
+		if bat.VoltageV > 0 {
+			det = append(det, fmt.Sprintf("%.2f V", bat.VoltageV))
+		}
+		if bat.PowerW > 0 {
+			det = append(det, fmt.Sprintf("%.2f W", bat.PowerW))
+		}
+		if bat.TimeLeft > 0 {
+			label := "to empty"
+			if bat.Status == "Charging" {
+				label = "to full"
+			}
+			det = append(det, fmt.Sprintf("%s %s", bat.TimeLeft.Truncate(time.Minute), label))
+		}
+		if bat.Technology != "" {
+			det = append(det, bat.Technology)
+		}
+		if len(det) > 0 {
+			b.WriteString("  " + subtleStyle.Render(strings.Join(det, "  •  ")) + "\n")
+		}
+	}
+	if p.ACKnown {
+		ac := errStyle.Render("disconnected")
+		if p.ACOnline {
+			ac = okStyle.Render("connected")
+		}
+		b.WriteString("  " + subtleStyle.Render("AC power ") + ac + "\n")
+	}
+	b.WriteString("\n")
+
+	// ── Load average ──
+	la := p.Load
+	loadColor := "42"
+	if la.CPUCount > 0 {
+		if la.Load1 >= float64(la.CPUCount) {
+			loadColor = "196"
+		} else if la.Load1 >= float64(la.CPUCount)*0.7 {
+			loadColor = "214"
+		}
+	}
+	lStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(loadColor))
+	b.WriteString(fmt.Sprintf("%s %s %s %s  %s\n",
+		titleStyle.Render("Load"),
+		lStyle.Render(fmt.Sprintf("%.2f", la.Load1)),
+		subtleStyle.Render(fmt.Sprintf("%.2f", la.Load5)),
+		subtleStyle.Render(fmt.Sprintf("%.2f", la.Load15)),
+		subtleStyle.Render(fmt.Sprintf("(1/5/15m, %d CPUs)", la.CPUCount)),
+	))
+	if roomy {
+		b.WriteString("  " + Spark(m.loadHist, min(chartW, 60)) + "\n")
+	}
+	b.WriteString("\n")
+
+	// ── Throttle / under-voltage (Raspberry Pi / uConsole) ──
+	t := p.Throttle
+	if !t.Available {
+		b.WriteString(titleStyle.Render("Throttle") + " " +
+			subtleStyle.Render("vcgencmd unavailable (not a Raspberry Pi)") + "\n")
+	} else {
+		b.WriteString(titleStyle.Render("Throttle / Under-voltage") + " " +
+			subtleStyle.Render(fmt.Sprintf("(raw 0x%X)", t.Raw)) + "\n")
+		flag := func(now, ever bool, label string) string {
+			switch {
+			case now:
+				return errStyle.Render("● " + label + " (now)")
+			case ever:
+				return warnStyle.Render("◐ " + label + " (since boot)")
+			default:
+				return okStyle.Render("○ " + label + " OK")
+			}
+		}
+		b.WriteString("  " + flag(t.UnderVoltageNow, t.UnderVoltageOccurred, "Under-voltage") + "\n")
+		b.WriteString("  " + flag(t.FreqCappedNow, t.FreqCappedOccurred, "ARM freq capped") + "\n")
+		b.WriteString("  " + flag(t.ThrottledNow, t.ThrottledOccurred, "Throttled") + "\n")
+		b.WriteString("  " + flag(t.SoftTempLimitNow, t.SoftTempLimitOccurred, "Soft temp limit") + "\n")
+	}
+
+	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+}
+
+func statusStyled(s string) string {
+	switch s {
+	case "Charging", "Full":
+		return okStyle.Render(s)
+	case "Discharging":
+		return warnStyle.Render(s)
+	case "":
+		return subtleStyle.Render("Unknown")
+	default:
+		return subtleStyle.Render(s)
+	}
 }
 
 func min(a, b int) int {

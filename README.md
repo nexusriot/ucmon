@@ -6,10 +6,12 @@ Built in Go with the [Bubble Tea](https://github.com/charmbracelet/bubbletea) fr
 
 ## Features
 
-- **CPU & Temperature** — total and per-core usage with bar charts and sparkline history; color-coded thermal sensor readings
+- **CPU & Temperature** — total and per-core usage with bar charts and sparkline history; color-coded thermal sensor readings; load-average summary
+- **Memory** — RAM total/used/free/available/cached/buffers and swap, with bars and sparkline history
 - **Processes** — top 100 processes by CPU, scrollable and searchable
 - **Disk** — partition usage with color-coded bars, plus per-device read/write rates
 - **Network** — interface throughput with sparklines and a searchable connection table (protocol, addresses, status, PID, process)
+- **Power & System Health** — battery charge/status/time-left (uConsole/Pi via `/sys/class/power_supply`), 1/5/15-min load average, and Raspberry Pi throttle / under-voltage flags via `vcgencmd`
 
 ## Install
 
@@ -34,7 +36,7 @@ go build -o ucmon cmd/ucmon/main.go
 |--------------------|------------------------------|
 | `tab` / `→`        | Next tab                     |
 | `shift+tab` / `←`  | Previous tab                 |
-| `1` – `4`          | Jump to tab                  |
+| `1` – `6`          | Jump to tab                  |
 | `/`                | Activate search (procs, net) |
 | `enter`            | Apply search filter          |
 | `esc`              | Cancel search                |
@@ -44,13 +46,15 @@ go build -o ucmon cmd/ucmon/main.go
 
 ## Refresh Intervals
 
-| Data          | Interval |
-|---------------|----------|
-| CPU / temps   | 1s       |
-| Network I/O   | 1s       |
-| Processes     | 3s       |
-| Connections   | 3s       |
-| Disk usage/IO | 5s       |
+| Data            | Interval |
+|-----------------|----------|
+| CPU / temps     | 1s       |
+| Memory / swap   | 1s       |
+| Network I/O     | 1s       |
+| Processes       | 3s       |
+| Connections     | 3s       |
+| Disk usage/IO   | 5s       |
+| Battery/throttle| 5s       |
 
 ## Target Platforms
 

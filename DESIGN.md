@@ -14,9 +14,11 @@ ucmon/
 ├── internal/
 │   ├── probe/                  # Data collection layer
 │   │   ├── cpu.go              # CPU load & temperature sensors
+│   │   ├── mem.go              # RAM & swap
 │   │   ├── procs.go            # Process listing
 │   │   ├── disk.go             # Disk usage & I/O counters
 │   │   ├── net.go              # Network interfaces & connections
+│   │   ├── power.go            # Battery, RPi throttle, load average
 │   │   └── util.go             # Formatting helpers
 │   └── ui/                     # Presentation layer
 │       ├── model.go            # Bubble Tea model (state, Update, View)
@@ -60,35 +62,52 @@ Chosen for consistency with the existing project family (ducknetview). The Elm a
 - Temperature sensor readings with color-coded values, bars, and sparkline history
 - Temperature thresholds: green (<50°C), yellow (50-65°C), orange (65-80°C), red (>80°C)
 
-### Tab 2: Processes
+CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded against CPU count).
+
+### Tab 2: Memory
+
+- RAM: total / used / free / available / cached / buffers, with a color-coded usage bar and sparkline history
+- Swap: total / used / free with bar and sparkline (or "not configured")
+- Refreshed every 1 second
+
+### Tab 3: Processes
 
 - Top 100 processes sorted by CPU usage
 - Columns: PID, USER, NAME, CPU%, MEM%, RSS, STATUS
 - Scrollable viewport with search/filter support
 - Refreshed every 3 seconds
 
-### Tab 3: Disk Usage
+### Tab 4: Disk Usage
 
 - Partition list with device, mount point, filesystem type, total/used/free sizes
 - Color-coded usage bar per partition (green → red based on usage percentage)
 - Disk I/O rates (read/write bytes per second) per block device
 
-### Tab 4: Network
+### Tab 5: Network
 
 - Active interface summary with MAC, address, RX/TX rates and sparkline history
 - Connection table: protocol, local/remote address, status, PID, process name
 - LISTEN connections sorted first
 - Search/filter support for connection table
 
+### Tab 6: Power & System Health
+
+- Battery: charge %, charging status, voltage, instantaneous watts, estimated time to empty/full, technology — read directly from `/sys/class/power_supply` (works with the uConsole axp20x driver and standard laptop batteries); AC/USB mains presence
+- Load average: 1/5/15-minute, color-coded against CPU count, with sparkline history
+- Raspberry Pi throttle / under-voltage: parses `vcgencmd get_throttled`, showing both current and since-boot flags for under-voltage, ARM frequency capping, throttling, and soft temperature limit. Gracefully reports unavailable when `vcgencmd` is absent (non-Pi hosts)
+- Refreshed every 5 seconds
+
 ## Refresh Intervals
 
-| Data          | Interval |
-|---------------|----------|
-| CPU / temps   | 1s       |
-| Network I/O   | 1s       |
-| Processes     | 3s       |
-| Connections   | 3s       |
-| Disk usage/IO | 5s       |
+| Data             | Interval |
+|------------------|----------|
+| CPU / temps      | 1s       |
+| Memory / swap    | 1s       |
+| Network I/O      | 1s       |
+| Processes        | 3s       |
+| Connections      | 3s       |
+| Disk usage/IO    | 5s       |
+| Battery/throttle | 5s       |
 
 ## Keyboard Controls
 
@@ -96,8 +115,8 @@ Chosen for consistency with the existing project family (ducknetview). The Elm a
 |------------------|---------------------------|
 | `tab` / `→`      | Next tab                  |
 | `shift+tab` / `←`| Previous tab              |
-| `1` - `4`        | Jump to tab               |
-| `/`              | Activate search (tabs 2,4)|
+| `1` - `6`        | Jump to tab               |
+| `/`              | Activate search (tabs 3,5)|
 | `enter`          | Apply search filter       |
 | `esc`            | Cancel search             |
 | `ctrl+u`         | Clear search filter       |
