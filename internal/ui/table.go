@@ -164,6 +164,21 @@ func hardClipLinesToWidth(s string, w int) string {
 	return strings.Join(lines, "\n")
 }
 
+// clipHeight drops any lines beyond maxLines so a tab body can never grow
+// taller than its box. Without this, lipgloss renders all lines and the
+// frame overflows the terminal, which makes Bubble Tea's alt-screen
+// renderer blank the screen on short displays (e.g. the uConsole).
+func clipHeight(s string, maxLines int) string {
+	if maxLines <= 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= maxLines {
+		return s
+	}
+	return strings.Join(lines[:maxLines], "\n")
+}
+
 func oneLine(s string) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	s = strings.ReplaceAll(s, "\r", " ")
