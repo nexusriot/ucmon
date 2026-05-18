@@ -15,19 +15,30 @@ Built in Go with the [Bubble Tea](https://github.com/charmbracelet/bubbletea) fr
 
 ## Install
 
+All builds are pure Go (no cgo), so every platform cross-compiles from one machine.
+
 ### Debian / Ubuntu (incl. uConsole, Raspberry Pi OS)
 
 ```bash
-./build-deb.sh          # amd64
-./build-deb-arm64.sh    # arm64 (cross-compile)
-sudo dpkg -i ucmon_*.deb
+make deb                 # .deb for every platform → dist/
+make deb-uconsole        # just the uConsole (arm64) package
+sudo dpkg -i dist/ucmon_*_arm64.deb
 ```
+
+| `make` target | Device                                   | deb arch |
+|---------------|------------------------------------------|----------|
+| `amd64`       | Generic Linux x86_64                      | `amd64`  |
+| `uconsole`    | ClockworkPi uConsole (CM4, aarch64)       | `arm64`  |
+| `pizero2w`    | Raspberry Pi Zero 2 W (32-bit Pi OS)      | `armhf`  |
+
+> A Pi Zero 2 W running a **64-bit** OS uses the `uconsole` / `arm64` build.
 
 ### From source
 
 ```bash
-go build -o ucmon cmd/ucmon/main.go
-./ucmon
+make install            # build for the host, install to /usr/local/bin (sudo)
+make run                # build & run natively
+make help               # list all targets
 ```
 
 ## Keyboard Controls
