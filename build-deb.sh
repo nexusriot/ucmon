@@ -1,6 +1,6 @@
 #!/bin/env bash
 
-version=0.1.9
+version=0.2.1
 arch="${1:-amd64}"
 
 echo "building deb for ucmon $version ($arch)"

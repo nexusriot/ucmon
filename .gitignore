@@ -2,3 +2,5 @@ build/
 
 *.deb
 cmd/ucmon/ucmon
+dist/
+
