@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -13,7 +14,7 @@ import (
 	"github.com/nexusriot/ucmon/internal/probe"
 )
 
-const version = "0.1.9"
+const version = "0.2.1"
 
 type tab int
 
@@ -31,6 +32,46 @@ const (
 	headerH = 1
 	footerH = 1
 )
+
+// procsDisplayCap bounds how many process rows are rendered (the viewport
+// scrolls within this); keeps the rendered string small on slow devices.
+const procsDisplayCap = 200
+
+type procSort int
+
+const (
+	sortCPU procSort = iota
+	sortMem
+	sortPID
+	sortName
+)
+
+func (s procSort) String() string {
+	switch s {
+	case sortMem:
+		return "MEM"
+	case sortPID:
+		return "PID"
+	case sortName:
+		return "NAME"
+	default:
+		return "CPU"
+	}
+}
+
+// killPrompt holds the pending kill confirmation.
+type killPrompt struct {
+	pid  int32
+	name string
+	hard bool // true = SIGKILL, false = SIGTERM
+}
+
+func (k killPrompt) signal() string {
+	if k.hard {
+		return "SIGKILL"
+	}
+	return "SIGTERM"
+}
 
 // messages
 type tickMsg time.Time
@@ -74,12 +115,19 @@ type Model struct {
 
 	// Processes tab
 	procs          []probe.ProcInfo
+	procsView      []probe.ProcInfo // filtered + sorted + capped (cursor maps to this)
 	procsVP        viewport.Model
 	procsHeader    string
 	procsText      string
 	procsSearch    textinput.Model
 	procsSearching bool
 	procsQuery     string
+	procsSort      procSort
+	procsTree      bool        // true = render as a process tree
+	procsPrefix    []string    // tree-branch prefix per procsView row (tree mode)
+	procsSel       int         // cursor index into procsView
+	procsKill      *killPrompt // non-nil while confirming a kill
+	procsNotice    string      // transient status (e.g. "sent SIGTERM …")
 
 	// Disk tab
 	disks       []probe.DiskInfo
@@ -177,7 +225,7 @@ func fetchCPUCmd() tea.Cmd {
 
 func fetchProcsCmd() tea.Cmd {
 	return func() tea.Msg {
-		procs, err := probe.ListProcesses(100)
+		procs, err := probe.ListProcesses(0)
 		if err != nil {
 			return errMsg{err}
 		}
@@ -269,13 +317,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		vpW := min(m.w-2, 140)
 		m.procsVP.Width = max(10, vpW-2)
-		m.procsVP.Height = max(5, bodyH-9) // account for search + header + separator above viewport
+		// 7 fixed lines above the viewport: status + detail + blank +
+		// (title, blank, colhdr, sep). Keep total == bodyH so the box
+		// neither pads nor overflows.
+		m.procsVP.Height = max(1, bodyH-7)
 		m.netVP.Width = max(10, vpW-2)
 		m.netVP.Height = m.calcNetVPHeight()
 
-		m.procsHeader = m.buildProcsHeader()
 		m.netHeader = m.buildNetHeader()
-		m.procsVP.SetContent(hardClipLinesToWidth(m.procsText, m.procsVP.Width))
+		m.refreshProcs()
 		m.netVP.SetContent(hardClipLinesToWidth(m.netText, m.netVP.Width))
 		return m, nil
 
@@ -341,9 +391,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case procMsg:
 		m.procs = msg
-		m.procsHeader = m.buildProcsHeader()
-		m.procsText = m.renderProcsText()
-		m.procsVP.SetContent(hardClipLinesToWidth(m.procsText, m.procsVP.Width))
+		m.refreshProcs()
 		return m, nil
 
 	case diskMsg:
@@ -382,6 +430,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// A pending kill confirmation captures all keys.
+		if m.activeTab == tabProc && m.procsKill != nil {
+			switch msg.String() {
+			case "y", "Y", "enter":
+				kp := *m.procsKill
+				m.procsKill = nil
+				if err := probe.KillProcess(kp.pid, kp.hard); err != nil {
+					m.procsNotice = errStyle.Render(
+						fmt.Sprintf("%s %d failed: %v", kp.signal(), kp.pid, err))
+				} else {
+					m.procsNotice = okStyle.Render(
+						fmt.Sprintf("sent %s to %s (%d)", kp.signal(), kp.name, kp.pid))
+				}
+				return m, fetchProcsCmd()
+			default: // n / esc / anything else cancels
+				m.procsKill = nil
+				return m, nil
+			}
+		}
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
@@ -409,6 +476,77 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "6":
 			m.activeTab = tabPower
 			return m, nil
+		case "up":
+			if m.activeTab == tabProc && !m.procsSearching {
+				if m.procsSel > 0 {
+					m.procsSel--
+				}
+				m.rerenderProcs()
+				return m, nil
+			}
+		case "down":
+			if m.activeTab == tabProc && !m.procsSearching {
+				if m.procsSel < len(m.procsView)-1 {
+					m.procsSel++
+				}
+				m.rerenderProcs()
+				return m, nil
+			}
+		case "pgup":
+			if m.activeTab == tabProc && !m.procsSearching {
+				m.procsSel -= max(1, m.procsVP.Height)
+				if m.procsSel < 0 {
+					m.procsSel = 0
+				}
+				m.rerenderProcs()
+				return m, nil
+			}
+		case "pgdown":
+			if m.activeTab == tabProc && !m.procsSearching {
+				m.procsSel += max(1, m.procsVP.Height)
+				if m.procsSel > len(m.procsView)-1 {
+					m.procsSel = len(m.procsView) - 1
+				}
+				m.rerenderProcs()
+				return m, nil
+			}
+		case "home":
+			if m.activeTab == tabProc && !m.procsSearching {
+				m.procsSel = 0
+				m.rerenderProcs()
+				return m, nil
+			}
+		case "end":
+			if m.activeTab == tabProc && !m.procsSearching {
+				m.procsSel = max(0, len(m.procsView)-1)
+				m.rerenderProcs()
+				return m, nil
+			}
+		case "s":
+			if m.activeTab == tabProc && !m.procsSearching {
+				m.procsSort = (m.procsSort + 1) % 4
+				m.procsSel = 0
+				m.procsNotice = ""
+				m.refreshProcs()
+				m.procsVP.GotoTop()
+				return m, nil
+			}
+		case "t":
+			if m.activeTab == tabProc && !m.procsSearching {
+				m.procsTree = !m.procsTree
+				m.procsSel = 0
+				m.procsNotice = ""
+				m.refreshProcs()
+				m.procsVP.GotoTop()
+				return m, nil
+			}
+		case "K":
+			if m.activeTab == tabProc && !m.procsSearching {
+				if p, ok := m.selectedProc(); ok {
+					m.procsKill = &killPrompt{pid: p.PID, name: p.Name, hard: true}
+				}
+				return m, nil
+			}
 		case "/":
 			if m.activeTab == tabProc {
 				m.procsSearching = true
@@ -446,12 +584,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+			if m.activeTab == tabProc && !m.procsSearching {
+				if p, ok := m.selectedProc(); ok {
+					m.procsKill = &killPrompt{pid: p.PID, name: p.Name, hard: false}
+				}
+				return m, nil
+			}
 		case "ctrl+u":
 			if m.activeTab == tabProc && !m.procsSearching {
 				m.procsQuery = ""
 				m.procsSearch.SetValue("")
-				m.procsText = m.renderProcsText()
-				m.procsVP.SetContent(m.procsText)
+				m.procsSel = 0
+				m.procsNotice = ""
+				m.refreshProcs()
+				m.procsVP.GotoTop()
 				return m, nil
 			}
 			if m.activeTab == tabNet && !m.netSearching {
@@ -474,8 +620,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.procsQuery = strings.TrimSpace(m.procsSearch.Value())
 				m.procsSearching = false
 				m.procsSearch.Blur()
-				m.procsText = m.renderProcsText()
-				m.procsVP.SetContent(m.procsText)
+				m.procsSel = 0
+				m.refreshProcs()
+				m.procsVP.GotoTop()
 				return m, nil
 			case "esc":
 				m.procsSearching = false
@@ -555,6 +702,9 @@ func (m Model) View() string {
 	footerText := "Keys: tab/←/→ switch • 1-6 jump • / search • ctrl+u clear • ctrl+c quit"
 	if m.activeTab == tabNet && !m.netSearching {
 		footerText = "Keys: tab/←/→ switch • 1-6 jump • j/k iface • / search • ctrl+u clear • ctrl+c quit"
+	}
+	if m.activeTab == tabProc && !m.procsSearching {
+		footerText = "Keys: ↑↓ select • s sort • t tree • k/K kill • / filter • tab switch • ctrl+c quit"
 	}
 	footer := subtleStyle.Render(footerText)
 	if m.err != nil {
@@ -808,16 +958,43 @@ func (m Model) viewProcs() string {
 	procsW := min(m.w-2, 140)
 	procsH := m.bodyHeight()
 
-	searchLine := subtleStyle.Render("Press / to search")
+	innerW := max(10, min(m.w-2, 140)-2)
+
+	// Status line: kill prompt > notice > search/filter.
+	statusLine := subtleStyle.Render("Press / to search")
 	if m.procsQuery != "" {
-		searchLine = subtleStyle.Render("Filter: ") + titleStyle.Render(m.procsQuery) + subtleStyle.Render("  (/ change, ctrl+u clear)")
+		statusLine = subtleStyle.Render("Filter: ") + titleStyle.Render(m.procsQuery) + subtleStyle.Render("  (/ change, ctrl+u clear)")
 	}
 	if m.procsSearching {
-		searchLine = m.procsSearch.View()
+		statusLine = m.procsSearch.View()
+	}
+	if m.procsNotice != "" && !m.procsSearching {
+		statusLine = m.procsNotice
+	}
+	if m.procsKill != nil {
+		kp := *m.procsKill
+		style := warnStyle
+		if kp.hard {
+			style = errStyle
+		}
+		statusLine = style.Render(fmt.Sprintf("Send %s to %s (pid %d)?", kp.signal(), kp.name, kp.pid)) +
+			subtleStyle.Render("  y / N")
+	}
+	statusLine = clampToWidthOneLine(statusLine, innerW)
+
+	// Detail line: full command line of the selected process.
+	detailLine := subtleStyle.Render("—")
+	if p, ok := m.selectedProc(); ok {
+		cmd := p.CmdLine
+		if strings.TrimSpace(cmd) == "" {
+			cmd = p.Name
+		}
+		detailLine = subtleStyle.Render(clampToWidthOneLine(
+			fmt.Sprintf("pid %d  %s  %s", p.PID, p.User, cmd), innerW))
 	}
 
-	content := searchLine + "\n\n" + m.procsHeader + "\n" + m.procsVP.View()
-	return boxStyle.Width(procsW).Height(procsH).Render(content)
+	content := statusLine + "\n" + detailLine + "\n\n" + m.procsHeader + "\n" + m.procsVP.View()
+	return boxStyle.Width(procsW).Height(procsH).Render(clipHeight(content, procsH))
 }
 
 func (m Model) buildProcsHeader() string {
@@ -827,12 +1004,16 @@ func (m Model) buildProcsHeader() string {
 	}
 
 	colPID, colUser, colCPU, colMem, colRSS, colStat := 7, 10, 7, 7, 10, 3
+	nameCap := 30
+	if m.procsTree && m.procsQuery == "" {
+		nameCap = 48 // leave room for tree-branch indentation
+	}
 	colName := max(12, w-colPID-colUser-colCPU-colMem-colRSS-colStat-14)
-	if colName > 30 {
-		colName = 30
+	if colName > nameCap {
+		colName = nameCap
 	}
 
-	h := fmt.Sprintf("%s  %s  %s  %s  %s  %s  %s",
+	h := fmt.Sprintf("  %s  %s  %s  %s  %s  %s  %s",
 		padRight("PID", colPID),
 		padRight("USER", colUser),
 		padRight("NAME", colName),
@@ -841,8 +1022,178 @@ func (m Model) buildProcsHeader() string {
 		padRight("RSS", colRSS),
 		padRight("S", colStat),
 	)
-	sep := strings.Repeat("─", min(w, colPID+colUser+colName+colCPU+colMem+colRSS+colStat+12))
-	return "Processes (sorted by CPU)  Scroll: ↑↓ PgUp/PgDn\n\n" + h + "\n" + sep
+	sep := strings.Repeat("─", min(w, colPID+colUser+colName+colCPU+colMem+colRSS+colStat+14))
+
+	view := "flat"
+	if m.procsTree {
+		view = "tree"
+		if m.procsQuery != "" {
+			view = "tree (flat while filtered)"
+		}
+	}
+	title := fmt.Sprintf("Processes  sort: %s  view: %s",
+		titleStyle.Render(m.procsSort.String()),
+		titleStyle.Render(view))
+	hint := subtleStyle.Render("↑↓ select • s sort • t tree • k SIGTERM • K SIGKILL • / filter")
+	return title + "  " + hint + "\n\n" + h + "\n" + sep
+}
+
+// computeProcsView filters m.procs by the active query, sorts by the active
+// sort mode, and caps the result for rendering.
+func (m Model) computeProcsView() []probe.ProcInfo {
+	q := m.procsQuery
+	out := make([]probe.ProcInfo, 0, len(m.procs))
+	for _, p := range m.procs {
+		name := p.Name
+		if name == "" {
+			name = "-"
+		}
+		if q != "" && !(containsFold(name, q) ||
+			containsFold(fmt.Sprintf("%d", p.PID), q) ||
+			containsFold(p.User, q)) {
+			continue
+		}
+		out = append(out, p)
+	}
+
+	sort.SliceStable(out, func(i, j int) bool {
+		switch m.procsSort {
+		case sortMem:
+			return out[i].MemPct > out[j].MemPct
+		case sortPID:
+			return out[i].PID < out[j].PID
+		case sortName:
+			return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+		default:
+			return out[i].CPUPct > out[j].CPUPct
+		}
+	})
+
+	if len(out) > procsDisplayCap {
+		out = out[:procsDisplayCap]
+	}
+	return out
+}
+
+// sortProcSlice orders ps in place by the active process sort mode.
+func (m Model) sortProcSlice(ps []probe.ProcInfo) {
+	sort.SliceStable(ps, func(i, j int) bool {
+		switch m.procsSort {
+		case sortMem:
+			return ps[i].MemPct > ps[j].MemPct
+		case sortPID:
+			return ps[i].PID < ps[j].PID
+		case sortName:
+			return strings.ToLower(ps[i].Name) < strings.ToLower(ps[j].Name)
+		default:
+			return ps[i].CPUPct > ps[j].CPUPct
+		}
+	})
+}
+
+// computeProcsTree builds a depth-first ordering of m.procs as a process
+// tree, sorting siblings by the active sort mode. It returns the ordered
+// rows and a parallel slice of tree-branch prefixes. Used only when no
+// search filter is active.
+func (m Model) computeProcsTree() ([]probe.ProcInfo, []string) {
+	byPID := make(map[int32]probe.ProcInfo, len(m.procs))
+	for _, p := range m.procs {
+		byPID[p.PID] = p
+	}
+	children := make(map[int32][]probe.ProcInfo)
+	var roots []probe.ProcInfo
+	for _, p := range m.procs {
+		if _, ok := byPID[p.PPID]; ok && p.PPID != p.PID {
+			children[p.PPID] = append(children[p.PPID], p)
+		} else {
+			roots = append(roots, p)
+		}
+	}
+	m.sortProcSlice(roots)
+	for pp := range children {
+		m.sortProcSlice(children[pp])
+	}
+
+	var out []probe.ProcInfo
+	var prefixes []string
+	visited := make(map[int32]bool, len(m.procs))
+	var walk func(p probe.ProcInfo, indent string, last, isRoot bool)
+	walk = func(p probe.ProcInfo, indent string, last, isRoot bool) {
+		if len(out) >= procsDisplayCap || visited[p.PID] {
+			return
+		}
+		visited[p.PID] = true
+
+		prefix := ""
+		childIndent := ""
+		if !isRoot {
+			if last {
+				prefix = indent + "└─ "
+				childIndent = indent + "   "
+			} else {
+				prefix = indent + "├─ "
+				childIndent = indent + "│  "
+			}
+		}
+		out = append(out, p)
+		prefixes = append(prefixes, prefix)
+
+		kids := children[p.PID]
+		for i, k := range kids {
+			walk(k, childIndent, i == len(kids)-1, false)
+		}
+	}
+	for i, r := range roots {
+		walk(r, "", i == len(roots)-1, true)
+	}
+	return out, prefixes
+}
+
+// refreshProcs recomputes the view, clamps the cursor, and re-renders.
+func (m *Model) refreshProcs() {
+	if m.procsTree && m.procsQuery == "" {
+		m.procsView, m.procsPrefix = m.computeProcsTree()
+	} else {
+		m.procsView = m.computeProcsView()
+		m.procsPrefix = nil
+	}
+	if m.procsSel >= len(m.procsView) {
+		m.procsSel = len(m.procsView) - 1
+	}
+	if m.procsSel < 0 {
+		m.procsSel = 0
+	}
+	m.procsHeader = m.buildProcsHeader()
+	m.procsText = m.renderProcsText()
+	m.procsVP.SetContent(hardClipLinesToWidth(m.procsText, m.procsVP.Width))
+	m.ensureProcVisible()
+}
+
+// rerenderProcs re-renders the (unchanged) view after a cursor move.
+func (m *Model) rerenderProcs() {
+	m.procsText = m.renderProcsText()
+	m.procsVP.SetContent(hardClipLinesToWidth(m.procsText, m.procsVP.Width))
+	m.ensureProcVisible()
+}
+
+// ensureProcVisible scrolls the viewport so the cursor row stays on screen.
+func (m *Model) ensureProcVisible() {
+	h := m.procsVP.Height
+	if h <= 0 {
+		return
+	}
+	if m.procsSel < m.procsVP.YOffset {
+		m.procsVP.SetYOffset(m.procsSel)
+	} else if m.procsSel >= m.procsVP.YOffset+h {
+		m.procsVP.SetYOffset(m.procsSel - h + 1)
+	}
+}
+
+func (m Model) selectedProc() (probe.ProcInfo, bool) {
+	if m.procsSel >= 0 && m.procsSel < len(m.procsView) {
+		return m.procsView[m.procsSel], true
+	}
+	return probe.ProcInfo{}, false
 }
 
 func (m Model) renderProcsText() string {
@@ -854,18 +1205,26 @@ func (m Model) renderProcsText() string {
 	}
 
 	colPID, colUser, colCPU, colMem, colRSS, colStat := 7, 10, 7, 7, 10, 3
+	nameCap := 30
+	if m.procsTree && m.procsQuery == "" {
+		nameCap = 48 // leave room for tree-branch indentation
+	}
 	colName := max(12, w-colPID-colUser-colCPU-colMem-colRSS-colStat-14)
-	if colName > 30 {
-		colName = 30
+	if colName > nameCap {
+		colName = nameCap
 	}
 
 	if len(m.procs) == 0 {
 		b.WriteString("No data (yet)…\n")
 		return b.String()
 	}
+	if len(m.procsView) == 0 {
+		b.WriteString(subtleStyle.Render("No processes match the filter.") + "\n")
+		return b.String()
+	}
 
 	q := m.procsQuery
-	for _, p := range m.procs {
+	for i, p := range m.procsView {
 		name := p.Name
 		if name == "" {
 			name = "-"
@@ -875,8 +1234,14 @@ func (m Model) renderProcsText() string {
 			user = "-"
 		}
 
-		if q != "" && !(containsFold(name, q) || containsFold(fmt.Sprintf("%d", p.PID), q) || containsFold(user, q)) {
-			continue
+		selected := i == m.procsSel
+		marker := "  "
+		if selected {
+			marker = "▸ "
+		}
+
+		if len(m.procsPrefix) == len(m.procsView) {
+			name = m.procsPrefix[i] + name
 		}
 
 		pidS := padRight(trunc(fmt.Sprintf("%d", p.PID), colPID), colPID)
@@ -887,11 +1252,15 @@ func (m Model) renderProcsText() string {
 		rssS := padRight(probe.HumanBytes(p.MemRSS), colRSS)
 		statS := padRight(p.Status, colStat)
 
-		nameS = highlightFold(nameS, q)
-		pidS = highlightFold(pidS, q)
+		row := fmt.Sprintf("%s%s  %s  %s  %s  %s  %s  %s",
+			marker, pidS, userS, nameS, cpuS, memS, rssS, statS)
 
-		b.WriteString(fmt.Sprintf("%s  %s  %s  %s  %s  %s  %s\n",
-			pidS, userS, nameS, cpuS, memS, rssS, statS))
+		if selected {
+			b.WriteString(selectedStyle.Render(row) + "\n")
+		} else {
+			row = highlightFold(row, q)
+			b.WriteString(row + "\n")
+		}
 	}
 
 	return b.String()

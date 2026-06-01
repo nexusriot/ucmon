@@ -72,10 +72,17 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
 
 ### Tab 3: Processes
 
-- Top 100 processes sorted by CPU usage
-- Columns: PID, USER, NAME, CPU%, MEM%, RSS, STATUS
-- Scrollable viewport with search/filter support
-- Refreshed every 3 seconds
+- Columns: PID, USER, NAME, CPU%, MEM%, RSS, STATUS (up to 200 rows, scrollable)
+- Movable cursor (`↑↓` / PgUp/PgDn / Home/End) with the selected row highlighted
+- Sort cycle via `s`: CPU → MEM → PID → NAME (active sort shown in the header)
+- Tree view toggle via `t`: renders a parent/child process tree (built from
+  PPID) with `├─`/`└─` branch glyphs; siblings ordered by the active sort.
+  Falls back to the flat list while a search filter is active.
+- Detail line shows the selected process's full command line
+- `k` (SIGTERM) / `K` (SIGKILL) open a `y/N` confirmation; the signal is sent
+  via `probe.KillProcess` (gopsutil `Terminate`/`Kill`) and a status line reports
+  the result
+- Search/filter support; refreshed every 3 seconds
 
 ### Tab 4: Disk Usage
 
@@ -118,9 +125,13 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
 | `1` - `6`        | Jump to tab               |
 | `/`              | Activate search (tabs 3,5)|
 | `enter`          | Apply search filter       |
-| `esc`            | Cancel search             |
+| `esc`            | Cancel search / kill      |
 | `ctrl+u`         | Clear search filter       |
-| `↑` `↓` PgUp/Dn | Scroll viewport           |
+| `↑` `↓` PgUp/Dn | Move cursor (procs)/scroll|
+| `s`              | Cycle process sort        |
+| `t`              | Toggle process tree view  |
+| `k` / `K`        | SIGTERM / SIGKILL (procs) |
+| `j` / `k`        | Select interface (net)    |
 | `ctrl+c`         | Quit                      |
 
 ## Build & Packaging

@@ -8,7 +8,7 @@ Built in Go with the [Bubble Tea](https://github.com/charmbracelet/bubbletea) fr
 
 - **CPU & Temperature** — total and per-core usage with bar charts and sparkline history; color-coded thermal sensor readings; load-average summary
 - **Memory** — RAM total/used/free/available/cached/buffers and swap, with bars and sparkline history
-- **Processes** — top 100 processes by CPU, scrollable and searchable
+- **Processes** — searchable list with a movable cursor, sortable by CPU / MEM / PID / NAME, a parent/child tree view, a command-line detail line, and SIGTERM/SIGKILL with confirmation
 - **Disk** — partition usage with color-coded bars, plus per-device read/write rates
 - **Network** — interface throughput with sparklines and a searchable connection table (protocol, addresses, status, PID, process)
 - **Power & System Health** — battery charge/status/time-left (uConsole/Pi via `/sys/class/power_supply`), 1/5/15-min load average, and Raspberry Pi throttle / under-voltage flags via `vcgencmd`
@@ -50,9 +50,13 @@ make help               # list all targets
 | `1` – `6`          | Jump to tab                  |
 | `/`                | Activate search (procs, net) |
 | `enter`            | Apply search filter          |
-| `esc`              | Cancel search                |
+| `esc`              | Cancel search / kill prompt  |
 | `ctrl+u`           | Clear search filter          |
-| `↑` `↓` PgUp/PgDn  | Scroll viewport              |
+| `↑` `↓` PgUp/PgDn  | Move cursor (procs) / scroll |
+| `s`                | Cycle process sort (CPU/MEM/PID/NAME) |
+| `t`                | Toggle process tree / flat view |
+| `k` / `K`          | SIGTERM / SIGKILL selected process (confirm with `y`) |
+| `j` / `k`          | Select interface (network tab) |
 | `ctrl+c`           | Quit                         |
 
 ## Refresh Intervals

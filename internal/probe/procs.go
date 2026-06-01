@@ -10,6 +10,7 @@ import (
 
 type ProcInfo struct {
 	PID     int32
+	PPID    int32
 	Name    string
 	CPUPct  float64
 	MemPct  float32
@@ -28,6 +29,7 @@ func ListProcesses(topN int) ([]ProcInfo, error) {
 	var out []ProcInfo
 	for _, p := range procs {
 		name, _ := p.Name()
+		ppid, _ := p.Ppid()
 		cpuPct, _ := p.CPUPercent()
 		memPct, _ := p.MemoryPercent()
 		memInfo, _ := p.MemoryInfo()
@@ -51,6 +53,7 @@ func ListProcesses(topN int) ([]ProcInfo, error) {
 
 		out = append(out, ProcInfo{
 			PID:     p.Pid,
+			PPID:    ppid,
 			Name:    name,
 			CPUPct:  cpuPct,
 			MemPct:  memPct,
@@ -70,6 +73,18 @@ func ListProcesses(topN int) ([]ProcInfo, error) {
 	}
 
 	return out, nil
+}
+
+// KillProcess sends SIGTERM (hard=false) or SIGKILL (hard=true) to pid.
+func KillProcess(pid int32, hard bool) error {
+	p, err := process.NewProcess(pid)
+	if err != nil {
+		return err
+	}
+	if hard {
+		return p.Kill()
+	}
+	return p.Terminate()
 }
 
 func FormatProcCPU(pct float64) string {
