@@ -11,10 +11,11 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/nexusriot/ucmon/internal/config"
 	"github.com/nexusriot/ucmon/internal/probe"
 )
 
-const version = "0.2.1"
+const version = "0.3.0"
 
 type tab int
 
@@ -25,8 +26,29 @@ const (
 	tabDisk             // disk usage
 	tabNet              // network
 	tabPower            // battery, throttle, load
+	tabGPU              // GPU/VideoCore stats & backlight
 	numTabs
 )
+
+// tabFromName maps a config start_tab string to a tab index.
+func tabFromName(s string) tab {
+	switch s {
+	case "mem", "memory":
+		return tabMem
+	case "proc", "procs", "processes":
+		return tabProc
+	case "disk":
+		return tabDisk
+	case "net", "network":
+		return tabNet
+	case "power":
+		return tabPower
+	case "gpu", "soc", "videocore":
+		return tabGPU
+	default:
+		return tabCPU
+	}
+}
 
 const (
 	headerH = 1
@@ -85,6 +107,10 @@ type diskMsg struct {
 type netMsg probe.NetSnapshot
 type connMsg []probe.ConnInfo
 type powerMsg probe.PowerSnapshot
+type sysMsg struct {
+	gpu       probe.GPUInfo
+	backlight probe.BacklightInfo
+}
 type errMsg struct{ error }
 
 func tickEvery(d time.Duration) tea.Cmd {
@@ -93,6 +119,11 @@ func tickEvery(d time.Duration) tea.Cmd {
 
 type Model struct {
 	w, h int
+
+	cfg          config.Config
+	fastInterval time.Duration
+	procEvery    int // base ticks between process/conn refreshes
+	slowEvery    int // base ticks between disk/power/gpu refreshes
 
 	activeTab tab
 	err       error
@@ -148,10 +179,18 @@ type Model struct {
 	txHist       map[string][]float64
 	netIfaceSel  int // selected interface index in upIfaces list (-1 = none)
 
+	// GPU / SoC tab
+	gpuSnap   probe.GPUInfo
+	backlight probe.BacklightInfo
+	sysNotice string // transient backlight-set status
+
 	tickCount int
 }
 
-func NewModel() Model {
+func NewModel(cfg config.Config) Model {
+	cfg.Sanitize()
+	probe.SetTempThresholds(cfg.TempWarn, cfg.TempHot, cfg.TempCrit)
+
 	pvp := viewport.New(0, 0)
 	nvp := viewport.New(0, 0)
 
@@ -165,18 +204,31 @@ func NewModel() Model {
 	ns.Prompt = "/ "
 	ns.CharLimit = 64
 
+	procEvery := int((cfg.ProcInterval + cfg.FastInterval/2) / cfg.FastInterval)
+	slowEvery := int((cfg.SlowInterval + cfg.FastInterval/2) / cfg.FastInterval)
+	if procEvery < 1 {
+		procEvery = 1
+	}
+	if slowEvery < 1 {
+		slowEvery = 1
+	}
+
 	return Model{
-		activeTab:   tabCPU,
-		tempHist:    map[string][]float64{},
-		diskSampler: probe.NewDiskSampler(),
-		netSampler:  probe.NewNetSampler(),
-		procsVP:     pvp,
-		netVP:       nvp,
-		procsSearch: ps,
-		netSearch:   ns,
-		rxHist:      map[string][]float64{},
-		txHist:      map[string][]float64{},
-		netIfaceSel: -1,
+		cfg:          cfg,
+		fastInterval: cfg.FastInterval,
+		procEvery:    procEvery,
+		slowEvery:    slowEvery,
+		activeTab:    tabFromName(cfg.StartTab),
+		tempHist:     map[string][]float64{},
+		diskSampler:  probe.NewDiskSampler(),
+		netSampler:   probe.NewNetSampler(),
+		procsVP:      pvp,
+		netVP:        nvp,
+		procsSearch:  ps,
+		netSearch:    ns,
+		rxHist:       map[string][]float64{},
+		txHist:       map[string][]float64{},
+		netIfaceSel:  -1,
 	}
 }
 
@@ -189,7 +241,8 @@ func (m Model) Init() tea.Cmd {
 		fetchNetCmd(m.netSampler),
 		fetchConnsCmd(),
 		fetchPowerCmd(),
-		tickEvery(1*time.Second),
+		m.fetchSysCmd(),
+		tickEvery(m.fastInterval),
 	)
 }
 
@@ -264,6 +317,16 @@ func fetchConnsCmd() tea.Cmd {
 	}
 }
 
+func (m Model) fetchSysCmd() tea.Cmd {
+	dev := m.cfg.BacklightDevice
+	return func() tea.Msg {
+		return sysMsg{
+			gpu:       probe.SampleGPU(),
+			backlight: probe.ReadBacklight(dev),
+		}
+	}
+}
+
 // bodyHeight is the content height of a tab's box. The total rendered frame
 // is bodyHeight + 2 (box border) + headerH + footerH, which must never exceed
 // m.h or Bubble Tea's alt-screen renderer blanks the screen on short displays.
@@ -296,6 +359,9 @@ func (m Model) netIfaceLines() int {
 	n += len(up) // one line per interface
 	if m.netIfaceSel >= 0 && m.netIfaceSel < len(up) {
 		n += 2 // RX + TX sparklines for selected
+		if up[m.netIfaceSel].WiFi.Present {
+			n++ // WiFi quality/signal detail line
+		}
 	}
 	n++ // blank line after
 	return n
@@ -334,13 +400,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds := []tea.Cmd{
 			fetchCPUCmd(),
 			fetchMemCmd(),
-			tickEvery(1 * time.Second),
+			tickEvery(m.fastInterval),
 		}
-		if m.tickCount%3 == 0 {
+		if m.tickCount%m.procEvery == 0 {
 			cmds = append(cmds, fetchProcsCmd(), fetchConnsCmd())
 		}
-		if m.tickCount%5 == 0 {
-			cmds = append(cmds, m.fetchDiskCmd(), fetchNetCmd(m.netSampler), fetchPowerCmd())
+		if m.tickCount%m.slowEvery == 0 {
+			cmds = append(cmds, m.fetchDiskCmd(), fetchNetCmd(m.netSampler), fetchPowerCmd(), m.fetchSysCmd())
 		} else {
 			cmds = append(cmds, fetchNetCmd(m.netSampler))
 		}
@@ -425,6 +491,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.netVP.SetContent(hardClipLinesToWidth(m.netText, m.netVP.Width))
 		return m, nil
 
+	case sysMsg:
+		m.gpuSnap = msg.gpu
+		m.backlight = msg.backlight
+		return m, nil
+
 	case errMsg:
 		m.err = msg.error
 		return m, nil
@@ -476,6 +547,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "6":
 			m.activeTab = tabPower
 			return m, nil
+		case "7":
+			m.activeTab = tabGPU
+			return m, nil
+		case "+", "=":
+			if m.activeTab == tabGPU {
+				return m, m.adjustBacklight(m.cfg.BacklightStep)
+			}
+		case "-", "_":
+			if m.activeTab == tabGPU {
+				return m, m.adjustBacklight(-m.cfg.BacklightStep)
+			}
 		case "up":
 			if m.activeTab == tabProc && !m.procsSearching {
 				if m.procsSel > 0 {
@@ -697,14 +779,19 @@ func (m Model) View() string {
 		body = m.viewNet()
 	case tabPower:
 		body = m.viewPower()
+	case tabGPU:
+		body = m.viewGPU()
 	}
 
-	footerText := "Keys: tab/←/→ switch • 1-6 jump • / search • ctrl+u clear • ctrl+c quit"
+	footerText := "Keys: tab/←/→ switch • 1-7 jump • / search • ctrl+u clear • ctrl+c quit"
 	if m.activeTab == tabNet && !m.netSearching {
-		footerText = "Keys: tab/←/→ switch • 1-6 jump • j/k iface • / search • ctrl+u clear • ctrl+c quit"
+		footerText = "Keys: tab/←/→ switch • 1-7 jump • j/k iface • / search • ctrl+u clear • ctrl+c quit"
 	}
 	if m.activeTab == tabProc && !m.procsSearching {
 		footerText = "Keys: ↑↓ select • s sort • t tree • k/K kill • / filter • tab switch • ctrl+c quit"
+	}
+	if m.activeTab == tabGPU {
+		footerText = "Keys: +/- brightness • tab/←/→ switch • 1-7 jump • ctrl+c quit"
 	}
 	footer := subtleStyle.Render(footerText)
 	if m.err != nil {
@@ -725,6 +812,7 @@ func (m Model) renderHeader() string {
 		renderTab("4 Disk", m.activeTab == tabDisk),
 		renderTab("5 Network", m.activeTab == tabNet),
 		renderTab("6 Power", m.activeTab == tabPower),
+		renderTab("7 GPU", m.activeTab == tabGPU),
 	}
 
 	left := titleStyle.Render(fmt.Sprintf("ucmon %s", version)) + " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
@@ -1386,12 +1474,18 @@ func (m Model) viewNet() string {
 				addr = trunc(ii.Addrs[0], 22)
 			}
 
-			b.WriteString(fmt.Sprintf("%s%s  %s  %s  %s\n",
+			wifi := ""
+			if ii.WiFi.Present {
+				wifi = "  " + wifiSummary(ii.WiFi)
+			}
+
+			b.WriteString(fmt.Sprintf("%s%s  %s  %s  %s%s\n",
 				marker,
 				nameStyle.Render(padRight(ii.Name, 16)),
 				subtleStyle.Render(padRight(addr, 22)),
 				rateStyle.Render(fmt.Sprintf("RX:%-10s", rxS)),
 				rateStyle.Render(fmt.Sprintf("TX:%-10s", txS)),
+				wifi,
 			))
 
 			// Expanded detail for selected interface
@@ -1400,6 +1494,15 @@ func (m Model) viewNet() string {
 				txSpark := Spark(m.txHist[ii.Name], chartW)
 				b.WriteString(fmt.Sprintf("    RX: %-12s %s\n", rxS, rxSpark))
 				b.WriteString(fmt.Sprintf("    TX: %-12s %s\n", txS, txSpark))
+				if ii.WiFi.Present {
+					w := ii.WiFi
+					col := wifiColor(w)
+					wStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(col))
+					b.WriteString("    " + subtleStyle.Render("WiFi: ") +
+						wStyle.Render(fmt.Sprintf("%.0f%% quality", w.QualityPct)) + "  " +
+						wStyle.Render(fmt.Sprintf("%.0f dBm", w.SignalDBm)) + "  " +
+						RenderBar(w.QualityPct, min(20, chartW), col) + "\n")
+				}
 			}
 		}
 		b.WriteString("\n")
@@ -1623,6 +1726,113 @@ func (m Model) viewPower() string {
 		b.WriteString("  " + flag(t.FreqCappedNow, t.FreqCappedOccurred, "ARM freq capped") + "\n")
 		b.WriteString("  " + flag(t.ThrottledNow, t.ThrottledOccurred, "Throttled") + "\n")
 		b.WriteString("  " + flag(t.SoftTempLimitNow, t.SoftTempLimitOccurred, "Soft temp limit") + "\n")
+	}
+
+	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+}
+
+// wifiColor picks a color for a wireless link by quality/signal strength.
+func wifiColor(w probe.WiFiInfo) string {
+	switch {
+	case w.QualityPct >= 66 || w.SignalDBm >= -55:
+		return "42" // green: strong
+	case w.QualityPct >= 33 || w.SignalDBm >= -70:
+		return "214" // orange: fair
+	default:
+		return "196" // red: weak
+	}
+}
+
+// wifiSummary renders a compact, colored "WiFi 72% -48dBm" tag for a list row.
+func wifiSummary(w probe.WiFiInfo) string {
+	col := wifiColor(w)
+	style := lipgloss.NewStyle().Foreground(lipgloss.Color(col))
+	return style.Render(fmt.Sprintf("WiFi %.0f%% %.0fdBm", w.QualityPct, w.SignalDBm))
+}
+
+// adjustBacklight nudges screen brightness by delta percent and refreshes the
+// reading. Permission errors are surfaced in the status line, not fatal.
+func (m *Model) adjustBacklight(delta int) tea.Cmd {
+	if !m.backlight.Present {
+		m.sysNotice = subtleStyle.Render("no backlight device detected")
+		return nil
+	}
+	target := m.backlight.Percent + delta
+	if target < 0 {
+		target = 0
+	}
+	if target > 100 {
+		target = 100
+	}
+	if err := probe.SetBacklightPercent(m.backlight.Device, target); err != nil {
+		m.sysNotice = errStyle.Render("brightness: " + err.Error())
+		return nil
+	}
+	m.backlight.Percent = target // optimistic; fetchSysCmd reconciles
+	m.sysNotice = okStyle.Render(fmt.Sprintf("brightness → %d%%", target))
+	return m.fetchSysCmd()
+}
+
+func (m Model) viewGPU() string {
+	bodyH := m.bodyHeight()
+	w := min(m.w-2, 140)
+	chartW := max(10, w-20)
+
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("GPU / VideoCore & Display") + "\n\n")
+
+	b.WriteString(titleStyle.Render("Backlight") + "\n")
+	if !m.backlight.Present {
+		b.WriteString("  " + subtleStyle.Render("no backlight device under /sys/class/backlight") + "\n")
+	} else {
+		bl := m.backlight
+		b.WriteString(fmt.Sprintf("  %s  %s  %s\n",
+			subtleStyle.Render(bl.Device),
+			okStyle.Render(fmt.Sprintf("%d%%", bl.Percent)),
+			subtleStyle.Render(fmt.Sprintf("(%d / %d)", bl.Brightness, bl.Max)),
+		))
+		b.WriteString("  " + RenderBar(float64(bl.Percent), min(40, chartW), "42") + "\n")
+		hint := subtleStyle.Render(fmt.Sprintf("  +/- to adjust (step %d%%)", m.cfg.BacklightStep))
+		if !bl.Writable {
+			hint = warnStyle.Render("  read-only (needs root or a udev rule to change)")
+		}
+		b.WriteString(hint + "\n")
+	}
+	if m.sysNotice != "" {
+		b.WriteString("  " + m.sysNotice + "\n")
+	}
+	b.WriteString("\n")
+
+	b.WriteString(titleStyle.Render("VideoCore") + "\n")
+	if !m.gpuSnap.Available {
+		b.WriteString("  " + subtleStyle.Render("vcgencmd unavailable (not a Raspberry Pi / uConsole)") + "\n")
+		return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+	}
+
+	g := m.gpuSnap
+	if g.CoreTempC > 0 {
+		tcol := probe.TempColor(g.CoreTempC)
+		tStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(tcol))
+		b.WriteString("  " + subtleStyle.Render(padRight("Core temp", 12)) + " " +
+			tStyle.Render(probe.FormatTemp(g.CoreTempC)) + "\n")
+	}
+	if g.CoreVolts > 0 {
+		b.WriteString("  " + subtleStyle.Render(padRight("Core volts", 12)) + " " +
+			fmt.Sprintf("%.4f V", g.CoreVolts) + "\n")
+	}
+	if g.MemARMMB > 0 || g.MemGPUMB > 0 {
+		b.WriteString("  " + subtleStyle.Render(padRight("Mem split", 12)) + " " +
+			fmt.Sprintf("CPU %dM  /  GPU %dM", g.MemARMMB, g.MemGPUMB) + "\n")
+	}
+
+	if len(g.Clocks) > 0 {
+		b.WriteString("\n  " + titleStyle.Render("Clocks") + "\n")
+		for _, c := range g.Clocks {
+			b.WriteString(fmt.Sprintf("    %s %s\n",
+				subtleStyle.Render(padRight(strings.ToUpper(c.Name), 6)),
+				okStyle.Render(fmt.Sprintf("%.0f MHz", c.MHz)),
+			))
+		}
 	}
 
 	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))

@@ -18,8 +18,13 @@ ucmon/
 │   │   ├── procs.go            # Process listing
 │   │   ├── disk.go             # Disk usage & I/O counters
 │   │   ├── net.go              # Network interfaces & connections
+│   │   ├── wifi.go             # WiFi link quality/signal (/proc/net/wireless)
 │   │   ├── power.go            # Battery, RPi throttle, load average
+│   │   ├── gpu.go              # VideoCore clocks/temp/volts/mem (vcgencmd)
+│   │   ├── backlight.go        # Display backlight read/set (/sys/class/backlight)
 │   │   └── util.go             # Formatting helpers
+│   ├── config/                 # Optional TOML-subset config loader
+│   │   └── config.go
 │   └── ui/                     # Presentation layer
 │       ├── model.go            # Bubble Tea model (state, Update, View)
 │       ├── styles.go           # Lipgloss style definitions
@@ -93,6 +98,9 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
 ### Tab 5: Network
 
 - Active interface summary with MAC, address, RX/TX rates and sparkline history
+- WiFi interfaces show a color-coded link-quality % and signal dBm inline; the
+  selected interface expands to a quality bar (parsed from `/proc/net/wireless`,
+  no external tooling)
 - Connection table: protocol, local/remote address, status, PID, process name
 - LISTEN connections sorted first
 - Search/filter support for connection table
@@ -102,19 +110,41 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
 - Battery: charge %, charging status, voltage, instantaneous watts, estimated time to empty/full, technology — read directly from `/sys/class/power_supply` (works with the uConsole axp20x driver and standard laptop batteries); AC/USB mains presence
 - Load average: 1/5/15-minute, color-coded against CPU count, with sparkline history
 - Raspberry Pi throttle / under-voltage: parses `vcgencmd get_throttled`, showing both current and since-boot flags for under-voltage, ARM frequency capping, throttling, and soft temperature limit. Gracefully reports unavailable when `vcgencmd` is absent (non-Pi hosts)
-- Refreshed every 5 seconds
+- Refreshed on the slow interval
+
+### Tab 7: GPU / VideoCore & Display
+
+- Display **backlight**: device, current %, raw brightness/max, and a bar, read
+  from `/sys/class/backlight`. `+`/`-` adjust brightness by `backlight_step`
+  percent. When the brightness file isn't writable (no root / udev rule) the
+  value is shown read-only with a hint instead of erroring
+- **VideoCore** (Raspberry Pi / uConsole, via `vcgencmd`): SoC core temperature
+  (color-coded against the same thresholds as CPU temps), core voltage, the
+  CPU↔GPU memory split, and per-domain clocks (arm/core/v3d/h264/isp/hevc).
+  Reports unavailable on non-Pi hosts
+- Refreshed on the slow interval
 
 ## Refresh Intervals
 
-| Data             | Interval |
-|------------------|----------|
-| CPU / temps      | 1s       |
-| Memory / swap    | 1s       |
-| Network I/O      | 1s       |
-| Processes        | 3s       |
-| Connections      | 3s       |
-| Disk usage/IO    | 5s       |
-| Battery/throttle | 5s       |
+Three configurable cadences drive all sampling (defaults shown). The base
+"fast" tick schedules the others by integer multiples.
+
+| Data                         | Setting         | Default |
+|------------------------------|-----------------|---------|
+| CPU / memory / network I/O   | `fast_interval` | 1s      |
+| Processes / connections      | `proc_interval` | 3s      |
+| Disk / battery / GPU / SoC    | `slow_interval` | 5s      |
+
+## Configuration
+
+ucmon loads `$XDG_CONFIG_HOME/ucmon/config.toml` (`~/.config/ucmon/config.toml`)
+if present; otherwise built-in defaults apply. The loader (`internal/config`)
+parses the flat `key = value` TOML subset by hand — comments (`#`/`;`) and
+`[section]` headers are skipped, values may be quoted, and durations accept a Go
+duration string or a bare number of seconds. No third-party TOML dependency is
+added, preserving the pure-Go cross-compile. Keys: `start_tab`, `fast_interval`,
+`proc_interval`, `slow_interval`, `temp_warn`/`temp_hot`/`temp_crit`,
+`backlight_step`, `backlight_device`. See the README for an annotated example.
 
 ## Keyboard Controls
 
@@ -122,7 +152,8 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
 |------------------|---------------------------|
 | `tab` / `→`      | Next tab                  |
 | `shift+tab` / `←`| Previous tab              |
-| `1` - `6`        | Jump to tab               |
+| `1` - `7`        | Jump to tab               |
+| `+` / `-`        | Adjust backlight (tab 7)  |
 | `/`              | Activate search (tabs 3,5)|
 | `enter`          | Apply search filter       |
 | `esc`            | Cancel search / kill      |

@@ -113,13 +113,34 @@ func readThermalZones() []TempReading {
 	return out
 }
 
+// Temperature color thresholds (°C). Overridable from config via
+// SetTempThresholds; defaults match the original hard-coded values.
+var (
+	tempWarn float64 = 50 // yellow
+	tempHot  float64 = 65 // orange
+	tempCrit float64 = 80 // red
+)
+
+// SetTempThresholds overrides the warn/hot/crit boundaries used by TempColor.
+func SetTempThresholds(warn, hot, crit float64) {
+	if warn > 0 {
+		tempWarn = warn
+	}
+	if hot > 0 {
+		tempHot = hot
+	}
+	if crit > 0 {
+		tempCrit = crit
+	}
+}
+
 func TempColor(t float64) string {
 	switch {
-	case t >= 80:
+	case t >= tempCrit:
 		return "196" // red
-	case t >= 65:
+	case t >= tempHot:
 		return "214" // orange
-	case t >= 50:
+	case t >= tempWarn:
 		return "226" // yellow
 	default:
 		return "42" // green
