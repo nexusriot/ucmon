@@ -10,8 +10,33 @@ Built in Go with the [Bubble Tea](https://github.com/charmbracelet/bubbletea) fr
 - **Memory** — RAM total/used/free/available/cached/buffers and swap, with bars and sparkline history
 - **Processes** — searchable list with a movable cursor, sortable by CPU / MEM / PID / NAME, a parent/child tree view, a command-line detail line, and SIGTERM/SIGKILL with confirmation
 - **Disk** — partition usage with color-coded bars, plus per-device read/write rates
-- **Network** — interface throughput with sparklines and a searchable connection table (protocol, addresses, status, PID, process)
+- **Network** — interface throughput with sparklines and a searchable connection table (protocol, addresses, status, PID, process); **WiFi link quality / signal dBm** for wireless interfaces (from `/proc/net/wireless`)
 - **Power & System Health** — battery charge/status/time-left (uConsole/Pi via `/sys/class/power_supply`), 1/5/15-min load average, and Raspberry Pi throttle / under-voltage flags via `vcgencmd`
+- **GPU / VideoCore** — Raspberry Pi / uConsole SoC core temp, voltage, clock domains (arm/core/v3d/…) and CPU↔GPU memory split via `vcgencmd`, plus **display backlight readout and `+`/`-` control** (`/sys/class/backlight`)
+
+## Configuration
+
+ucmon runs with sensible defaults and needs no config. To customise, create
+`~/.config/ucmon/config.toml` (respects `$XDG_CONFIG_HOME`):
+
+```toml
+start_tab        = "cpu"   # cpu | mem | proc | disk | net | power | gpu
+fast_interval    = "1s"    # CPU / memory / network throughput tick
+proc_interval    = "3s"    # process & connection list
+slow_interval    = "5s"    # disk, power, GPU/SoC
+temp_warn        = 50      # °C — yellow threshold
+temp_hot         = 65      # °C — orange threshold
+temp_crit        = 80      # °C — red threshold
+backlight_step   = 10      # percent change per +/- keypress
+# backlight_device = "intel_backlight"  # override auto-detect
+```
+
+Intervals accept a Go duration (`"500ms"`, `"2s"`) or a bare number of seconds.
+Unknown keys, comments (`#`), and `[section]` headers are ignored.
+
+> Changing backlight brightness writes to `/sys/class/backlight/<dev>/brightness`,
+> which usually requires root or a udev rule granting your user write access. ucmon
+> shows the brightness read-only otherwise.
 
 ## Install
 
@@ -47,7 +72,8 @@ make help               # list all targets
 |--------------------|------------------------------|
 | `tab` / `→`        | Next tab                     |
 | `shift+tab` / `←`  | Previous tab                 |
-| `1` – `6`          | Jump to tab                  |
+| `1` – `7`          | Jump to tab                  |
+| `+` / `-`          | Adjust backlight (GPU tab)    |
 | `/`                | Activate search (procs, net) |
 | `enter`            | Apply search filter          |
 | `esc`              | Cancel search / kill prompt  |

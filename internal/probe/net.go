@@ -21,6 +21,7 @@ type IfaceInfo struct {
 	TxBps    float64
 	RxTotal  uint64
 	TxTotal  uint64
+	WiFi     WiFiInfo // populated for wireless interfaces (WiFi.Present)
 }
 
 type NetSnapshot struct {
@@ -72,6 +73,8 @@ func (s *NetSampler) Sample() (NetSnapshot, error) {
 		dt = 1
 	}
 
+	wifi := readWirelessStats()
+
 	out := make([]IfaceInfo, 0, len(ifs))
 	for _, nif := range ifs {
 		ii := IfaceInfo{
@@ -79,6 +82,9 @@ func (s *NetSampler) Sample() (NetSnapshot, error) {
 			MTU:      nif.MTU,
 			Hardware: nif.HardwareAddr.String(),
 			IsUp:     (nif.Flags&net.FlagUp != 0),
+		}
+		if w, ok := wifi[nif.Name]; ok {
+			ii.WiFi = w
 		}
 
 		addrs, _ := nif.Addrs()

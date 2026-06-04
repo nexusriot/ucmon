@@ -6,12 +6,15 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/nexusriot/ucmon/internal/config"
 	"github.com/nexusriot/ucmon/internal/ui"
 )
 
 func main() {
+	cfg := config.Load()
+
 	p := tea.NewProgram(
-		ui.NewModel(),
+		ui.NewModel(cfg),
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)
