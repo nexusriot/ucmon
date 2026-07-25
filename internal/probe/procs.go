@@ -1,11 +1,9 @@
 package probe
 
 import (
-	"fmt"
 	"sort"
 	"sync"
 	"syscall"
-	"time"
 	"unicode/utf8"
 
 	"github.com/shirou/gopsutil/v4/process"
@@ -222,17 +220,4 @@ func ClampNice(n int) int {
 // the raw EPERM/EACCES error is returned for the UI to surface.
 func SetNice(pid int32, nice int) error {
 	return syscall.Setpriority(syscall.PRIO_PROCESS, int(pid), ClampNice(nice))
-}
-
-func FormatProcCPU(pct float64) string {
-	return fmt.Sprintf("%.1f%%", pct)
-}
-
-func FormatProcMem(pct float32) string {
-	return fmt.Sprintf("%.1f%%", pct)
-}
-
-func FormatCreateTime(createTime int64) string {
-	t := time.Unix(createTime/1000, 0)
-	return t.Format("15:04:05")
 }

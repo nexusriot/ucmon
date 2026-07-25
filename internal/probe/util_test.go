@@ -2,7 +2,6 @@ package probe
 
 import (
 	"testing"
-	"time"
 )
 
 func TestHumanBytesPerSec(t *testing.T) {
@@ -43,27 +42,5 @@ func TestClampHistory(t *testing.T) {
 	ints := ClampHistory([]int{1, 2, 3}, 2) // generic over element type
 	if len(ints) != 2 || ints[0] != 2 {
 		t.Errorf("int history: %v", ints)
-	}
-}
-
-func TestSince(t *testing.T) {
-	if d := Since(time.Time{}); d != 0 {
-		t.Errorf("Since(zero) = %v", d)
-	}
-	if d := Since(time.Now().Add(-time.Hour)); d < 59*time.Minute {
-		t.Errorf("Since(1h ago) = %v", d)
-	}
-}
-
-func TestProcFormatters(t *testing.T) {
-	if got := FormatProcCPU(12.34); got != "12.3%" {
-		t.Errorf("FormatProcCPU = %q", got)
-	}
-	if got := FormatProcMem(5.67); got != "5.7%" {
-		t.Errorf("FormatProcMem = %q", got)
-	}
-	ct := time.Date(2026, 7, 25, 13, 45, 12, 0, time.Local)
-	if got := FormatCreateTime(ct.UnixMilli()); got != "13:45:12" {
-		t.Errorf("FormatCreateTime = %q", got)
 	}
 }

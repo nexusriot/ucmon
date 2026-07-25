@@ -23,7 +23,7 @@ func TestReadWirelessStats(t *testing.T) {
 	if !ok {
 		t.Fatalf("wlan0 missing: %v", stats)
 	}
-	if !w.Present || w.LinkQuality != 56 || w.SignalDBm != -54 {
+	if !w.Present || w.SignalDBm != -54 {
 		t.Errorf("got %+v", w)
 	}
 	if w.QualityPct != 80 {

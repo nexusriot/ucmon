@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // psiBase is a var so tests can point it at a fake /proc/pressure tree.
@@ -15,14 +14,12 @@ var psiBase = "/proc/pressure"
 // wall time at least one task was stalled on the resource; "full" = all
 // non-idle tasks were stalled (memory/io only in practice).
 type PSIRes struct {
-	SomeAvg10  float64
-	SomeAvg60  float64
-	SomeAvg300 float64
-	FullAvg10  float64
-	FullAvg60  float64
-	FullAvg300 float64
-	HasSome    bool
-	HasFull    bool
+	SomeAvg10 float64
+	SomeAvg60 float64
+	FullAvg10 float64
+	FullAvg60 float64
+	HasSome   bool
+	HasFull   bool
 }
 
 type PSISnapshot struct {
@@ -30,13 +27,12 @@ type PSISnapshot struct {
 	CPU     PSIRes
 	Mem     PSIRes
 	IO      PSIRes
-	TakenAt time.Time
 }
 
 // ReadPSI reads /proc/pressure/{cpu,memory,io}. Kernels without PSI simply
 // yield Present=false.
 func ReadPSI() PSISnapshot {
-	snap := PSISnapshot{TakenAt: time.Now()}
+	var snap PSISnapshot
 	for name, dst := range map[string]*PSIRes{
 		"cpu":    &snap.CPU,
 		"memory": &snap.Mem,
@@ -65,22 +61,20 @@ func parsePSI(s string) PSIRes {
 		if len(fields) < 2 {
 			continue
 		}
-		var a10, a60, a300 float64
+		var a10, a60 float64
 		for _, f := range fields[1:] {
 			switch {
 			case strings.HasPrefix(f, "avg10="):
 				a10, _ = strconv.ParseFloat(f[len("avg10="):], 64)
 			case strings.HasPrefix(f, "avg60="):
 				a60, _ = strconv.ParseFloat(f[len("avg60="):], 64)
-			case strings.HasPrefix(f, "avg300="):
-				a300, _ = strconv.ParseFloat(f[len("avg300="):], 64)
 			}
 		}
 		switch fields[0] {
 		case "some":
-			r.SomeAvg10, r.SomeAvg60, r.SomeAvg300, r.HasSome = a10, a60, a300, true
+			r.SomeAvg10, r.SomeAvg60, r.HasSome = a10, a60, true
 		case "full":
-			r.FullAvg10, r.FullAvg60, r.FullAvg300, r.HasFull = a10, a60, a300, true
+			r.FullAvg10, r.FullAvg60, r.HasFull = a10, a60, true
 		}
 	}
 	return r

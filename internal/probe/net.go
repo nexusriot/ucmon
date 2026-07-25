@@ -14,16 +14,12 @@ import (
 )
 
 type IfaceInfo struct {
-	Name     string
-	MTU      int
-	Hardware string
-	Addrs    []string
-	IsUp     bool
-	RxBps    float64
-	TxBps    float64
-	RxTotal  uint64
-	TxTotal  uint64
-	WiFi     WiFiInfo // populated for wireless interfaces (WiFi.Present)
+	Name  string
+	Addrs []string
+	IsUp  bool
+	RxBps float64
+	TxBps float64
+	WiFi  WiFiInfo // populated for wireless interfaces (WiFi.Present)
 }
 
 type NetSnapshot struct {
@@ -84,10 +80,8 @@ func (s *NetSampler) Sample() (NetSnapshot, error) {
 	out := make([]IfaceInfo, 0, len(ifs))
 	for _, nif := range ifs {
 		ii := IfaceInfo{
-			Name:     nif.Name,
-			MTU:      nif.MTU,
-			Hardware: nif.HardwareAddr.String(),
-			IsUp:     (nif.Flags&net.FlagUp != 0),
+			Name: nif.Name,
+			IsUp: (nif.Flags&net.FlagUp != 0),
 		}
 		if w, ok := wifi[nif.Name]; ok {
 			ii.WiFi = w
@@ -99,9 +93,6 @@ func (s *NetSampler) Sample() (NetSnapshot, error) {
 		}
 
 		if c, ok := cur[nif.Name]; ok {
-			ii.RxTotal = c.BytesRecv
-			ii.TxTotal = c.BytesSent
-
 			if prev, ok2 := s.last[nif.Name]; ok2 {
 				ii.RxBps = float64(c.BytesRecv-prev.BytesRecv) / dt
 				ii.TxBps = float64(c.BytesSent-prev.BytesSent) / dt

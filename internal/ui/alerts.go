@@ -160,8 +160,6 @@ func (e *alertEngine) clearLog() {
 	e.log = e.log[:0]
 }
 
-// ── Delivery side effects ──
-
 // handleAlertEvents runs the configured delivery actions for freshly logged
 // events: terminal bell on a new critical, the alert_cmd hook, and the
 // on-disk alert log.
@@ -234,8 +232,6 @@ func runAlertCmd(cmdline string, ev alertEntry) {
 	cmd.Env = append(os.Environ(), alertCmdEnv(ev)...)
 	_ = cmd.Run()
 }
-
-// ── Model integration ──
 
 // currentAlertConds evaluates the latest probe snapshots against the configured
 // thresholds and returns the set of conditions that are true right now.

@@ -2,7 +2,6 @@ package probe
 
 import (
 	"fmt"
-	"time"
 )
 
 func HumanBytes(b uint64) string {
@@ -41,11 +40,4 @@ func ClampHistory[T any](s []T, max int) []T {
 		return s
 	}
 	return s[len(s)-max:]
-}
-
-func Since(t time.Time) time.Duration {
-	if t.IsZero() {
-		return 0
-	}
-	return time.Since(t)
 }

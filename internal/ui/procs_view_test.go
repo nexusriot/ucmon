@@ -85,7 +85,7 @@ func TestTreeToggleAndSortKeys(t *testing.T) {
 	if len(m.procsPrefix) != len(m.procsView) {
 		t.Errorf("tree prefixes not aligned: %d vs %d", len(m.procsPrefix), len(m.procsView))
 	}
-	if !strings.Contains(m.procsText, "└─") {
+	if !strings.Contains(m.renderProcsText(), "└─") {
 		t.Error("tree glyphs missing from rendered text")
 	}
 

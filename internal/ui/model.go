@@ -199,7 +199,6 @@ type Model struct {
 	procsView      []probe.ProcInfo // filtered + sorted + capped (cursor maps to this)
 	procsVP        viewport.Model
 	procsHeader    string
-	procsText      string
 	procsSearch    textinput.Model
 	procsSearching bool
 	procsQuery     string
@@ -1051,8 +1050,6 @@ func (m *Model) setNotice(s string) {
 	m.noticeUntil = time.Now().Add(5 * time.Second)
 }
 
-// ── View ──
-
 func (m Model) View() string {
 	header := m.renderHeader()
 
@@ -1193,8 +1190,6 @@ func joinTabsWithinWidth(tabs []string, maxW int) string {
 	return out.String()
 }
 
-// ── Alerts ──
-
 // alertsTabLabel adds a live count badge to the Alerts tab when conditions fire.
 func (m Model) alertsTabLabel() string {
 	if _, n, any := m.alerts.summary(); any {
@@ -1284,8 +1279,6 @@ func (m Model) viewAlerts() string {
 	content := title + "\n\n" + m.alertsVP.View()
 	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(content, bodyH))
 }
-
-// ── Tab 1: CPU / Temperature ──
 
 func (m Model) viewCPU() string {
 	bodyH := m.bodyHeight()
@@ -1444,8 +1437,6 @@ func (m Model) viewCPU() string {
 	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
 }
 
-// ── Tab 2: Memory ──
-
 func (m Model) viewMem() string {
 	bodyH := m.bodyHeight()
 	w := min(m.w-2, 140)
@@ -1492,8 +1483,6 @@ func (m Model) viewMem() string {
 	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
 }
 
-// ── Tab 3: Processes ──
-
 func (m Model) viewProcs() string {
 	procsW := min(m.w-2, 140)
 	procsH := m.bodyHeight()
@@ -1537,21 +1526,33 @@ func (m Model) viewProcs() string {
 	return boxStyle.Width(procsW).Height(procsH).Render(clipHeight(content, procsH))
 }
 
+// procsCols computes the process-table column widths for the current
+// viewport; the header and the rows must agree on them.
+func (m Model) procsCols() (colPID, colUser, colName, colCPU, colMem, colRSS, colStat int) {
+	w := m.procsVP.Width
+	if w <= 0 {
+		w = 120
+	}
+
+	colPID, colUser, colCPU, colMem, colRSS, colStat = 7, 10, 7, 7, 10, 3
+	nameCap := 30
+	if m.procsTree && m.procsQuery == "" {
+		nameCap = 48 // leave room for tree-branch indentation
+	}
+	colName = max(12, w-colPID-colUser-colCPU-colMem-colRSS-colStat-14)
+	if colName > nameCap {
+		colName = nameCap
+	}
+	return colPID, colUser, colName, colCPU, colMem, colRSS, colStat
+}
+
 func (m Model) buildProcsHeader() string {
 	w := m.procsVP.Width
 	if w <= 0 {
 		w = 120
 	}
 
-	colPID, colUser, colCPU, colMem, colRSS, colStat := 7, 10, 7, 7, 10, 3
-	nameCap := 30
-	if m.procsTree && m.procsQuery == "" {
-		nameCap = 48 // leave room for tree-branch indentation
-	}
-	colName := max(12, w-colPID-colUser-colCPU-colMem-colRSS-colStat-14)
-	if colName > nameCap {
-		colName = nameCap
-	}
+	colPID, colUser, colName, colCPU, colMem, colRSS, colStat := m.procsCols()
 
 	h := fmt.Sprintf("  %s  %s  %s  %s  %s  %s  %s",
 		padRight("PID", colPID),
@@ -1597,18 +1598,7 @@ func (m Model) computeProcsView() []probe.ProcInfo {
 		out = append(out, p)
 	}
 
-	sort.SliceStable(out, func(i, j int) bool {
-		switch m.procsSort {
-		case sortMem:
-			return out[i].MemPct > out[j].MemPct
-		case sortPID:
-			return out[i].PID < out[j].PID
-		case sortName:
-			return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
-		default:
-			return out[i].CPUPct > out[j].CPUPct
-		}
-	})
+	m.sortProcSlice(out)
 
 	if len(out) > procsDisplayCap {
 		out = out[:procsDisplayCap]
@@ -1705,15 +1695,13 @@ func (m *Model) refreshProcs() {
 		m.procsSel = 0
 	}
 	m.procsHeader = m.buildProcsHeader()
-	m.procsText = m.renderProcsText()
-	m.procsVP.SetContent(hardClipLinesToWidth(m.procsText, m.procsVP.Width))
+	m.procsVP.SetContent(hardClipLinesToWidth(m.renderProcsText(), m.procsVP.Width))
 	m.ensureProcVisible()
 }
 
 // rerenderProcs re-renders the (unchanged) view after a cursor move.
 func (m *Model) rerenderProcs() {
-	m.procsText = m.renderProcsText()
-	m.procsVP.SetContent(hardClipLinesToWidth(m.procsText, m.procsVP.Width))
+	m.procsVP.SetContent(hardClipLinesToWidth(m.renderProcsText(), m.procsVP.Width))
 	m.ensureProcVisible()
 }
 
@@ -1740,20 +1728,7 @@ func (m Model) selectedProc() (probe.ProcInfo, bool) {
 func (m Model) renderProcsText() string {
 	var b strings.Builder
 
-	w := m.procsVP.Width
-	if w <= 0 {
-		w = 120
-	}
-
-	colPID, colUser, colCPU, colMem, colRSS, colStat := 7, 10, 7, 7, 10, 3
-	nameCap := 30
-	if m.procsTree && m.procsQuery == "" {
-		nameCap = 48 // leave room for tree-branch indentation
-	}
-	colName := max(12, w-colPID-colUser-colCPU-colMem-colRSS-colStat-14)
-	if colName > nameCap {
-		colName = nameCap
-	}
+	colPID, colUser, colName, colCPU, colMem, colRSS, colStat := m.procsCols()
 
 	if len(m.procs) == 0 {
 		b.WriteString("No data (yet)…\n")
@@ -1806,8 +1781,6 @@ func (m Model) renderProcsText() string {
 
 	return b.String()
 }
-
-// ── Tab 4: Disk ──
 
 func (m Model) viewDisk() string {
 	bodyH := m.bodyHeight()
@@ -1880,8 +1853,6 @@ func (m Model) viewDisk() string {
 
 	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
 }
-
-// ── Tab 5: Network ──
 
 func (m Model) viewNet() string {
 	bodyH := m.bodyHeight()
@@ -2090,17 +2061,23 @@ func (m Model) connSummaryLine() string {
 	return line
 }
 
-func (m Model) buildNetHeader() string {
-	w := m.netVP.Width
+// netCols computes the connection-table column widths for the current
+// viewport; the header and the rows must agree on them.
+func (m Model) netCols() (w, colProto, colLocal, colRemote, colStatus, colPID int) {
+	w = m.netVP.Width
 	if w <= 0 {
 		w = 120
 	}
+	colProto = 4
+	colLocal = min(28, max(16, w/4))
+	colRemote = colLocal
+	colStatus = 12
+	colPID = 7
+	return w, colProto, colLocal, colRemote, colStatus, colPID
+}
 
-	colProto := 4
-	colLocal := min(28, max(16, w/4))
-	colRemote := min(28, max(16, w/4))
-	colStatus := 12
-	colPID := 7
+func (m Model) buildNetHeader() string {
+	w, colProto, colLocal, colRemote, colStatus, colPID := m.netCols()
 
 	h := fmt.Sprintf("%s  %s  %s  %s  %s  %s",
 		padRight("PR", colProto),
@@ -2117,16 +2094,7 @@ func (m Model) buildNetHeader() string {
 func (m Model) renderNetText() string {
 	var b strings.Builder
 
-	w := m.netVP.Width
-	if w <= 0 {
-		w = 120
-	}
-
-	colProto := 4
-	colLocal := min(28, max(16, w/4))
-	colRemote := min(28, max(16, w/4))
-	colStatus := 12
-	colPID := 7
+	w, colProto, colLocal, colRemote, colStatus, colPID := m.netCols()
 
 	if len(m.conns) == 0 {
 		b.WriteString("No data (yet)…\n")
@@ -2178,8 +2146,6 @@ func (m Model) renderNetText() string {
 	return b.String()
 }
 
-// ── Tab 6: Power & System Health ──
-
 func (m Model) viewPower() string {
 	bodyH := m.bodyHeight()
 	w := min(m.w-2, 140)
@@ -2198,7 +2164,6 @@ func (m Model) viewPower() string {
 	// so the battery/throttle status lines always survive the height clip.
 	roomy := bodyH >= 16
 
-	// ── Battery ──
 	if !p.Battery.Present {
 		b.WriteString(titleStyle.Render("Battery ") + subtleStyle.Render("no battery detected") + "\n")
 	} else {
@@ -2275,7 +2240,6 @@ func (m Model) viewPower() string {
 	}
 	b.WriteString("\n")
 
-	// ── Load average ──
 	la := p.Load
 	loadColor := "42"
 	if la.CPUCount > 0 {
@@ -2303,7 +2267,6 @@ func (m Model) viewPower() string {
 	}
 	b.WriteString("\n")
 
-	// ── Throttle / under-voltage (Raspberry Pi / uConsole) ──
 	t := p.Throttle
 	if !t.Available {
 		b.WriteString(titleStyle.Render("Throttle") + " " +
@@ -2504,18 +2467,4 @@ func statusStyled(s string) string {
 	default:
 		return subtleStyle.Render(s)
 	}
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

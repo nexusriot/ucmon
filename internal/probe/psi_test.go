@@ -11,11 +11,11 @@ func TestParsePSI(t *testing.T) {
 	if !r.HasSome || !r.HasFull {
 		t.Fatalf("HasSome=%v HasFull=%v", r.HasSome, r.HasFull)
 	}
-	if r.SomeAvg10 != 1.25 || r.SomeAvg60 != 0.50 || r.SomeAvg300 != 0.10 {
-		t.Errorf("some = %v/%v/%v", r.SomeAvg10, r.SomeAvg60, r.SomeAvg300)
+	if r.SomeAvg10 != 1.25 || r.SomeAvg60 != 0.50 {
+		t.Errorf("some = %v/%v", r.SomeAvg10, r.SomeAvg60)
 	}
-	if r.FullAvg10 != 0.75 || r.FullAvg60 != 0.25 || r.FullAvg300 != 0.05 {
-		t.Errorf("full = %v/%v/%v", r.FullAvg10, r.FullAvg60, r.FullAvg300)
+	if r.FullAvg10 != 0.75 || r.FullAvg60 != 0.25 {
+		t.Errorf("full = %v/%v", r.FullAvg10, r.FullAvg60)
 	}
 
 	if r := parsePSI("garbage\n"); r.HasSome || r.HasFull {

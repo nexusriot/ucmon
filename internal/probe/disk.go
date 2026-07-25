@@ -19,11 +19,9 @@ type DiskInfo struct {
 }
 
 type DiskIOInfo struct {
-	Device     string
-	ReadBytes  uint64
-	WriteBytes uint64
-	ReadBps    float64
-	WriteBps   float64
+	Device   string
+	ReadBps  float64
+	WriteBps float64
 }
 
 type DiskSampler struct {
@@ -101,11 +99,7 @@ func ioRates(prev, cur map[string]disk.IOCountersStat, dt float64) []DiskIOInfo 
 	}
 	ios := make([]DiskIOInfo, 0, len(cur))
 	for name, c := range cur {
-		di := DiskIOInfo{
-			Device:     name,
-			ReadBytes:  c.ReadBytes,
-			WriteBytes: c.WriteBytes,
-		}
+		di := DiskIOInfo{Device: name}
 		if p, ok := prev[name]; ok {
 			di.ReadBps = float64(c.ReadBytes-p.ReadBytes) / dt
 			di.WriteBps = float64(c.WriteBytes-p.WriteBytes) / dt

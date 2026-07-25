@@ -158,7 +158,7 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
 
 ### Tab 5: Network
 
-- Active interface summary with MAC, address, RX/TX rates and sparkline history
+- Active interface summary with address, RX/TX rates and sparkline history
 - WiFi interfaces show a color-coded link-quality % and signal dBm inline; the
   selected interface expands to a quality bar (parsed from `/proc/net/wireless`,
   no external tooling) plus SSID / channel / tx-rx bitrates when `iw` is
@@ -337,7 +337,7 @@ architectures cross-compile from one machine. Each `.deb` installs the binary to
 ## Dependencies
 
 - `github.com/charmbracelet/bubbletea` - TUI framework
-- `github.com/charmbracelet/bubbles` - UI components (viewport, textinput, list)
+- `github.com/charmbracelet/bubbles` - UI components (viewport, textinput)
 - `github.com/charmbracelet/lipgloss` - Terminal styling
 - `github.com/shirou/gopsutil/v4` - System metrics collection
 - `golang.org/x/sys/unix` - Unprivileged ICMP datagram sockets (latency monitor)

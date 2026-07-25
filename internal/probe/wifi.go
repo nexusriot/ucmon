@@ -16,11 +16,9 @@ var wirelessPath = "/proc/net/wireless"
 // WiFiInfo holds the wireless link statistics for one interface, parsed from
 // /proc/net/wireless. Pure file read — no external tooling or cgo required.
 type WiFiInfo struct {
-	Present     bool
-	LinkQuality float64 // raw link quality (driver scale, typically 0–70)
-	QualityMax  float64 // assumed maximum for the quality scale
-	QualityPct  float64 // LinkQuality / QualityMax * 100, clamped 0–100
-	SignalDBm   float64 // signal level in dBm (negative; closer to 0 is stronger)
+	Present    bool
+	QualityPct float64 // link quality vs the conventional cfg80211 max of 70, clamped 0–100
+	SignalDBm  float64 // signal level in dBm (negative; closer to 0 is stronger)
 }
 
 // readWirelessStats parses /proc/net/wireless and returns one entry per
@@ -73,11 +71,9 @@ func readWirelessStats() map[string]WiFiInfo {
 		}
 
 		out[name] = WiFiInfo{
-			Present:     true,
-			LinkQuality: quality,
-			QualityMax:  qualityMax,
-			QualityPct:  pct,
-			SignalDBm:   signal,
+			Present:    true,
+			QualityPct: pct,
+			SignalDBm:  signal,
 		}
 	}
 	return out
