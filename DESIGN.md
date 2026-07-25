@@ -27,6 +27,8 @@ ucmon/
 │   │   └── config.go
 │   └── ui/                     # Presentation layer
 │       ├── model.go            # Bubble Tea model (state, Update, View)
+│       ├── alerts.go           # Threshold alert engine + condition evaluation
+│       ├── export.go           # Plain-text snapshot report writer
 │       ├── styles.go           # Lipgloss style definitions
 │       ├── spark.go            # Unicode sparkline chart renderer
 │       ├── bar.go              # Horizontal bar chart renderer
@@ -124,6 +126,33 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
   Reports unavailable on non-Pi hosts
 - Refreshed on the slow interval
 
+### Tab 8: Alerts
+
+- An **edge-triggered alert engine** (`internal/ui/alerts.go`) evaluates the
+  latest probe snapshots against configurable thresholds once per fast tick.
+  Conditions are keyed by a stable identity (e.g. `temp:cpu_thermal`,
+  `disk:/`) so a sustained problem logs once on raise and once on clear rather
+  than every tick; a rise in severity (warn → crit) is logged as a new event,
+  a de-escalation is tracked silently.
+- Monitored conditions: CPU/SoC temperature (reusing `temp_hot`/`temp_crit`),
+  RAM and swap usage, per-filesystem usage (squashfs skipped to avoid loop-mount
+  noise), discharging battery level (low/critical), live Pi throttle and
+  under-voltage flags (current bits only — the latched "occurred" bits would
+  pin the banner on forever), and load average vs core count.
+- A severity-colored **banner** shows the most severe active alert in the
+  footer of *every* tab (errors still take precedence; transient notices show
+  briefly above it). The Alerts tab itself lists active conditions and a
+  scrollable, newest-first timestamped log. `m` mutes/unmutes the banner, `c`
+  clears the log. The tab label carries a live `(N)` active-count badge.
+
+### Snapshot export (`w`, any tab)
+
+`internal/ui/export.go` writes a plain-text dump of all current readings — CPU
+and temps, memory, power/throttle, disks, network interfaces, top-10 processes
+by CPU, and the active/recent alerts — to `~/ucmon-report-<timestamp>.txt`. A
+transient footer notice reports the path written. The report is ANSI-free and
+reuses the same `probe` formatting helpers as the live views.
+
 ## Refresh Intervals
 
 Three configurable cadences drive all sampling (defaults shown). The base
@@ -144,7 +173,10 @@ parses the flat `key = value` TOML subset by hand — comments (`#`/`;`) and
 duration string or a bare number of seconds. No third-party TOML dependency is
 added, preserving the pure-Go cross-compile. Keys: `start_tab`, `fast_interval`,
 `proc_interval`, `slow_interval`, `temp_warn`/`temp_hot`/`temp_crit`,
-`backlight_step`, `backlight_device`. See the README for an annotated example.
+`backlight_step`, `backlight_device`, and the alert thresholds
+`alerts_enabled`, `mem_warn_pct`, `swap_warn_pct`, `disk_warn_pct`,
+`batt_low_pct`, `batt_crit_pct`, `load_warn_factor`, `alert_log_cap`. See the
+README for an annotated example.
 
 ## Keyboard Controls
 
@@ -152,8 +184,10 @@ added, preserving the pure-Go cross-compile. Keys: `start_tab`, `fast_interval`,
 |------------------|---------------------------|
 | `tab` / `→`      | Next tab                  |
 | `shift+tab` / `←`| Previous tab              |
-| `1` - `7`        | Jump to tab               |
+| `1` - `8`        | Jump to tab               |
 | `+` / `-`        | Adjust backlight (tab 7)  |
+| `w`              | Write snapshot report     |
+| `m` / `c`        | Mute banner / clear log (tab 8) |
 | `/`              | Activate search (tabs 3,5)|
 | `enter`          | Apply search filter       |
 | `esc`            | Cancel search / kill      |
@@ -172,18 +206,26 @@ Binary build:
 go build -o ucmon cmd/ucmon/main.go
 ```
 
-Debian package (follows ducknetview pattern):
+Debian package — the `Makefile` is the canonical tooling (it derives the `.deb`
+version from `const version` in source, so binary and package stay in lockstep):
 ```bash
-./build-deb.sh          # amd64
-./build-deb-arm64.sh    # arm64 (cross-compile)
+make deb                # .deb for every platform → dist/
+make deb-uconsole       # arm64
+make deb-pizero2w       # armhf
+make deb-licheerv       # riscv64
 ```
 
-The build script produces a `.deb` file with the binary installed to `/usr/bin/ucmon`.
+Legacy single-arch wrappers remain for parity (`./build-deb.sh [amd64|arm64|riscv64]`,
+plus `build-deb-arm64.sh` / `build-deb-licheerv.sh` shortcuts); they now derive the
+version from source as well. Every build is pure Go (`CGO_ENABLED=0`), so all
+architectures cross-compile from one machine. Each `.deb` installs the binary to
+`/usr/bin/ucmon`.
 
 ## Target Platforms
 
 - ClockworkPi uConsole (ARM64, Raspberry Pi CM4)
-- Raspberry Pi 3/4/5 (ARM64)
+- Raspberry Pi 3/4/5 (ARM64); Pi Zero 2 W (armv7 on 32-bit Pi OS)
+- Sipeed LicheeRV Nano (riscv64, SG2002 — Debian-based image)
 - Generic Linux x86_64
 
 ## Dependencies

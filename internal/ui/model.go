@@ -15,18 +15,19 @@ import (
 	"github.com/nexusriot/ucmon/internal/probe"
 )
 
-const version = "0.3.0"
+const version = "0.5.3"
 
 type tab int
 
 const (
-	tabCPU   tab = iota // CPU load & temperatures
-	tabMem              // memory & swap
-	tabProc             // processes
-	tabDisk             // disk usage
-	tabNet              // network
-	tabPower            // battery, throttle, load
-	tabGPU              // GPU/VideoCore stats & backlight
+	tabCPU    tab = iota // CPU load & temperatures
+	tabMem               // memory & swap
+	tabProc              // processes
+	tabDisk              // disk usage
+	tabNet               // network
+	tabPower             // battery, throttle, load
+	tabGPU               // GPU/VideoCore stats & backlight
+	tabAlerts            // threshold alert log
 	numTabs
 )
 
@@ -45,6 +46,8 @@ func tabFromName(s string) tab {
 		return tabPower
 	case "gpu", "soc", "videocore":
 		return tabGPU
+	case "alert", "alerts":
+		return tabAlerts
 	default:
 		return tabCPU
 	}
@@ -184,6 +187,12 @@ type Model struct {
 	backlight probe.BacklightInfo
 	sysNotice string // transient backlight-set status
 
+	// Alerts tab + header banner
+	alerts      alertEngine
+	alertsVP    viewport.Model
+	notice      string    // transient global status (e.g. snapshot written)
+	noticeUntil time.Time // when the transient notice expires
+
 	tickCount int
 }
 
@@ -193,6 +202,7 @@ func NewModel(cfg config.Config) Model {
 
 	pvp := viewport.New(0, 0)
 	nvp := viewport.New(0, 0)
+	avp := viewport.New(0, 0)
 
 	ps := textinput.New()
 	ps.Placeholder = "search process name / pid"
@@ -224,11 +234,13 @@ func NewModel(cfg config.Config) Model {
 		netSampler:   probe.NewNetSampler(),
 		procsVP:      pvp,
 		netVP:        nvp,
+		alertsVP:     avp,
 		procsSearch:  ps,
 		netSearch:    ns,
 		rxHist:       map[string][]float64{},
 		txHist:       map[string][]float64{},
 		netIfaceSel:  -1,
+		alerts:       newAlertEngine(cfg.AlertLogCap),
 	}
 }
 
@@ -390,8 +402,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.netVP.Width = max(10, vpW-2)
 		m.netVP.Height = m.calcNetVPHeight()
 
+		// Alerts viewport: title + blank are the 2 fixed lines above the
+		// scrolling active+log content; keep total within the box body.
+		m.alertsVP.Width = max(10, vpW-2)
+		m.alertsVP.Height = max(1, bodyH-2)
+
 		m.netHeader = m.buildNetHeader()
 		m.refreshProcs()
+		m.refreshAlerts()
 		m.netVP.SetContent(hardClipLinesToWidth(m.netText, m.netVP.Width))
 		return m, nil
 
@@ -409,6 +427,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.fetchDiskCmd(), fetchNetCmd(m.netSampler), fetchPowerCmd(), m.fetchSysCmd())
 		} else {
 			cmds = append(cmds, fetchNetCmd(m.netSampler))
+		}
+		if m.cfg.AlertsEnabled {
+			m.alerts.update(m.currentAlertConds(), time.Time(msg))
+			if m.activeTab == tabAlerts {
+				m.refreshAlerts()
+			}
 		}
 		return m, tea.Batch(cmds...)
 
@@ -550,6 +574,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "7":
 			m.activeTab = tabGPU
 			return m, nil
+		case "8":
+			m.activeTab = tabAlerts
+			m.refreshAlerts()
+			return m, nil
 		case "+", "=":
 			if m.activeTab == tabGPU {
 				return m, m.adjustBacklight(m.cfg.BacklightStep)
@@ -627,6 +655,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if p, ok := m.selectedProc(); ok {
 					m.procsKill = &killPrompt{pid: p.PID, name: p.Name, hard: true}
 				}
+				return m, nil
+			}
+		case "w":
+			if !m.procsSearching && !m.netSearching {
+				if path, err := m.exportSnapshot(); err != nil {
+					m.setNotice(errStyle.Render("snapshot failed: " + err.Error()))
+				} else {
+					m.setNotice(okStyle.Render("snapshot written: " + path))
+				}
+				return m, nil
+			}
+		case "m":
+			if m.activeTab == tabAlerts {
+				m.alerts.muted = !m.alerts.muted
+				if m.alerts.muted {
+					m.setNotice(subtleStyle.Render("alert banner muted"))
+				} else {
+					m.setNotice(okStyle.Render("alert banner unmuted"))
+				}
+				m.refreshAlerts()
+				return m, nil
+			}
+		case "c":
+			if m.activeTab == tabAlerts {
+				m.alerts.clearLog()
+				m.refreshAlerts()
+				m.setNotice(subtleStyle.Render("alert log cleared"))
 				return m, nil
 			}
 		case "/":
@@ -757,7 +812,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// scroll: alerts
+	if m.activeTab == tabAlerts {
+		var cmd tea.Cmd
+		m.alertsVP, cmd = m.alertsVP.Update(msg)
+		return m, cmd
+	}
+
 	return m, nil
+}
+
+// setNotice shows a transient status line in the footer for a few seconds.
+func (m *Model) setNotice(s string) {
+	m.notice = s
+	m.noticeUntil = time.Now().Add(5 * time.Second)
 }
 
 // ── View ──
@@ -781,19 +849,31 @@ func (m Model) View() string {
 		body = m.viewPower()
 	case tabGPU:
 		body = m.viewGPU()
+	case tabAlerts:
+		body = m.viewAlerts()
 	}
 
-	footerText := "Keys: tab/←/→ switch • 1-7 jump • / search • ctrl+u clear • ctrl+c quit"
+	footerText := "Keys: tab/←/→ switch • 1-8 jump • w snapshot • / search • ctrl+c quit"
 	if m.activeTab == tabNet && !m.netSearching {
-		footerText = "Keys: tab/←/→ switch • 1-7 jump • j/k iface • / search • ctrl+u clear • ctrl+c quit"
+		footerText = "Keys: tab/←/→ switch • 1-8 jump • j/k iface • / search • w snapshot • ctrl+c quit"
 	}
 	if m.activeTab == tabProc && !m.procsSearching {
-		footerText = "Keys: ↑↓ select • s sort • t tree • k/K kill • / filter • tab switch • ctrl+c quit"
+		footerText = "Keys: ↑↓ select • s sort • t tree • k/K kill • / filter • w snap • ctrl+c quit"
 	}
 	if m.activeTab == tabGPU {
-		footerText = "Keys: +/- brightness • tab/←/→ switch • 1-7 jump • ctrl+c quit"
+		footerText = "Keys: +/- brightness • tab/←/→ switch • 1-8 jump • w snapshot • ctrl+c quit"
+	}
+	if m.activeTab == tabAlerts {
+		footerText = "Keys: ↑↓ scroll • m mute • c clear log • w snapshot • tab switch • ctrl+c quit"
 	}
 	footer := subtleStyle.Render(footerText)
+	// Transient notices and the alert banner take priority over the key hints;
+	// a hard error still trumps everything.
+	if m.notice != "" && time.Now().Before(m.noticeUntil) {
+		footer = m.notice
+	} else if banner := m.alertBanner(); banner != "" {
+		footer = banner
+	}
 	if m.err != nil {
 		footer = errStyle.Render("Error: " + m.err.Error())
 	}
@@ -813,6 +893,7 @@ func (m Model) renderHeader() string {
 		renderTab("5 Network", m.activeTab == tabNet),
 		renderTab("6 Power", m.activeTab == tabPower),
 		renderTab("7 GPU", m.activeTab == tabGPU),
+		renderTab(m.alertsTabLabel(), m.activeTab == tabAlerts),
 	}
 
 	left := titleStyle.Render(fmt.Sprintf("ucmon %s", version)) + " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
@@ -874,6 +955,98 @@ func joinTabsWithinWidth(tabs []string, maxW int) string {
 	}
 
 	return out.String()
+}
+
+// ── Alerts ──
+
+// alertsTabLabel adds a live count badge to the Alerts tab when conditions fire.
+func (m Model) alertsTabLabel() string {
+	if _, n, any := m.alerts.summary(); any {
+		return fmt.Sprintf("8 Alerts(%d)", n)
+	}
+	return "8 Alerts"
+}
+
+// alertBanner is the single-line, severity-colored footer banner. Empty when
+// alerting is disabled, muted, or nothing is firing.
+func (m Model) alertBanner() string {
+	if !m.cfg.AlertsEnabled || m.alerts.muted {
+		return ""
+	}
+	top, n, any := m.alerts.summary()
+	if !any {
+		return ""
+	}
+	prefix := fmt.Sprintf("⚠ %s", top.sev.label())
+	if n > 1 {
+		prefix += fmt.Sprintf(" (+%d more)", n-1)
+	}
+	return top.sev.style().Render(prefix + ": " + top.msg)
+}
+
+// refreshAlerts rebuilds the scrolling alert-log content for the Alerts tab.
+func (m *Model) refreshAlerts() {
+	w := m.alertsVP.Width
+	if w <= 0 {
+		w = 60
+	}
+
+	var b strings.Builder
+
+	active := m.alerts.activeList()
+	b.WriteString(titleStyle.Render(fmt.Sprintf("Active (%d)", len(active))) + "\n")
+	if len(active) == 0 {
+		b.WriteString(okStyle.Render("  all clear") + "\n")
+	} else {
+		for _, a := range active {
+			line := fmt.Sprintf("  [%s] %s", a.sev.label(), a.msg)
+			b.WriteString(a.sev.style().Render(clampToWidthOneLine(line, w)) + "\n")
+		}
+	}
+
+	b.WriteString("\n" + titleStyle.Render(fmt.Sprintf("Log (%d)", len(m.alerts.log))) + "\n")
+	if len(m.alerts.log) == 0 {
+		b.WriteString(subtleStyle.Render("  no events recorded yet") + "\n")
+	} else {
+		// Newest first.
+		for i := len(m.alerts.log) - 1; i >= 0; i-- {
+			en := m.alerts.log[i]
+			ts := en.when.Format("15:04:05")
+			if en.cleared {
+				line := fmt.Sprintf("  %s  OK    %s", ts, en.msg)
+				b.WriteString(okStyle.Render(clampToWidthOneLine(line, w)) + "\n")
+			} else {
+				line := fmt.Sprintf("  %s  %-4s  %s", ts, en.sev.label(), en.msg)
+				b.WriteString(en.sev.style().Render(clampToWidthOneLine(line, w)) + "\n")
+			}
+		}
+	}
+
+	m.alertsVP.SetContent(b.String())
+}
+
+func (m Model) viewAlerts() string {
+	w := min(m.w-2, 140)
+	bodyH := m.bodyHeight()
+
+	if !m.cfg.AlertsEnabled {
+		body := titleStyle.Render("Alerts") + "\n\n" +
+			subtleStyle.Render("Alerting is disabled (set alerts_enabled = true in config.toml).")
+		return boxStyle.Width(w).Height(bodyH).Render(clipHeight(body, bodyH))
+	}
+
+	_, n, _ := m.alerts.summary()
+	status := okStyle.Render("all clear")
+	if n > 0 {
+		status = warnStyle.Render(fmt.Sprintf("%d active", n))
+	}
+	if m.alerts.muted {
+		status += subtleStyle.Render("  • banner muted")
+	}
+
+	title := titleStyle.Render("Alerts") + "  " + status
+	content := title + "\n\n" + m.alertsVP.View()
+	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(content, bodyH))
 }
 
 // ── Tab 1: CPU / Temperature ──

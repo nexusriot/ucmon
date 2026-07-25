@@ -6,6 +6,7 @@
 #   make amd64            # generic Linux x86_64
 #   make uconsole         # ClockworkPi uConsole (CM4, arm64)
 #   make pizero2w         # Raspberry Pi Zero 2 W (32-bit Pi OS, armv7)
+#   make licheerv         # Sipeed LicheeRV Nano (SG2002, riscv64)
 #   make deb              # .deb packages for all platforms
 #   make deb-uconsole     # single .deb (same pattern for each platform)
 #   make install          # build native + install to $(PREFIX)/bin (sudo)
@@ -27,11 +28,12 @@ BUILDENV := CGO_ENABLED=0
 
 # platform = GOOS GOARCH GOARM debarch
 # (GOARM is empty for non-arm targets)
-amd64_triple    := linux amd64 .  amd64
-uconsole_triple := linux arm64 .  arm64
-pizero2w_triple := linux arm   7  armhf
+amd64_triple    := linux amd64   .  amd64
+uconsole_triple := linux arm64   .  arm64
+pizero2w_triple := linux arm     7  armhf
+licheerv_triple := linux riscv64 .  riscv64
 
-PLATFORMS := amd64 uconsole pizero2w
+PLATFORMS := amd64 uconsole pizero2w licheerv
 
 .PHONY: all build $(PLATFORMS) deb $(addprefix deb-,$(PLATFORMS)) \
         install uninstall run fmt vet test clean version help

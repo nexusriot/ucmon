@@ -29,6 +29,17 @@ type Config struct {
 
 	BacklightStep   int    // percent change per +/- keypress
 	BacklightDevice string // optional /sys/class/backlight device override
+
+	// Alerting (Alerts tab + header banner). Thresholds drive edge-triggered
+	// alerts; CPU-temperature alerts reuse TempHot (warn) / TempCrit (crit).
+	AlertsEnabled  bool    // master switch
+	MemWarnPct     float64 // RAM used %% that raises a warning
+	SwapWarnPct    float64 // swap used %% that raises a warning
+	DiskWarnPct    float64 // filesystem used %% that raises a warning
+	BattLowPct     int     // discharging battery %% that raises a warning
+	BattCritPct    int     // discharging battery %% that raises a critical alert
+	LoadWarnFactor float64 // load1 ≥ factor×cores raises a warning
+	AlertLogCap    int     // max alert-log entries retained in memory
 }
 
 // Default returns the built-in configuration used when no file is present.
@@ -42,6 +53,15 @@ func Default() Config {
 		TempHot:       65,
 		TempCrit:      80,
 		BacklightStep: 10,
+
+		AlertsEnabled:  true,
+		MemWarnPct:     90,
+		SwapWarnPct:    50,
+		DiskWarnPct:    90,
+		BattLowPct:     15,
+		BattCritPct:    5,
+		LoadWarnFactor: 2.0,
+		AlertLogCap:    200,
 	}
 }
 
@@ -128,6 +148,49 @@ func apply(cfg *Config, key, val string) {
 		}
 	case "backlight_device", "backlightdevice":
 		cfg.BacklightDevice = val
+	case "alerts_enabled", "alertsenabled", "alerts":
+		cfg.AlertsEnabled = parseBool(val, cfg.AlertsEnabled)
+	case "mem_warn_pct", "memwarnpct", "mem_warn":
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			cfg.MemWarnPct = f
+		}
+	case "swap_warn_pct", "swapwarnpct", "swap_warn":
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			cfg.SwapWarnPct = f
+		}
+	case "disk_warn_pct", "diskwarnpct", "disk_warn":
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			cfg.DiskWarnPct = f
+		}
+	case "batt_low_pct", "battlowpct", "batt_low":
+		if n, err := strconv.Atoi(val); err == nil {
+			cfg.BattLowPct = n
+		}
+	case "batt_crit_pct", "battcritpct", "batt_crit":
+		if n, err := strconv.Atoi(val); err == nil {
+			cfg.BattCritPct = n
+		}
+	case "load_warn_factor", "loadwarnfactor", "load_warn":
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			cfg.LoadWarnFactor = f
+		}
+	case "alert_log_cap", "alertlogcap":
+		if n, err := strconv.Atoi(val); err == nil {
+			cfg.AlertLogCap = n
+		}
+	}
+}
+
+// parseBool accepts the common truthy/falsy spellings; an unrecognized value
+// keeps the supplied default.
+func parseBool(val string, def bool) bool {
+	switch strings.ToLower(val) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
 	}
 }
 
@@ -160,5 +223,15 @@ func (c *Config) Sanitize() {
 	}
 	if c.BacklightStep > 100 {
 		c.BacklightStep = 100
+	}
+	if c.AlertLogCap < 16 {
+		c.AlertLogCap = 16
+	}
+	if c.LoadWarnFactor <= 0 {
+		c.LoadWarnFactor = 2.0
+	}
+	// BattCrit should not exceed BattLow so the two tiers stay ordered.
+	if c.BattCritPct > c.BattLowPct {
+		c.BattCritPct = c.BattLowPct
 	}
 }

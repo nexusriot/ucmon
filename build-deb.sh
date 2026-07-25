@@ -1,6 +1,7 @@
 #!/bin/env bash
 
-version=0.2.1
+# Keep the .deb version in lockstep with the embedded UI version string.
+version="$(sed -nE 's/.*const version = "([^"]+)".*/\1/p' internal/ui/model.go)"
 arch="${1:-amd64}"
 
 echo "building deb for ucmon $version ($arch)"
@@ -10,9 +11,10 @@ if ! type "dpkg-deb" > /dev/null; then
 fi
 
 case "$arch" in
-  amd64)  goarch="amd64" ;;
-  arm64)  goarch="arm64" ;;
-  *)      echo "unsupported architecture: $arch"; exit 1 ;;
+  amd64)    goarch="amd64" ;;
+  arm64)    goarch="arm64" ;;
+  riscv64)  goarch="riscv64" ;;
+  *)        echo "unsupported architecture: $arch"; exit 1 ;;
 esac
 
 project="ucmon_${version}_${arch}"
