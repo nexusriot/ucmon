@@ -27,6 +27,7 @@ type BatteryInfo struct {
 	PowerW     float64       // instantaneous draw/charge in watts, 0 if unknown
 	TimeLeft   time.Duration // to empty (discharging) or to full (charging)
 	Technology string
+	HealthPct  float64 // full vs design capacity, 0 if unknown
 }
 
 type ThrottleInfo struct {
@@ -71,7 +72,8 @@ func SamplePower() (PowerSnapshot, error) {
 	return snap, nil
 }
 
-const powerSupplyBase = "/sys/class/power_supply"
+// powerSupplyBase is a var so tests can point it at a fake sysfs tree.
+var powerSupplyBase = "/sys/class/power_supply"
 
 func sysReadStr(path string) (string, bool) {
 	b, err := os.ReadFile(path)
@@ -136,10 +138,26 @@ func readPowerSupply() (bat BatteryInfo, acKnown bool, acOnline bool) {
 			}
 
 			bat.PowerW, bat.TimeLeft = batteryRate(dir, bat.Status)
+			bat.HealthPct = batteryHealth(dir)
 		}
 	}
 
 	return bat, acKnown, acOnline
+}
+
+// batteryHealth derives pack health from the full vs design-capacity
+// counters (energy_* preferred, charge_* fallback). 0 when unavailable.
+func batteryHealth(dir string) float64 {
+	full, okF := sysReadInt(filepath.Join(dir, "energy_full"))
+	design, okD := sysReadInt(filepath.Join(dir, "energy_full_design"))
+	if !okF || !okD {
+		full, okF = sysReadInt(filepath.Join(dir, "charge_full"))
+		design, okD = sysReadInt(filepath.Join(dir, "charge_full_design"))
+	}
+	if !okF || !okD || design <= 0 || full <= 0 {
+		return 0
+	}
+	return float64(full) / float64(design) * 100
 }
 
 // batteryRate computes instantaneous power (W) and an estimated time to

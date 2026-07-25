@@ -1,6 +1,10 @@
 package probe
 
 import (
+	"sort"
+	"sync"
+	"time"
+
 	"github.com/shirou/gopsutil/v4/disk"
 )
 
@@ -23,7 +27,9 @@ type DiskIOInfo struct {
 }
 
 type DiskSampler struct {
+	mu     sync.Mutex
 	lastIO map[string]disk.IOCountersStat
+	lastAt time.Time
 }
 
 func NewDiskSampler() *DiskSampler {
@@ -32,7 +38,12 @@ func NewDiskSampler() *DiskSampler {
 	}
 }
 
-func (s *DiskSampler) Sample(dt float64) ([]DiskInfo, []DiskIOInfo, error) {
+func (s *DiskSampler) Sample() ([]DiskInfo, []DiskIOInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+
 	partitions, err := disk.Partitions(false)
 	if err != nil {
 		return nil, nil, err
@@ -68,24 +79,39 @@ func (s *DiskSampler) Sample(dt float64) ([]DiskInfo, []DiskIOInfo, error) {
 		return disks, nil, nil
 	}
 
-	if dt <= 0 {
+	// Rates are computed over the real elapsed time since the previous sample
+	// (the sampler runs on the slow interval, not once per second).
+	dt := now.Sub(s.lastAt).Seconds()
+	if s.lastAt.IsZero() || dt <= 0 {
 		dt = 1
 	}
 
-	var ios []DiskIOInfo
-	for name, cur := range ioCounters {
+	ios := ioRates(s.lastIO, ioCounters, dt)
+
+	s.lastIO = ioCounters
+	s.lastAt = now
+	return disks, ios, nil
+}
+
+// ioRates computes per-device read/write rates from two counter snapshots
+// taken dt seconds apart. Devices without a previous snapshot report 0.
+func ioRates(prev, cur map[string]disk.IOCountersStat, dt float64) []DiskIOInfo {
+	if dt <= 0 {
+		dt = 1
+	}
+	ios := make([]DiskIOInfo, 0, len(cur))
+	for name, c := range cur {
 		di := DiskIOInfo{
 			Device:     name,
-			ReadBytes:  cur.ReadBytes,
-			WriteBytes: cur.WriteBytes,
+			ReadBytes:  c.ReadBytes,
+			WriteBytes: c.WriteBytes,
 		}
-		if prev, ok := s.lastIO[name]; ok {
-			di.ReadBps = float64(cur.ReadBytes-prev.ReadBytes) / dt
-			di.WriteBps = float64(cur.WriteBytes-prev.WriteBytes) / dt
+		if p, ok := prev[name]; ok {
+			di.ReadBps = float64(c.ReadBytes-p.ReadBytes) / dt
+			di.WriteBps = float64(c.WriteBytes-p.WriteBytes) / dt
 		}
 		ios = append(ios, di)
 	}
-
-	s.lastIO = ioCounters
-	return disks, ios, nil
+	sort.Slice(ios, func(i, j int) bool { return ios[i].Device < ios[j].Device })
+	return ios
 }

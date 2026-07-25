@@ -1,11 +1,16 @@
 package ui
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"sort"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/nexusriot/ucmon/internal/probe"
 )
 
 // alertSeverity orders alerts; higher wins for the header banner.
@@ -44,21 +49,33 @@ type alertEntry struct {
 	cleared bool // true = this records a condition resolving
 }
 
-// alertEngine tracks active conditions and an edge-triggered log of changes.
-// Conditions are keyed by a stable identity (e.g. "temp:cpu_thermal") so the
-// same sensor crossing a threshold logs once, not every tick.
-type alertEngine struct {
-	active map[string]alertCond
-	log    []alertEntry
-	cap    int
-	muted  bool // banner suppressed; the log keeps recording
+// activeCond wraps a condition with its flap-damping state.
+type activeCond struct {
+	cond    alertCond
+	missing int // consecutive updates the condition was absent
 }
 
-func newAlertEngine(capN int) alertEngine {
+// alertEngine tracks active conditions and an edge-triggered log of changes.
+// Conditions are keyed by a stable identity (e.g. "temp:cpu_thermal") so the
+// same sensor crossing a threshold logs once, not every tick. A condition
+// must stay absent for clearTicks consecutive updates before it clears, so a
+// value oscillating around its threshold doesn't spam raise/clear pairs.
+type alertEngine struct {
+	active     map[string]activeCond
+	log        []alertEntry
+	cap        int
+	clearTicks int
+	muted      bool // banner suppressed; the log keeps recording
+}
+
+func newAlertEngine(capN, clearTicks int) alertEngine {
 	if capN < 16 {
 		capN = 16
 	}
-	return alertEngine{active: map[string]alertCond{}, cap: capN}
+	if clearTicks < 1 {
+		clearTicks = 1
+	}
+	return alertEngine{active: map[string]activeCond{}, cap: capN, clearTicks: clearTicks}
 }
 
 func (e *alertEngine) push(en alertEntry) {
@@ -69,29 +86,43 @@ func (e *alertEngine) push(en alertEntry) {
 }
 
 // update diffs current conditions against the active set, logging new alerts,
-// severity escalations, and clears.
-func (e *alertEngine) update(conds map[string]alertCond, now time.Time) {
+// severity escalations, and (damped) clears. It returns the events recorded
+// this tick so the caller can run delivery side effects (bell, hook, file).
+func (e *alertEngine) update(conds map[string]alertCond, now time.Time) []alertEntry {
+	var events []alertEntry
+
 	for k, c := range conds {
 		prev, ok := e.active[k]
 		switch {
 		case !ok:
-			e.active[k] = c
-			e.push(alertEntry{when: now, sev: c.sev, msg: c.msg})
-		case c.sev > prev.sev:
-			e.active[k] = c
-			e.push(alertEntry{when: now, sev: c.sev, msg: c.msg})
-		default:
-			// De-escalation or text change: track silently so a later
-			// re-escalation is detected, but don't spam the log.
-			e.active[k] = c
+			events = append(events, alertEntry{when: now, sev: c.sev, msg: c.msg})
+		case c.sev > prev.cond.sev:
+			events = append(events, alertEntry{when: now, sev: c.sev, msg: c.msg})
 		}
+		// De-escalation or text change is tracked silently; presence always
+		// resets the absent counter.
+		e.active[k] = activeCond{cond: c}
 	}
+
 	for k, prev := range e.active {
-		if _, ok := conds[k]; !ok {
+		if _, ok := conds[k]; ok {
+			continue
+		}
+		prev.missing++
+		if prev.missing >= e.clearTicks {
 			delete(e.active, k)
-			e.push(alertEntry{when: now, sev: prev.sev, msg: prev.msg, cleared: true})
+			events = append(events, alertEntry{
+				when: now, sev: prev.cond.sev, msg: prev.cond.msg, cleared: true,
+			})
+		} else {
+			e.active[k] = prev
 		}
 	}
+
+	for _, ev := range events {
+		e.push(ev)
+	}
+	return events
 }
 
 // summary returns the most severe active condition and the active count.
@@ -101,8 +132,8 @@ func (e *alertEngine) summary() (top alertCond, count int, any bool) {
 	}
 	first := true
 	for _, c := range e.active {
-		if first || c.sev > top.sev {
-			top = c
+		if first || c.cond.sev > top.sev {
+			top = c.cond
 			first = false
 		}
 	}
@@ -114,7 +145,7 @@ func (e *alertEngine) summary() (top alertCond, count int, any bool) {
 func (e *alertEngine) activeList() []alertCond {
 	out := make([]alertCond, 0, len(e.active))
 	for _, c := range e.active {
-		out = append(out, c)
+		out = append(out, c.cond)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].sev != out[j].sev {
@@ -127,6 +158,81 @@ func (e *alertEngine) activeList() []alertCond {
 
 func (e *alertEngine) clearLog() {
 	e.log = e.log[:0]
+}
+
+// ── Delivery side effects ──
+
+// handleAlertEvents runs the configured delivery actions for freshly logged
+// events: terminal bell on a new critical, the alert_cmd hook, and the
+// on-disk alert log.
+func (m *Model) handleAlertEvents(events []alertEntry) {
+	if len(events) == 0 {
+		return
+	}
+	if m.cfg.AlertBell && !m.alerts.muted {
+		for _, ev := range events {
+			if !ev.cleared && ev.sev == sevCrit {
+				fmt.Fprint(os.Stderr, "\a")
+				break
+			}
+		}
+	}
+	if m.cfg.AlertLogFile != "" {
+		if err := appendAlertLog(m.cfg.AlertLogFile, events); err != nil {
+			m.setNotice(errStyle.Render("alert log: " + err.Error()))
+		}
+	}
+	if m.cfg.AlertCmd != "" {
+		for _, ev := range events {
+			go runAlertCmd(m.cfg.AlertCmd, ev)
+		}
+	}
+}
+
+// appendAlertLog appends one line per event; events are rare (edge-triggered)
+// so open-append-close keeps this simple and crash-safe.
+func appendAlertLog(path string, events []alertEntry) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for _, ev := range events {
+		if _, err := f.WriteString(formatAlertLogLine(ev)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func formatAlertLogLine(ev alertEntry) string {
+	state := "RAISE"
+	if ev.cleared {
+		state = "CLEAR"
+	}
+	return fmt.Sprintf("%s %s %s %s\n",
+		ev.when.Format("2006-01-02 15:04:05"), state, ev.sev.label(), ev.msg)
+}
+
+// alertCmdEnv builds the UCMON_ALERT_* environment for the alert_cmd hook.
+func alertCmdEnv(ev alertEntry) []string {
+	state := "raise"
+	if ev.cleared {
+		state = "clear"
+	}
+	return []string{
+		"UCMON_ALERT_STATE=" + state,
+		"UCMON_ALERT_SEV=" + ev.sev.label(),
+		"UCMON_ALERT_MSG=" + ev.msg,
+	}
+}
+
+func runAlertCmd(cmdline string, ev alertEntry) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", cmdline)
+	cmd.Env = append(os.Environ(), alertCmdEnv(ev)...)
+	_ = cmd.Run()
 }
 
 // ── Model integration ──
@@ -210,5 +316,58 @@ func (m Model) currentAlertConds() map[string]alertCond {
 		}
 	}
 
+	// WiFi signal strength (readings are negative dBm; 0 disables).
+	if c.WifiLowDBm != 0 {
+		for _, ii := range m.netSnap.Ifaces {
+			if !ii.IsUp || !ii.WiFi.Present || ii.WiFi.SignalDBm >= 0 {
+				continue
+			}
+			if int(ii.WiFi.SignalDBm) <= c.WifiLowDBm {
+				conds["wifi:"+ii.Name] = alertCond{sevWarn,
+					fmt.Sprintf("%s signal %.0f dBm ≤ %d dBm", ii.Name, ii.WiFi.SignalDBm, c.WifiLowDBm)}
+			}
+		}
+	}
+
+	// Packet loss to a ping target (needs a settled window of samples).
+	if c.PingEnabled && c.PingLossWarnPct > 0 {
+		for target, win := range m.lossWin {
+			if len(win) < 10 {
+				continue
+			}
+			if loss := lossPct(win); loss >= c.PingLossWarnPct {
+				conds["ping:"+target] = alertCond{sevWarn,
+					fmt.Sprintf("packet loss to %s %.0f%% ≥ %.0f%%", target, loss, c.PingLossWarnPct)}
+			}
+		}
+	}
+
+	// PSI pressure ("some" share of the last 10s).
+	if c.PSIWarnPct > 0 && m.psi.Present {
+		for _, res := range []struct {
+			key string
+			r   probe.PSIRes
+		}{{"cpu", m.psi.CPU}, {"mem", m.psi.Mem}, {"io", m.psi.IO}} {
+			if res.r.HasSome && res.r.SomeAvg10 >= c.PSIWarnPct {
+				conds["psi:"+res.key] = alertCond{sevWarn,
+					fmt.Sprintf("%s pressure %.0f%% ≥ %.0f%% (10s some)", res.key, res.r.SomeAvg10, c.PSIWarnPct)}
+			}
+		}
+	}
+
 	return conds
+}
+
+// lossPct is the failure share of a ping success/failure window, in percent.
+func lossPct(win []bool) float64 {
+	if len(win) == 0 {
+		return 0
+	}
+	fails := 0
+	for _, ok := range win {
+		if !ok {
+			fails++
+		}
+	}
+	return float64(fails) / float64(len(win)) * 100
 }

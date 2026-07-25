@@ -7,7 +7,8 @@ import (
 	"strconv"
 )
 
-const backlightBase = "/sys/class/backlight"
+// backlightBase is a var so tests can point it at a fake sysfs tree.
+var backlightBase = "/sys/class/backlight"
 
 // BacklightInfo describes a display backlight exposed via sysfs. On the
 // uConsole the DSI panel registers here; on a generic laptop it's the panel

@@ -16,6 +16,7 @@ type CPUSnapshot struct {
 	PerCorePercent []float64
 	TotalPercent   float64
 	Temperatures   []TempReading
+	Freqs          []PolicyFreq // cpufreq policies; empty without cpufreq support
 	TakenAt        time.Time
 }
 
@@ -46,6 +47,7 @@ func SampleCPU() (CPUSnapshot, error) {
 		PerCorePercent: perCore,
 		TotalPercent:   totalPct,
 		Temperatures:   temps,
+		Freqs:          ReadCPUFreq(),
 		TakenAt:        time.Now(),
 	}, nil
 }
@@ -72,9 +74,11 @@ func readTemperatures() []TempReading {
 	return readThermalZones()
 }
 
+// thermalBase is a var so tests can point it at a fake sysfs tree.
+var thermalBase = "/sys/class/thermal"
+
 func readThermalZones() []TempReading {
-	const base = "/sys/class/thermal"
-	entries, err := os.ReadDir(base)
+	entries, err := os.ReadDir(thermalBase)
 	if err != nil {
 		return nil
 	}
@@ -84,7 +88,7 @@ func readThermalZones() []TempReading {
 		if !strings.HasPrefix(e.Name(), "thermal_zone") {
 			continue
 		}
-		zpath := filepath.Join(base, e.Name())
+		zpath := filepath.Join(thermalBase, e.Name())
 
 		label := e.Name()
 		if b, err := os.ReadFile(filepath.Join(zpath, "type")); err == nil {

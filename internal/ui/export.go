@@ -63,6 +63,35 @@ func (m Model) buildReport(now time.Time) string {
 	}
 	b.WriteString("\n")
 
+	// CPU frequency / governor.
+	if len(m.cpuSnap.Freqs) > 0 {
+		b.WriteString("Frequency\n")
+		for _, f := range m.cpuSnap.Freqs {
+			fmt.Fprintf(&b, "  %-8s       %.0f MHz (%.0f–%.0f), governor %s\n",
+				f.Policy, f.CurMHz, f.MinMHz, f.MaxMHz, f.Governor)
+		}
+		b.WriteString("\n")
+	}
+
+	// Pressure stall information.
+	if m.psi.Present {
+		b.WriteString("Pressure (PSI, some avg10/avg60)\n")
+		for _, res := range []struct {
+			name string
+			r    probe.PSIRes
+		}{{"cpu", m.psi.CPU}, {"memory", m.psi.Mem}, {"io", m.psi.IO}} {
+			if !res.r.HasSome {
+				continue
+			}
+			line := fmt.Sprintf("  %-14s %.1f%% / %.1f%%", res.name, res.r.SomeAvg10, res.r.SomeAvg60)
+			if res.r.HasFull {
+				line += fmt.Sprintf("  (full %.1f%% / %.1f%%)", res.r.FullAvg10, res.r.FullAvg60)
+			}
+			b.WriteString(line + "\n")
+		}
+		b.WriteString("\n")
+	}
+
 	// Power: load, battery, throttle.
 	p := m.powerSnap
 	b.WriteString("Power\n")
@@ -76,6 +105,9 @@ func (m Model) buildReport(now time.Time) string {
 		}
 		if bat.TimeLeft > 0 {
 			line += fmt.Sprintf(", %s left", bat.TimeLeft.Round(time.Minute))
+		}
+		if bat.HealthPct > 0 {
+			line += fmt.Sprintf(", health %.0f%%", bat.HealthPct)
 		}
 		b.WriteString(line + "\n")
 	}
@@ -102,8 +134,32 @@ func (m Model) buildReport(now time.Time) string {
 	if len(up) > 0 {
 		b.WriteString("Network\n")
 		for _, ii := range up {
-			fmt.Fprintf(&b, "  %-10s ↓ %-12s ↑ %-12s\n",
+			line := fmt.Sprintf("  %-10s ↓ %-12s ↑ %-12s",
 				ii.Name, probe.HumanBytesPerSec(ii.RxBps), probe.HumanBytesPerSec(ii.TxBps))
+			if ii.WiFi.Present {
+				line += fmt.Sprintf("  wifi %.0f%% %.0f dBm", ii.WiFi.QualityPct, ii.WiFi.SignalDBm)
+				if link, ok := m.iwLinks[ii.Name]; ok && link.SSID != "" {
+					line += fmt.Sprintf("  ssid %q ch %d", link.SSID, link.Channel)
+				}
+			}
+			b.WriteString(line + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	// Connectivity latency.
+	if len(m.pings) > 0 {
+		b.WriteString("Latency\n")
+		for _, r := range m.pings {
+			state := "lost"
+			if r.OK {
+				state = fmt.Sprintf("%.1f ms", float64(r.RTT.Microseconds())/1000)
+			}
+			line := fmt.Sprintf("  %-24s %s (%s)", r.Target+" ("+r.Addr+")", state, r.Method)
+			if win := m.lossWin[r.Target]; len(win) > 0 {
+				line += fmt.Sprintf(", loss %.0f%%/%d", lossPct(win), len(win))
+			}
+			b.WriteString(line + "\n")
 		}
 		b.WriteString("\n")
 	}
@@ -124,6 +180,19 @@ func (m Model) buildReport(now time.Time) string {
 		}
 		b.WriteString("\n")
 	}
+
+	// Session peaks.
+	b.WriteString("Session peaks\n")
+	fmt.Fprintf(&b, "  cpu            %.1f%%\n", m.peaks.cpuPct)
+	if m.peaks.tempC > 0 {
+		fmt.Fprintf(&b, "  temperature    %s (%s)\n", probe.FormatTemp(m.peaks.tempC), m.peaks.tempLabel)
+	}
+	fmt.Fprintf(&b, "  memory         %.1f%%\n", m.peaks.memPct)
+	fmt.Fprintf(&b, "  load1          %.2f\n", m.peaks.load1)
+	if m.peaks.battMin >= 0 {
+		fmt.Fprintf(&b, "  battery min    %d%%\n", m.peaks.battMin)
+	}
+	b.WriteString("\n")
 
 	// Alerts.
 	b.WriteString("Alerts\n")

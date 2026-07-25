@@ -40,6 +40,23 @@ type Config struct {
 	BattCritPct    int     // discharging battery %% that raises a critical alert
 	LoadWarnFactor float64 // load1 ≥ factor×cores raises a warning
 	AlertLogCap    int     // max alert-log entries retained in memory
+
+	// Alert delivery / flap damping.
+	AlertClearTicks int    // consecutive OK ticks before a condition clears
+	AlertBell       bool   // terminal bell on a new critical alert
+	AlertCmd        string // shell command run on each raise/clear ("" = off)
+	AlertLogFile    string // append raise/clear lines to this file ("" = off)
+
+	// WiFi signal alert: warn when a wireless iface signal ≤ this dBm (0 = off).
+	WifiLowDBm int
+
+	// Connectivity latency monitor (Network tab).
+	PingEnabled     bool    // ping the default gateway on the proc interval
+	PingTarget      string  // extra external target (host or IP, "" = none)
+	PingLossWarnPct float64 // packet-loss %% that raises a warning (0 = off)
+
+	// PSI pressure alert: warn when some avg10 ≥ this %% for cpu/mem/io (0 = off).
+	PSIWarnPct float64
 }
 
 // Default returns the built-in configuration used when no file is present.
@@ -62,6 +79,11 @@ func Default() Config {
 		BattCritPct:    5,
 		LoadWarnFactor: 2.0,
 		AlertLogCap:    200,
+
+		AlertClearTicks: 3,
+		AlertBell:       true,
+
+		PingEnabled: true,
 	}
 }
 
@@ -82,8 +104,12 @@ func Path() string {
 // defaults are returned. Malformed individual lines are skipped silently so a
 // typo never prevents the monitor from starting.
 func Load() Config {
+	return LoadFrom(Path())
+}
+
+// LoadFrom reads the config file at an explicit path (the --config flag).
+func LoadFrom(path string) Config {
 	cfg := Default()
-	path := Path()
 	if path == "" {
 		return cfg
 	}
@@ -178,7 +204,43 @@ func apply(cfg *Config, key, val string) {
 		if n, err := strconv.Atoi(val); err == nil {
 			cfg.AlertLogCap = n
 		}
+	case "alert_clear_ticks", "alertclearticks":
+		if n, err := strconv.Atoi(val); err == nil {
+			cfg.AlertClearTicks = n
+		}
+	case "alert_bell", "alertbell":
+		cfg.AlertBell = parseBool(val, cfg.AlertBell)
+	case "alert_cmd", "alertcmd":
+		cfg.AlertCmd = val
+	case "alert_log_file", "alertlogfile":
+		cfg.AlertLogFile = expandHome(val)
+	case "wifi_low_dbm", "wifilowdbm", "wifi_low":
+		if n, err := strconv.Atoi(val); err == nil {
+			cfg.WifiLowDBm = n
+		}
+	case "ping_enabled", "pingenabled", "ping":
+		cfg.PingEnabled = parseBool(val, cfg.PingEnabled)
+	case "ping_target", "pingtarget":
+		cfg.PingTarget = val
+	case "ping_loss_warn_pct", "pinglosswarnpct", "ping_loss_warn":
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			cfg.PingLossWarnPct = f
+		}
+	case "psi_warn_pct", "psiwarnpct", "psi_warn":
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			cfg.PSIWarnPct = f
+		}
 	}
+}
+
+// expandHome resolves a leading "~/" against the user's home directory.
+func expandHome(path string) string {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			return filepath.Join(home, strings.TrimPrefix(path[1:], "/"))
+		}
+	}
+	return path
 }
 
 // parseBool accepts the common truthy/falsy spellings; an unrecognized value
@@ -233,5 +295,24 @@ func (c *Config) Sanitize() {
 	// BattCrit should not exceed BattLow so the two tiers stay ordered.
 	if c.BattCritPct > c.BattLowPct {
 		c.BattCritPct = c.BattLowPct
+	}
+	if c.AlertClearTicks < 1 {
+		c.AlertClearTicks = 1
+	}
+	if c.AlertClearTicks > 60 {
+		c.AlertClearTicks = 60
+	}
+	// A positive dBm threshold is meaningless (signal levels are negative).
+	if c.WifiLowDBm > 0 {
+		c.WifiLowDBm = -c.WifiLowDBm
+	}
+	if c.PingLossWarnPct < 0 {
+		c.PingLossWarnPct = 0
+	}
+	if c.PingLossWarnPct > 100 {
+		c.PingLossWarnPct = 100
+	}
+	if c.PSIWarnPct < 0 {
+		c.PSIWarnPct = 0
 	}
 }

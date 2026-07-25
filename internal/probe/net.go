@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/host"
@@ -32,6 +34,7 @@ type NetSnapshot struct {
 }
 
 type NetSampler struct {
+	mu     sync.Mutex
 	last   map[string]gnet.IOCountersStat
 	lastAt time.Time
 }
@@ -44,6 +47,9 @@ func NewNetSampler() *NetSampler {
 }
 
 func (s *NetSampler) Sample() (NetSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	now := time.Now()
 
 	hi, _ := host.Info()
@@ -127,23 +133,33 @@ type ConnInfo struct {
 	Process    string
 }
 
-func ListConnections() ([]ConnInfo, error) {
-	conns, err := gnet.Connections("all")
-	if err != nil {
-		return nil, err
+// protoLabel maps a socket type + address family to a display label.
+// Unknown types yield "" (the connection is skipped).
+func protoLabel(typ, family uint32) string {
+	proto := ""
+	switch typ {
+	case syscall.SOCK_STREAM:
+		proto = "TCP"
+	case syscall.SOCK_DGRAM:
+		proto = "UDP"
+	default:
+		return ""
 	}
+	if family == syscall.AF_INET6 {
+		proto += "6"
+	}
+	return proto
+}
 
+// convertConns maps gopsutil connection stats to ConnInfo rows, resolving
+// each PID's process name once.
+func convertConns(conns []gnet.ConnectionStat) []ConnInfo {
 	procNames := map[int32]string{}
 
 	var out []ConnInfo
 	for _, c := range conns {
-		proto := ""
-		switch c.Type {
-		case 1:
-			proto = "TCP"
-		case 2:
-			proto = "UDP"
-		default:
+		proto := protoLabel(c.Type, c.Family)
+		if proto == "" {
 			continue
 		}
 
@@ -174,6 +190,16 @@ func ListConnections() ([]ConnInfo, error) {
 			Process:    name,
 		})
 	}
+	return out
+}
+
+func ListConnections() ([]ConnInfo, error) {
+	conns, err := gnet.Connections("all")
+	if err != nil {
+		return nil, err
+	}
+
+	out := convertConns(conns)
 
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Status != out[j].Status {
@@ -188,4 +214,14 @@ func ListConnections() ([]ConnInfo, error) {
 	})
 
 	return out, nil
+}
+
+// ConnectionsForPID returns the sockets owned by one process (best effort;
+// nil when unreadable).
+func ConnectionsForPID(pid int32) []ConnInfo {
+	conns, err := gnet.ConnectionsPid("all", pid)
+	if err != nil {
+		return nil
+	}
+	return convertConns(conns)
 }
