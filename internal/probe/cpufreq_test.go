@@ -3,6 +3,7 @@ package probe
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -109,5 +110,56 @@ func TestSetGovernor(t *testing.T) {
 
 	if err := SetGovernor("", "x"); err == nil {
 		t.Error("empty policy should error")
+	}
+}
+
+// A read-only scaling_governor is what a non-root user meets on a real board.
+// The error must name the path so the UI hint can point at the udev fix.
+func TestSetGovernorPermissionDenied(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: the write would succeed")
+	}
+	base := t.TempDir()
+	old := cpufreqBase
+	cpufreqBase = base
+	defer func() { cpufreqBase = old }()
+
+	dir := filepath.Join(base, "policy0")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "scaling_governor")
+	if err := os.WriteFile(path, []byte("ondemand\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+
+	err := SetGovernor("policy0", "performance")
+	if err == nil {
+		t.Fatal("writing a read-only governor file succeeded")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("error = %v, want a permission-denied message", err)
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("error = %v, want it to name %s", err, path)
+	}
+}
+
+// A missing policy is a plain error, and empty arguments are rejected before
+// any filesystem access.
+func TestSetGovernorRejectsBadInput(t *testing.T) {
+	base := t.TempDir()
+	old := cpufreqBase
+	cpufreqBase = base
+	defer func() { cpufreqBase = old }()
+
+	for _, c := range []struct{ policy, gov string }{
+		{"", "performance"},
+		{"policy0", ""},
+		{"policy-missing", "performance"},
+	} {
+		if err := SetGovernor(c.policy, c.gov); err == nil {
+			t.Errorf("SetGovernor(%q, %q) succeeded", c.policy, c.gov)
+		}
 	}
 }

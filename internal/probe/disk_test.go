@@ -50,3 +50,22 @@ func TestIORatesFirstSampleAndOrder(t *testing.T) {
 		t.Errorf("dt=0: ReadBps = %v", ios[0].ReadBps)
 	}
 }
+
+// An mmcblk/sd counter that goes backwards (driver reload, module reload,
+// 32-bit wrap) must report 0, not the ~3.2 EiB/s unsigned wrap-around gives.
+func TestIORatesCounterReset(t *testing.T) {
+	prev := map[string]disk.IOCountersStat{
+		"mmcblk0": {Name: "mmcblk0", ReadBytes: 5_000_000_000, WriteBytes: 4_000_000_000},
+	}
+	cur := map[string]disk.IOCountersStat{
+		"mmcblk0": {Name: "mmcblk0", ReadBytes: 1_000_000, WriteBytes: 500_000},
+	}
+	got := ioRates(prev, cur, 5)
+	if len(got) != 1 {
+		t.Fatalf("got %d rows", len(got))
+	}
+	if got[0].ReadBps != 0 || got[0].WriteBps != 0 {
+		t.Errorf("counter reset gave read=%s write=%s, want 0",
+			HumanBytesPerSec(got[0].ReadBps), HumanBytesPerSec(got[0].WriteBps))
+	}
+}

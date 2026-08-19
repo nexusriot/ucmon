@@ -96,3 +96,142 @@ func TestEstimate(t *testing.T) {
 		t.Errorf("zero rate = %v, want 0", d)
 	}
 }
+
+// The uConsole's axp20x driver exposes charge/current counters rather than the
+// energy/power pair, so the fallback branch is the one that actually runs on
+// the target hardware.
+func TestBatteryRateChargeCurrentFallback(t *testing.T) {
+	base := t.TempDir()
+	old := powerSupplyBase
+	powerSupplyBase = base
+	defer func() { powerSupplyBase = old }()
+
+	fakeSupply(t, base, "axp20x-battery", map[string]string{
+		"type":               "Battery",
+		"capacity":           "50",
+		"status":             "Discharging",
+		"voltage_now":        "3700000", // 3.7 V
+		"current_now":        "1000000", // 1 A
+		"charge_now":         "2000000", // 2 Ah
+		"charge_full":        "4000000",
+		"charge_full_design": "5000000",
+	})
+
+	bat, _, _ := readPowerSupply()
+	if !bat.Present {
+		t.Fatal("battery not detected")
+	}
+	if bat.PowerW != 3.7 { // 1 A x 3.7 V
+		t.Errorf("PowerW = %v, want 3.7", bat.PowerW)
+	}
+	if bat.TimeLeft != 2*time.Hour { // 2 Ah at 1 A
+		t.Errorf("TimeLeft = %v, want 2h", bat.TimeLeft)
+	}
+	if bat.HealthPct != 80 { // 4000000 / 5000000
+		t.Errorf("HealthPct = %v, want 80", bat.HealthPct)
+	}
+}
+
+// Charging estimates the time to full, not to empty, and a negative counter
+// (some drivers sign the discharge direction) must not invert the rate.
+func TestBatteryRateChargingAndSignedCounters(t *testing.T) {
+	base := t.TempDir()
+	old := powerSupplyBase
+	powerSupplyBase = base
+	defer func() { powerSupplyBase = old }()
+
+	fakeSupply(t, base, "bat", map[string]string{
+		"type":        "Battery",
+		"capacity":    "25",
+		"status":      "Charging",
+		"voltage_now": "3700000",
+		"current_now": "-2000000", // signed discharge convention, 2 A
+		"charge_now":  "1000000",  // 1 Ah
+		"charge_full": "5000000",  // 5 Ah -> 4 Ah to go -> 2h
+	})
+
+	bat, _, _ := readPowerSupply()
+	if bat.PowerW != 7.4 { // |−2 A| x 3.7 V
+		t.Errorf("PowerW = %v, want 7.4 from a signed counter", bat.PowerW)
+	}
+	if bat.TimeLeft != 2*time.Hour {
+		t.Errorf("TimeLeft = %v, want 2h to full", bat.TimeLeft)
+	}
+}
+
+// A zero rate gives no estimate rather than a division by zero, and a status
+// that is neither charging nor discharging gets none either.
+func TestBatteryRateNoEstimate(t *testing.T) {
+	base := t.TempDir()
+	old := powerSupplyBase
+	powerSupplyBase = base
+	defer func() { powerSupplyBase = old }()
+
+	for _, c := range []struct {
+		name  string
+		files map[string]string
+	}{
+		{"zero current", map[string]string{
+			"type": "Battery", "capacity": "50", "status": "Discharging",
+			"voltage_now": "3700000", "current_now": "0", "charge_now": "2000000",
+		}},
+		{"full", map[string]string{
+			"type": "Battery", "capacity": "100", "status": "Full",
+			"voltage_now": "3700000", "current_now": "1000000", "charge_now": "4000000",
+			"charge_full": "4000000",
+		}},
+		{"no counters at all", map[string]string{
+			"type": "Battery", "capacity": "50", "status": "Discharging",
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := filepath.Join(base, c.name)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			powerSupplyBase = dir
+			fakeSupply(t, dir, "bat", c.files)
+
+			bat, _, _ := readPowerSupply()
+			if bat.TimeLeft != 0 {
+				t.Errorf("TimeLeft = %v, want no estimate", bat.TimeLeft)
+			}
+		})
+	}
+}
+
+// Only the first battery is used, and a non-battery supply must not be mistaken
+// for one. Entries are read in lexical order.
+func TestReadPowerSupplyFirstBatteryWins(t *testing.T) {
+	base := t.TempDir()
+	old := powerSupplyBase
+	powerSupplyBase = base
+	defer func() { powerSupplyBase = old }()
+
+	fakeSupply(t, base, "b-second", map[string]string{"type": "Battery", "capacity": "20"})
+	fakeSupply(t, base, "a-first", map[string]string{"type": "Battery", "capacity": "80"})
+	fakeSupply(t, base, "c-mains", map[string]string{"type": "Mains", "online": "0"})
+
+	bat, acKnown, acOnline := readPowerSupply()
+	if bat.Name != "a-first" || bat.Capacity != 80 {
+		t.Errorf("got %+v, want the lexically first battery", bat)
+	}
+	if !acKnown || acOnline {
+		t.Errorf("acKnown=%v acOnline=%v, want known and offline", acKnown, acOnline)
+	}
+}
+
+// No /sys/class/power_supply at all (a VM, a container) yields a clean absence.
+func TestReadPowerSupplyMissingTree(t *testing.T) {
+	old := powerSupplyBase
+	powerSupplyBase = filepath.Join(t.TempDir(), "nope")
+	defer func() { powerSupplyBase = old }()
+
+	bat, acKnown, acOnline := readPowerSupply()
+	if bat.Present || acKnown || acOnline {
+		t.Errorf("got %+v acKnown=%v acOnline=%v", bat, acKnown, acOnline)
+	}
+	if bat.Capacity != -1 {
+		t.Errorf("Capacity = %d, want -1 for unknown", bat.Capacity)
+	}
+}

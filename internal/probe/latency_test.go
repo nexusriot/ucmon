@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"context"
 	"errors"
 	"net"
 	"os"
@@ -105,11 +106,50 @@ func TestICMPPingLoopback(t *testing.T) {
 }
 
 func TestResolveIPv4(t *testing.T) {
-	if got := resolveIPv4("192.168.1.1"); got != "192.168.1.1" {
+	ctx := context.Background()
+	if got := resolveIPv4(ctx, "192.168.1.1"); got != "192.168.1.1" {
 		t.Errorf("v4 literal: %q", got)
 	}
-	if got := resolveIPv4("::1"); got != "" {
+	if got := resolveIPv4(ctx, "::1"); got != "" {
 		t.Errorf("v6 literal should be rejected, got %q", got)
+	}
+}
+
+// An IP literal needs no resolver, so an already-cancelled context must not
+// stop it — only a name lookup is bound by the deadline.
+func TestResolveIPv4LiteralIgnoresContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := resolveIPv4(ctx, "10.0.0.1"); got != "10.0.0.1" {
+		t.Errorf("literal with a cancelled context: %q", got)
+	}
+}
+
+// A name lookup must give up with the deadline instead of running for the
+// resolver's full retry budget.
+func TestResolveIPv4RespectsDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	got := resolveIPv4(ctx, "ucmon-does-not-exist.invalid")
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("resolution took %v, deadline was 20ms", elapsed)
+	}
+	if got != "" {
+		t.Errorf("unresolvable name returned %q", got)
+	}
+}
+
+// pingOnce must honour its timeout even when the name never resolves.
+func TestPingOnceBoundedByTimeout(t *testing.T) {
+	start := time.Now()
+	res := pingOnce("target", "ucmon-does-not-exist.invalid", 100*time.Millisecond)
+	elapsed := time.Since(start)
+	if elapsed > 3*time.Second {
+		t.Errorf("pingOnce took %v for a 100ms budget", elapsed)
+	}
+	if res.OK {
+		t.Error("unresolvable target reported OK")
 	}
 }
 

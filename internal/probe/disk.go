@@ -71,7 +71,6 @@ func (s *DiskSampler) Sample() ([]DiskInfo, []DiskIOInfo, error) {
 		})
 	}
 
-	// IO counters
 	ioCounters, err := disk.IOCounters()
 	if err != nil {
 		return disks, nil, nil
@@ -101,8 +100,8 @@ func ioRates(prev, cur map[string]disk.IOCountersStat, dt float64) []DiskIOInfo 
 	for name, c := range cur {
 		di := DiskIOInfo{Device: name}
 		if p, ok := prev[name]; ok {
-			di.ReadBps = float64(c.ReadBytes-p.ReadBytes) / dt
-			di.WriteBps = float64(c.WriteBytes-p.WriteBytes) / dt
+			di.ReadBps = CounterRate(c.ReadBytes, p.ReadBytes, dt)
+			di.WriteBps = CounterRate(c.WriteBytes, p.WriteBytes, dt)
 		}
 		ios = append(ios, di)
 	}

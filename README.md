@@ -18,6 +18,22 @@ Built in Go with the [Bubble Tea](https://github.com/charmbracelet/bubbletea) fr
 - **Snapshot export** — press `w` on any tab to write a plain-text report of all current readings to `~/ucmon-report-<timestamp>.txt`
 - **Pause** (`space`) freezes sampling to inspect readings; **help overlay** (`?`) lists every key
 - **Headless mode** — `ucmon --once` prints the full snapshot report to stdout and exits (for SSH sessions and cron)
+- **Ignore lists** — `net_ignore` / `disk_ignore` / `temp_ignore` hide noisy names (container veths, snap loop mounts, per-core `coretemp` sensors) from their tab, the `--once` report and the alert engine alike; comma-separated globs where `*` spans `/`, so `/snap/*` covers a whole subtree
+- **Sampling-lateness badge** — when a probe cannot finish inside its interval ucmon skips the next round rather than piling up work, and the header names what is lagging (`⏳ slow: gpu/soc`) so a stall on a slow board is diagnosable instead of invisible
+
+## Development
+
+```bash
+make test-race    # go test -race with a coverage profile
+make fmt-check    # fail if anything needs gofmt
+make vet
+make              # cross-compile every target into dist/
+```
+
+CI runs the same checks on every push, plus pinned `staticcheck` /
+`golangci-lint`, a statically-linked assertion on all four cross-compiled
+binaries, and a smoke job that drives the real CLI. See
+[DESIGN.md](DESIGN.md#architecture) for the job breakdown.
 
 ## Command line
 
@@ -45,6 +61,13 @@ temp_crit        = 80      # °C — red threshold (also alert: critical)
 backlight_step   = 10      # percent change per +/- keypress
 # backlight_device = "intel_backlight"  # override auto-detect
 
+# Hide noisy names from their tab, the --once report and the alert engine.
+# Comma-separated globs; "*" spans "/" so "/snap/*" covers a whole subtree.
+# Empty (the default) shows everything.
+# net_ignore   = "veth*, br-*, docker*"      # container plumbing
+# disk_ignore  = "/snap/*, /var/lib/docker/*"
+# temp_ignore  = "coretemp_core_*"           # keep the package sensor only
+
 # Alerts
 alerts_enabled   = true    # master switch for the Alerts tab + banner
 mem_warn_pct     = 90      # RAM used % that raises a warning
@@ -56,7 +79,7 @@ load_warn_factor = 2.0     # load1 ≥ factor × cores raises a warning
 alert_log_cap    = 200     # max alert-log entries kept in memory
 alert_clear_ticks = 3      # consecutive OK ticks before an alert clears (flap damping)
 alert_bell       = true    # terminal bell on a new critical alert
-# alert_cmd      = "notify-send ucmon \"$UCMON_ALERT_MSG\""  # run on each raise/clear
+# alert_cmd      = 'notify-send ucmon "$UCMON_ALERT_MSG"'   # run on each raise/clear
 # alert_log_file = "~/ucmon-alerts.log"                      # append raise/clear lines
 
 # WiFi & connectivity

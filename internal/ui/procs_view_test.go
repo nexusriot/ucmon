@@ -191,3 +191,50 @@ func TestProcSortStrings(t *testing.T) {
 		}
 	}
 }
+
+// End-to-end guard for the highlight crash: a process name longer than the
+// NAME column gets a "…" from trunc, and rendering that row under an active
+// filter used to panic inside highlightFold. gopsutil reports whole words for
+// Status ("sleep", "idle"), so the row ends flush with no padding after it —
+// a filter matching that last character is what pushed the byte-indexed
+// search past the end of the rune slice.
+func TestProcViewRendersFilteredLongNames(t *testing.T) {
+	m := testModel()
+	m.activeTab = tabProc
+	m.procs = []probe.ProcInfo{
+		{PID: 4242, Name: "org.gnome.Shell.Extensions.Foo.Bar", User: "vlad",
+			Status: "sleep", CmdLine: "/usr/bin/python3 -m gnome.shell.ext"},
+		{PID: 4243, Name: "日本語のプロセス名がとても長い場合のテストです", User: "vlad",
+			Status: "idle", CmdLine: "/usr/bin/example --long-flag"},
+		{PID: 4244, Name: "sshd", User: "root", Status: "running", CmdLine: "sshd: /usr/sbin/sshd"},
+	}
+
+	for _, q := range []string{"p", "e", "g", "n", "s", "S", "4", "root", "日本", "python"} {
+		m.procsQuery = q
+		m.refreshProcs()
+		if out := m.View(); out == "" {
+			t.Errorf("query %q rendered nothing", q)
+		}
+	}
+}
+
+// Same path on the Network tab, where the connection table truncates
+// addresses and process names.
+func TestNetViewRendersFilteredLongNames(t *testing.T) {
+	m := testModel()
+	m.activeTab = tabNet
+	m.conns = []probe.ConnInfo{
+		{Proto: "TCP", LocalAddr: "192.168.88.10:22", RemoteAddr: "10.0.0.1:54321",
+			Status: "ESTABLISHED", PID: 42, Process: strings.Repeat("very-long-proc-", 6)},
+		{Proto: "TCP6", LocalAddr: "[::]:443", RemoteAddr: "-", Status: "LISTEN", PID: 1, Process: "nginx"},
+	}
+
+	for _, q := range []string{"1", "l", "LISTEN", "very", "-"} {
+		m.netQuery = q
+		m.netText = m.renderNetText()
+		m.netVP.SetContent(hardClipLinesToWidth(m.netText, m.netVP.Width))
+		if out := m.View(); out == "" {
+			t.Errorf("query %q rendered nothing", q)
+		}
+	}
+}

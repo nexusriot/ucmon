@@ -27,10 +27,14 @@ ucmon/
 │   │   ├── backlight.go        # Display backlight read/set (/sys/class/backlight)
 │   │   └── util.go             # Formatting helpers
 │   ├── config/                 # Optional TOML-subset config loader
-│   │   └── config.go
+│   │   ├── config.go           # Parsing, defaults, Sanitize
+│   │   └── ignore.go           # net/disk/temp ignore globs
 │   └── ui/                     # Presentation layer
 │       ├── model.go            # Bubble Tea model (state, Update, View)
 │       ├── alerts.go           # Alert engine (flap damping) + delivery (bell/cmd/file)
+│       ├── behind.go           # Fetch guards + sampling-lateness badge
+│       ├── filter.go           # Applies the ignore lists to incoming snapshots
+│       ├── notice.go           # Self-expiring transient status lines
 │       ├── detail.go           # Process detail overlay (renice, STOP/CONT, kill)
 │       ├── help.go             # Key-binding help overlay (?)
 │       ├── peaks.go            # Session peak tracker
@@ -40,6 +44,7 @@ ucmon/
 │       ├── spark.go            # Unicode sparkline chart renderer
 │       ├── bar.go              # Horizontal bar chart renderer
 │       └── table.go            # Text table & ANSI helpers
+├── .github/workflows/ci.yml    # test+race / lint / cross-compile / CLI smoke
 ├── DEBIAN/control              # Debian package metadata
 ├── build-deb.sh                # Debian package builder (amd64/arm64)
 ├── build-deb-arm64.sh          # ARM64 shortcut
@@ -49,7 +54,23 @@ ucmon/
 
 Unit tests live beside each package (`*_test.go`); probes that read sysfs or
 procfs take their base path from a package-level var so tests can point them
-at fake trees under `t.TempDir()`.
+at fake trees under `t.TempDir()`, and probes that shell out take their binary
+path the same way (`iwPaths`) or are intercepted with a stub on `PATH`
+(`vcgencmd`). Destructive helpers are exercised against a child process the
+test spawns itself, so SIGSTOP/SIGCONT/SIGTERM/SIGKILL and renice are covered
+without touching anything else on the machine.
+
+CI (`.github/workflows/ci.yml`) runs four jobs on every push and pull request:
+
+| Job | What it protects |
+|-----|------------------|
+| **test** | `gofmt` check, `go vet`, `go test -race` with a coverage profile and a summary |
+| **lint** | pinned `staticcheck` plus `golangci-lint` (`unused`, `ineffassign`, `unparam`, `unconvert`) |
+| **cross-compile** | `make` for all four targets, asserting each binary is statically linked — the pure-Go/`CGO_ENABLED=0` stance breaks here long before anyone flashes a board |
+| **smoke** | builds and runs the CLI: `--version` matches what the Makefile derives, every flag is documented, `--once` emits every report section, the ignore lists filter it, `ping_enabled = false` is honoured, and unknown flags or unparseable configs fail or degrade cleanly |
+
+The smoke job exists because `main` is the one function unit tests cannot
+reach; it covers flag parsing, config loading and the whole headless report.
 
 ## Design Decisions
 
@@ -93,6 +114,12 @@ on the proc interval. Mechanism order:
    measurement; only timeouts count as loss. Caveat: a gateway that silently
    DROPs both probes reads as loss.
 
+Every step of a measurement — name resolution included — draws from a single
+deadline derived from the sample timeout, so a wedged resolver costs one sample
+instead of blocking for its full retry budget while the next tick queues
+another round. Resolution goes through `net.DefaultResolver.LookupIP` with that
+context; the ICMP and TCP attempts share whatever time is left.
+
 Loss is tracked per target over a rolling 50-sample window; the alert only
 evaluates once ≥ 10 samples exist.
 
@@ -101,7 +128,8 @@ evaluates once ≥ 10 samples exist.
 - **Sparkline charts** (from ducknetview's `spark.go`): Unicode block characters `▁▂▃▄▅▆▇█` for time-series visualization of CPU load, temperatures, and network throughput
 - **Bar charts** (inspired by s3duck-tui's `SummaryGraph`): `█` filled / `░` empty blocks for disk usage percentages with color coding (green → yellow → orange → red)
 - **Viewport scrolling** (from Bubble Tea's `bubbles/viewport`): for process and connection lists that exceed terminal height
-- **Search/filter** (from ducknetview pattern): `/` activates inline search, `ctrl+u` clears, `enter` applies
+- **Search/filter** (from ducknetview pattern): `/` activates inline search, `ctrl+u` clears, `enter` applies. While a search box is focused it owns every key but `ctrl+c`, so digits, arrows, `tab` and `/` reach the text input instead of the global map
+- **Frame budget**: every tab body goes through `Model.box`, which hard-clips the content to the box's inner width *and* to `bodyHeight()` before lipgloss renders it. Clipping only the height is not enough — lipgloss soft-wraps an over-wide line, and each wrap adds a physical row the height budget never counted, so the frame outgrows the terminal and Bubble Tea's alt-screen renderer blanks the display. The header is clamped for the same reason. Below `minWidth`×`minHeight` (30×6) ucmon draws a one-line "terminal too small" notice instead of a frame
 
 ## Tab Layout
 
@@ -158,7 +186,13 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
 
 ### Tab 5: Network
 
-- Active interface summary with address, RX/TX rates and sparkline history
+- Active interface summary with address, RX/TX rates and sparkline history.
+  `j`/`k` move the selection, which is stored by interface *name*: an interface
+  going down shifts the list, and a positional cursor would silently re-point at
+  whichever interface took that slot
+- Throughput history is keyed by interface name and evicted when a name leaves
+  the snapshot, so a host churning container veths or a reconnecting VPN does
+  not accumulate a ring buffer per name for the life of the process
 - WiFi interfaces show a color-coded link-quality % and signal dBm inline; the
   selected interface expands to a quality bar (parsed from `/proc/net/wireless`,
   no external tooling) plus SSID / channel / tx-rx bitrates when `iw` is
@@ -248,6 +282,15 @@ prints. Useful over SSH and from cron.
 - `internal/ui/peaks.go` tracks session peaks (max CPU%, hottest sensor, max
   load1, max RAM%, min battery%) fed from the same messages that update the
   histories; they render inline on the relevant tabs and in reports.
+- The header also carries a **sampling-lateness badge** (`⏳ slow: gpu/soc`)
+  naming the probes that could not finish inside their interval, and fades it
+  once they catch up. Naming the probe is the point: on a CM4 the difference
+  between "something is slow" and "the vcgencmd shell-outs are slow" is the
+  whole diagnosis.
+- Transient status lines (`internal/ui/notice.go`) expire on their own after a
+  few seconds rather than sitting there until an unrelated keypress overwrites
+  them; the footer notice, the kill confirmation and the brightness readout all
+  use the same type.
 
 ## Refresh Intervals
 
@@ -259,6 +302,15 @@ Three configurable cadences drive all sampling (defaults shown). The base
 | CPU / cpufreq / PSI / memory / network I/O | `fast_interval` | 1s |
 | Processes / connections / ping  | `proc_interval` | 3s      |
 | Disk / battery / GPU / SoC / iw | `slow_interval` | 5s      |
+
+The three slow rounds — the `/proc` walk, the vcgencmd + `iw` shell-outs, and
+the ping round — carry an in-flight guard. A tick that finds the previous round
+still running skips this one rather than queueing a second goroutine onto the
+sampler's mutex, and records the skip; the header then shows which probe is
+lagging (`⏳ slow: gpu/soc`). A fetch that is merely disabled is not lateness.
+`Init` primes every reading once without raising the guards, since Bubble Tea's
+`Init` returns a command rather than a model; the first guarded dispatch is a
+whole interval away, so the priming fetches have landed by then.
 
 ## Configuration
 
@@ -273,9 +325,28 @@ Keys: `start_tab`, `fast_interval`, `proc_interval`, `slow_interval`,
 alert thresholds `alerts_enabled`, `mem_warn_pct`, `swap_warn_pct`,
 `disk_warn_pct`, `batt_low_pct`, `batt_crit_pct`, `load_warn_factor`,
 `alert_log_cap`, the alert delivery/damping keys `alert_clear_ticks`,
-`alert_bell`, `alert_cmd`, `alert_log_file` (supports `~/`), and the monitor
-keys `wifi_low_dbm`, `ping_enabled`, `ping_target`, `ping_loss_warn_pct`,
-`psi_warn_pct`. See the README for an annotated example.
+`alert_bell`, `alert_cmd`, `alert_log_file` (supports `~/`), the monitor keys
+`wifi_low_dbm`, `ping_enabled`, `ping_target`, `ping_loss_warn_pct`,
+`psi_warn_pct`, and the ignore lists `net_ignore`, `disk_ignore`,
+`temp_ignore`. See the README for an annotated example.
+
+`splitValue` drops a `#` comment that is not inside quotes, then removes one
+matched pair of surrounding quotes — so a value keeps quotes of its own and a
+shell hook can be written as a TOML literal string. Escape sequences are not
+interpreted. `Sanitize` then clamps the intervals, restores out-of-range alert
+percentages to their defaults (an out-of-range threshold would otherwise fire
+forever or never), and enforces `temp_warn ≤ temp_hot ≤ temp_crit` by pushing
+the lower tiers down, so explicitly lowering `temp_crit` keeps the value asked
+for. `internal/config/readme_test.go` parses the README's own example block and
+asserts every documented key is recognised and every value loses its comment
+and quoting, pinning the docs to the parser.
+
+The ignore lists take comma-separated globs where `*` spans `/` as well, so
+`/snap/*` covers a whole mount subtree — deliberately unlike `path.Match`.
+Filtering is applied in `internal/ui/filter.go` where each snapshot lands, not
+in the views, so sparkline history, session peaks, the alert engine and the
+`--once` report all see the same filtered set; a hidden interface cannot still
+raise a WiFi alert or hold a history buffer. The default lists are empty.
 
 ## Keyboard Controls
 

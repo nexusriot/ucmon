@@ -227,7 +227,7 @@ func TestGovernorKeyWithoutCpufreq(t *testing.T) {
 	m := testModel()
 	m.activeTab = tabCPU
 	m, _ = press(t, m, key('g'))
-	if m.notice == "" {
+	if m.notice.get() == "" {
 		t.Error("g without cpufreq policies should set a notice")
 	}
 }

@@ -30,6 +30,13 @@ type Config struct {
 	BacklightStep   int    // percent change per +/- keypress
 	BacklightDevice string // optional /sys/class/backlight device override
 
+	// Name globs hidden from their tab, the --once report and the alert
+	// engine alike. "*" matches any run of characters, "/" included, so
+	// "/snap/*" covers a whole subtree. Empty means show everything.
+	NetIgnore  []string // interface names, e.g. veth*, br-*, docker*
+	DiskIgnore []string // mount points, e.g. /snap/*, /var/lib/docker/*
+	TempIgnore []string // sensor labels, e.g. coretemp_core_*
+
 	// Alerting (Alerts tab + header banner). Thresholds drive edge-triggered
 	// alerts; CPU-temperature alerts reuse TempHot (warn) / TempCrit (crit).
 	AlertsEnabled  bool    // master switch
@@ -41,7 +48,6 @@ type Config struct {
 	LoadWarnFactor float64 // load1 ≥ factor×cores raises a warning
 	AlertLogCap    int     // max alert-log entries retained in memory
 
-	// Alert delivery / flap damping.
 	AlertClearTicks int    // consecutive OK ticks before a condition clears
 	AlertBell       bool   // terminal bell on a new critical alert
 	AlertCmd        string // shell command run on each raise/clear ("" = off)
@@ -133,11 +139,45 @@ func LoadFrom(path string) Config {
 			continue
 		}
 		key := strings.ToLower(strings.TrimSpace(line[:eq]))
-		val := strings.TrimSpace(line[eq+1:])
-		val = strings.Trim(val, "\"'") // strip optional quotes
-		apply(&cfg, key, val)
+		apply(&cfg, key, splitValue(line[eq+1:]))
 	}
 	return cfg
+}
+
+// splitValue turns the raw text after `=` into the value: it drops a trailing
+// `#` comment that is not inside quotes, then removes one matched pair of
+// surrounding quotes. Quotes belonging to the value survive, so a shell hook
+// can be written as a TOML literal string:
+//
+//	alert_cmd = 'notify-send "ucmon" "$UCMON_ALERT_MSG"'   # fires on each event
+//
+// Escape sequences are not interpreted; a backslash only shields the next
+// character from ending the quoted stretch.
+func splitValue(raw string) string {
+	val := raw
+	var quote byte
+scan:
+	for i := 0; i < len(raw); i++ {
+		switch c := raw[i]; {
+		case quote != 0 && c == '\\':
+			i++
+		case quote != 0 && c == quote:
+			quote = 0
+		case quote == 0 && (c == '"' || c == '\''):
+			quote = c
+		case quote == 0 && c == '#':
+			val = raw[:i]
+			break scan
+		}
+	}
+
+	val = strings.TrimSpace(val)
+	if n := len(val); n >= 2 {
+		if q := val[0]; (q == '"' || q == '\'') && val[n-1] == q {
+			val = val[1 : n-1]
+		}
+	}
+	return val
 }
 
 func apply(cfg *Config, key, val string) {
@@ -174,6 +214,12 @@ func apply(cfg *Config, key, val string) {
 		}
 	case "backlight_device", "backlightdevice":
 		cfg.BacklightDevice = val
+	case "net_ignore", "netignore", "iface_ignore":
+		cfg.NetIgnore = splitList(val)
+	case "disk_ignore", "diskignore", "mount_ignore":
+		cfg.DiskIgnore = splitList(val)
+	case "temp_ignore", "tempignore", "sensor_ignore":
+		cfg.TempIgnore = splitList(val)
 	case "alerts_enabled", "alertsenabled", "alerts":
 		cfg.AlertsEnabled = parseBool(val, cfg.AlertsEnabled)
 	case "mem_warn_pct", "memwarnpct", "mem_warn":
@@ -292,9 +338,30 @@ func (c *Config) Sanitize() {
 	if c.LoadWarnFactor <= 0 {
 		c.LoadWarnFactor = 2.0
 	}
-	// BattCrit should not exceed BattLow so the two tiers stay ordered.
+
+	// Alert thresholds are compared against 0–100 readings, so an out-of-range
+	// value silently either never fires or fires on every tick. A typo like
+	// "900" or "-5" falls back to the default instead.
+	def := Default()
+	c.MemWarnPct = pctOr(c.MemWarnPct, def.MemWarnPct)
+	c.SwapWarnPct = pctOr(c.SwapWarnPct, def.SwapWarnPct)
+	c.DiskWarnPct = pctOr(c.DiskWarnPct, def.DiskWarnPct)
+
+	// Battery tiers allow 0 (fire only at a flat pack) and stay ordered.
+	c.BattLowPct = clampPctInt(c.BattLowPct)
+	c.BattCritPct = clampPctInt(c.BattCritPct)
 	if c.BattCritPct > c.BattLowPct {
 		c.BattCritPct = c.BattLowPct
+	}
+
+	// TempColor and the alert engine both assume warn ≤ hot ≤ crit. Push the
+	// lower tiers down rather than sorting, so explicitly lowering temp_crit
+	// on a passively cooled board keeps the value the user asked for.
+	if c.TempHot > c.TempCrit {
+		c.TempHot = c.TempCrit
+	}
+	if c.TempWarn > c.TempHot {
+		c.TempWarn = c.TempHot
 	}
 	if c.AlertClearTicks < 1 {
 		c.AlertClearTicks = 1
@@ -315,4 +382,27 @@ func (c *Config) Sanitize() {
 	if c.PSIWarnPct < 0 {
 		c.PSIWarnPct = 0
 	}
+	if c.PSIWarnPct > 100 {
+		c.PSIWarnPct = 100
+	}
+}
+
+// pctOr returns v when it is a usable percentage threshold and def otherwise.
+// 0 is rejected: no reading is ever below it, so it would alert forever.
+func pctOr(v, def float64) float64 {
+	if v <= 0 || v > 100 {
+		return def
+	}
+	return v
+}
+
+// clampPctInt bounds a whole-percent threshold to 0–100.
+func clampPctInt(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
 }

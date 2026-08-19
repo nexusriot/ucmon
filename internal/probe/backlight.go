@@ -2,6 +2,7 @@ package probe
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -41,7 +42,16 @@ func ReadBacklight(override string) BacklightInfo {
 		return BacklightInfo{}
 	}
 
-	pct := int(float64(cur) / float64(maxB) * 100)
+	// Round, don't truncate: SetBacklightPercent maps a percent back to a raw
+	// value, and a truncating read-back can land a step below where it was
+	// just set, so small backlight_step values would never advance.
+	pct := int(math.Round(float64(cur) / float64(maxB) * 100))
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
 
 	return BacklightInfo{
 		Present:    true,

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -19,7 +20,7 @@ func writeConfig(t *testing.T, content string) string {
 func TestLoadFromMissingFileReturnsDefaults(t *testing.T) {
 	cfg := LoadFrom(filepath.Join(t.TempDir(), "nope.toml"))
 	def := Default()
-	if cfg != def {
+	if !reflect.DeepEqual(cfg, def) {
 		t.Errorf("missing file: got %+v, want defaults %+v", cfg, def)
 	}
 }
@@ -192,5 +193,182 @@ func TestParseInterval(t *testing.T) {
 		if ok != c.ok || got != c.want {
 			t.Errorf("parseInterval(%q) = %v,%v want %v,%v", c.in, got, ok, c.want, c.ok)
 		}
+	}
+}
+
+// Inline "#" comments are TOML, and every example in the README uses them.
+// Taking them as part of the value made every documented key a no-op.
+func TestInlineCommentsAreStripped(t *testing.T) {
+	cfg := LoadFrom(writeConfig(t, `
+start_tab        = "net"   # cpu | mem | proc | disk | net | power | gpu
+fast_interval    = "2s"    # CPU / memory / network throughput tick
+temp_crit        = 70      # °C — red threshold
+backlight_step   = 5       # percent per keypress
+ping_target      = 1.1.1.1 # cloudflare
+alerts_enabled   = false   # master switch
+`))
+	if cfg.StartTab != "net" {
+		t.Errorf("StartTab = %q", cfg.StartTab)
+	}
+	if cfg.FastInterval != 2*time.Second {
+		t.Errorf("FastInterval = %v, want 2s", cfg.FastInterval)
+	}
+	if cfg.TempCrit != 70 {
+		t.Errorf("TempCrit = %v, want 70", cfg.TempCrit)
+	}
+	if cfg.BacklightStep != 5 {
+		t.Errorf("BacklightStep = %d, want 5", cfg.BacklightStep)
+	}
+	if cfg.PingTarget != "1.1.1.1" {
+		t.Errorf("PingTarget = %q, want 1.1.1.1", cfg.PingTarget)
+	}
+	if cfg.AlertsEnabled {
+		t.Error("AlertsEnabled should be false")
+	}
+}
+
+// Only one matched pair of surrounding quotes comes off; quotes inside the
+// value belong to it, and a "#" inside quotes is not a comment.
+func TestQuoteHandling(t *testing.T) {
+	cases := []struct{ body, want string }{
+		{`alert_cmd = 'notify-send "ucmon" "$UCMON_ALERT_MSG"'`, `notify-send "ucmon" "$UCMON_ALERT_MSG"`},
+		{`alert_cmd = "logger -t ucmon '$UCMON_ALERT_MSG'"`, `logger -t ucmon '$UCMON_ALERT_MSG'`},
+		{`alert_cmd = 'printf "#%s\n" "$UCMON_ALERT_SEV"'`, `printf "#%s\n" "$UCMON_ALERT_SEV"`},
+		{`alert_cmd = echo plain`, `echo plain`},
+		{`alert_cmd = 'trailing'   # a comment`, `trailing`},
+	}
+	for _, c := range cases {
+		if got := LoadFrom(writeConfig(t, c.body)).AlertCmd; got != c.want {
+			t.Errorf("%s\n  got  %q\n  want %q", c.body, got, c.want)
+		}
+	}
+}
+
+// Out-of-range alert thresholds silently never fire or fire forever, so a typo
+// falls back to the default rather than being clamped into uselessness.
+func TestSanitizeBoundsAlertThresholds(t *testing.T) {
+	cfg := LoadFrom(writeConfig(t, "mem_warn_pct = -5\nswap_warn_pct = 0\ndisk_warn_pct = 900\nbatt_low_pct = 300\nbatt_crit_pct = -9\npsi_warn_pct = 400\n"))
+	cfg.Sanitize()
+	def := Default()
+
+	if cfg.MemWarnPct != def.MemWarnPct {
+		t.Errorf("MemWarnPct = %v, want the default %v", cfg.MemWarnPct, def.MemWarnPct)
+	}
+	if cfg.SwapWarnPct != def.SwapWarnPct {
+		t.Errorf("SwapWarnPct = %v, want the default %v", cfg.SwapWarnPct, def.SwapWarnPct)
+	}
+	if cfg.DiskWarnPct != def.DiskWarnPct {
+		t.Errorf("DiskWarnPct = %v, want the default %v", cfg.DiskWarnPct, def.DiskWarnPct)
+	}
+	if cfg.BattLowPct != 100 {
+		t.Errorf("BattLowPct = %d, want 100", cfg.BattLowPct)
+	}
+	if cfg.BattCritPct != 0 {
+		t.Errorf("BattCritPct = %d, want 0", cfg.BattCritPct)
+	}
+	if cfg.PSIWarnPct != 100 {
+		t.Errorf("PSIWarnPct = %v, want 100", cfg.PSIWarnPct)
+	}
+}
+
+// TempColor and the alert engine both assume warn <= hot <= crit.
+func TestSanitizeOrdersTempThresholds(t *testing.T) {
+	cases := []struct{ warn, hot, crit, wWarn, wHot, wCrit float64 }{
+		{50, 65, 80, 50, 65, 80}, // already ordered
+		{90, 70, 50, 50, 50, 50}, // fully inverted
+		{50, 65, 60, 50, 60, 60}, // only crit lowered — crit is authoritative
+		{70, 60, 80, 60, 60, 80}, // warn above hot
+	}
+	for _, c := range cases {
+		cfg := Config{TempWarn: c.warn, TempHot: c.hot, TempCrit: c.crit}
+		cfg.Sanitize()
+		if cfg.TempWarn != c.wWarn || cfg.TempHot != c.wHot || cfg.TempCrit != c.wCrit {
+			t.Errorf("Sanitize(%v/%v/%v) = %v/%v/%v, want %v/%v/%v",
+				c.warn, c.hot, c.crit, cfg.TempWarn, cfg.TempHot, cfg.TempCrit,
+				c.wWarn, c.wHot, c.wCrit)
+		}
+		if !(cfg.TempWarn <= cfg.TempHot && cfg.TempHot <= cfg.TempCrit) {
+			t.Errorf("invariant broken: %v/%v/%v", cfg.TempWarn, cfg.TempHot, cfg.TempCrit)
+		}
+	}
+}
+
+// Path honours XDG_CONFIG_HOME and falls back to ~/.config, which is what the
+// README documents.
+func TestPathRespectsXDG(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	if got, want := Path(), filepath.Join(xdg, "ucmon", "config.toml"); got != want {
+		t.Errorf("Path() = %q, want %q", got, want)
+	}
+
+	home := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", home)
+	if got, want := Path(), filepath.Join(home, ".config", "ucmon", "config.toml"); got != want {
+		t.Errorf("Path() without XDG = %q, want %q", got, want)
+	}
+}
+
+// Load reads whatever Path points at; a missing file is the defaults, and a
+// real file there is picked up without an explicit --config.
+func TestLoadUsesPath(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+
+	if got := Load(); !reflect.DeepEqual(got, Default()) {
+		t.Errorf("Load() with no file did not return the defaults")
+	}
+
+	dir := filepath.Join(xdg, "ucmon")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"),
+		[]byte("start_tab = \"net\"   # picked up without --config\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := Load().StartTab; got != "net" {
+		t.Errorf("Load().StartTab = %q, want net", got)
+	}
+}
+
+// An empty path is the "no config" signal from main and must not be treated as
+// the current directory.
+func TestLoadFromEmptyPath(t *testing.T) {
+	if got := LoadFrom(""); !reflect.DeepEqual(got, Default()) {
+		t.Error("LoadFrom(\"\") did not return the defaults")
+	}
+}
+
+// Section headers and both comment styles are skipped, and a line without "="
+// cannot crash the parser.
+func TestLoadFromSkipsNonSettings(t *testing.T) {
+	cfg := LoadFrom(writeConfig(t, `
+# a hash comment
+; a semicolon comment
+[alerts]
+this line has no equals sign
+   
+start_tab = "power"
+= value with no key
+`))
+	if cfg.StartTab != "power" {
+		t.Errorf("StartTab = %q, want power", cfg.StartTab)
+	}
+}
+
+// With neither XDG_CONFIG_HOME nor HOME there is nowhere to look; Path must
+// return "" so LoadFrom falls through to the defaults instead of reading a
+// relative path out of the working directory.
+func TestPathWithNoHome(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+	got := Path()
+	if got != "" && !filepath.IsAbs(got) {
+		t.Errorf("Path() = %q, want \"\" or an absolute path", got)
+	}
+	if !reflect.DeepEqual(LoadFrom(""), Default()) {
+		t.Error("an empty path did not fall back to the defaults")
 	}
 }

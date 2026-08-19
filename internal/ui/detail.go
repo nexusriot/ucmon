@@ -43,42 +43,43 @@ func (m *Model) openProcDetail() tea.Cmd {
 	return fetchProcDetailCmd(p.PID)
 }
 
-// updateProcDetail handles keys while the overlay is open. The kill-confirm
+// updateProcDetail handles keys while the overlay is open; it swallows every
+// key, so the caller never falls through to the global map. The kill-confirm
 // prompt is handled by the caller before this runs.
-func (m *Model) updateProcDetail(key string) (tea.Cmd, bool) {
+func (m *Model) updateProcDetail(key string) tea.Cmd {
 	st := m.detail
 	switch key {
 	case "esc", "q", "enter":
 		m.detail = nil
-		return nil, true
+		return nil
 	case "+", "=":
-		return m.reniceDetail(1), true
+		return m.reniceDetail(1)
 	case "-", "_":
-		return m.reniceDetail(-1), true
+		return m.reniceDetail(-1)
 	case "p":
 		if err := probe.SuspendProcess(st.pid); err != nil {
 			st.notice = errStyle.Render("SIGSTOP failed: " + err.Error())
 		} else {
 			st.notice = warnStyle.Render(fmt.Sprintf("sent SIGSTOP to %d", st.pid))
 		}
-		return fetchProcDetailCmd(st.pid), true
+		return fetchProcDetailCmd(st.pid)
 	case "c":
 		if err := probe.ResumeProcess(st.pid); err != nil {
 			st.notice = errStyle.Render("SIGCONT failed: " + err.Error())
 		} else {
 			st.notice = okStyle.Render(fmt.Sprintf("sent SIGCONT to %d", st.pid))
 		}
-		return fetchProcDetailCmd(st.pid), true
+		return fetchProcDetailCmd(st.pid)
 	case "k":
 		m.procsKill = &killPrompt{pid: st.pid, name: st.displayName(), hard: false}
-		return nil, true
+		return nil
 	case "K":
 		m.procsKill = &killPrompt{pid: st.pid, name: st.displayName(), hard: true}
-		return nil, true
+		return nil
 	case "ctrl+c":
-		return tea.Quit, true
+		return tea.Quit
 	}
-	return nil, true // overlay swallows everything else
+	return nil
 }
 
 func (st *procDetailState) displayName() string {
@@ -103,8 +104,7 @@ func (m *Model) reniceDetail(delta int) tea.Cmd {
 }
 
 func (m Model) viewProcDetail() string {
-	w := min(m.w-2, 140)
-	bodyH := m.bodyHeight()
+	w := m.boxWidth()
 	innerW := max(10, w-4)
 	st := m.detail
 
@@ -135,7 +135,7 @@ func (m Model) viewProcDetail() string {
 
 	if !st.loaded {
 		b.WriteString("Loading details…\n")
-		return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+		return m.box(b.String())
 	}
 
 	d := st.d
@@ -199,5 +199,5 @@ func (m Model) viewProcDetail() string {
 		}
 	}
 
-	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+	return m.box(b.String())
 }

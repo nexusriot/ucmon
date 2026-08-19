@@ -44,3 +44,24 @@ func TestClampHistory(t *testing.T) {
 		t.Errorf("int history: %v", ints)
 	}
 }
+
+func TestCounterRate(t *testing.T) {
+	cases := []struct {
+		name      string
+		cur, prev uint64
+		dt        float64
+		want      float64
+	}{
+		{"normal", 5000, 1000, 2, 2000},
+		{"no change", 1000, 1000, 2, 0},
+		{"counter reset", 1_000_000, 5_000_000_000, 5, 0},
+		{"zero dt", 5000, 1000, 0, 0},
+		{"negative dt", 5000, 1000, -1, 0},
+	}
+	for _, c := range cases {
+		if got := CounterRate(c.cur, c.prev, c.dt); got != c.want {
+			t.Errorf("%s: CounterRate(%d,%d,%g) = %g, want %g",
+				c.name, c.cur, c.prev, c.dt, got, c.want)
+		}
+	}
+}

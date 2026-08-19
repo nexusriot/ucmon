@@ -4,3 +4,4 @@ build/
 cmd/ucmon/ucmon
 dist/
 
+coverage.out

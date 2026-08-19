@@ -15,7 +15,7 @@ import (
 	"github.com/nexusriot/ucmon/internal/probe"
 )
 
-const version = "0.6.0"
+const version = "0.8.0"
 
 // Version reports the ucmon release for the --version flag.
 func Version() string { return version }
@@ -59,6 +59,16 @@ func tabFromName(s string) tab {
 const (
 	headerH = 1
 	footerH = 1
+)
+
+// A tab frame costs headerH + footerH + 2 rows of box border before any
+// content, so below minHeight there is nothing left to draw and the frame
+// would overflow the terminal — which makes Bubble Tea's alt-screen renderer
+// blank the display. minWidth is where the box stops soft-wrapping into the
+// same overflow. Smaller than either and ucmon says so instead.
+const (
+	minWidth  = 30
+	minHeight = 6
 )
 
 // procsDisplayCap bounds how many process rows are rendered (the viewport
@@ -133,11 +143,16 @@ func (c connState) match(status string) bool {
 	}
 }
 
-// messages
 type tickMsg time.Time
 type cpuMsg probe.CPUSnapshot
 type memMsg probe.MemSnapshot
-type procMsg []probe.ProcInfo
+
+// procMsg carries its own error rather than routing failures through errMsg,
+// so the in-flight guard below always sees the fetch complete.
+type procMsg struct {
+	procs []probe.ProcInfo
+	err   error
+}
 type diskMsg struct {
 	disks []probe.DiskInfo
 	ios   []probe.DiskIOInfo
@@ -173,7 +188,6 @@ type Model struct {
 	showHelp bool // ?: key-binding overlay
 	peaks    sessionPeaks
 
-	// CPU tab
 	cpuSnap   probe.CPUSnapshot
 	cpuHist   []float64 // total CPU history
 	tempHist  map[string][]float64
@@ -181,18 +195,15 @@ type Model struct {
 	freqHist  map[string][]float64 // cpufreq MHz per policy
 	psi       probe.PSISnapshot
 
-	// Memory tab
 	memSnap  probe.MemSnapshot
 	memHist  []float64 // RAM used %
 	swapHist []float64 // swap used %
 
-	// Power tab
 	powerSnap probe.PowerSnapshot
 	battHist  []float64 // battery capacity %
 	battWHist []float64 // signed battery power (negative = discharging)
 	loadHist  []float64 // 1-min load average
 
-	// Processes tab
 	procSampler    *probe.ProcSampler
 	detail         *procDetailState // non-nil while the detail overlay is open
 	procs          []probe.ProcInfo
@@ -207,14 +218,12 @@ type Model struct {
 	procsPrefix    []string    // tree-branch prefix per procsView row (tree mode)
 	procsSel       int         // cursor index into procsView
 	procsKill      *killPrompt // non-nil while confirming a kill
-	procsNotice    string      // transient status (e.g. "sent SIGTERM …")
+	procsNotice    notice      // transient status (e.g. "sent SIGTERM …")
 
-	// Disk tab
 	disks       []probe.DiskInfo
 	diskIOs     []probe.DiskIOInfo
 	diskSampler *probe.DiskSampler
 
-	// Network tab
 	netSampler   *probe.NetSampler
 	netSnap      probe.NetSnapshot
 	conns        []probe.ConnInfo
@@ -227,25 +236,29 @@ type Model struct {
 	netQuery     string
 	rxHist       map[string][]float64
 	txHist       map[string][]float64
-	netIfaceSel  int // selected interface index in upIfaces list (-1 = none)
+	netIfaceName string // name of the selected interface ("" = none)
 	iwLinks      map[string]probe.IWLink
 
-	// Latency monitor (Network tab)
 	latSampler *probe.LatencySampler // nil when ping_enabled = false
 	pings      []probe.PingResult
 	rttHist    map[string][]float64 // ms, successful samples only
 	lossWin    map[string][]bool    // rolling success window per target
 
-	// GPU / SoC tab
 	gpuSnap   probe.GPUInfo
 	backlight probe.BacklightInfo
-	sysNotice string // transient backlight-set status
+	sysNotice notice // transient backlight-set status
 
-	// Alerts tab + header banner
-	alerts      alertEngine
-	alertsVP    viewport.Model
-	notice      string    // transient global status (e.g. snapshot written)
-	noticeUntil time.Time // when the transient notice expires
+	alerts   alertEngine
+	alertsVP viewport.Model
+	notice   notice // transient global status (e.g. snapshot written)
+
+	// Sampling-lateness tracking. inFlight is raised when a slow fetch is
+	// dispatched and lowered by its reply, so a board that cannot keep up
+	// samples less often instead of accumulating goroutines and forks;
+	// behindSkips counts the dispatches that were consequently skipped.
+	inFlight    [numFetchKinds]bool
+	behindSkips [numFetchKinds]int
+	behindAt    time.Time // last skipped dispatch
 
 	tickCount int
 }
@@ -304,12 +317,15 @@ func NewModel(cfg config.Config) Model {
 		txHist:       map[string][]float64{},
 		rttHist:      map[string][]float64{},
 		lossWin:      map[string][]bool{},
-		netIfaceSel:  -1,
 		iwLinks:      map[string]probe.IWLink{},
 		alerts:       newAlertEngine(cfg.AlertLogCap, cfg.AlertClearTicks),
 	}
 }
 
+// Init primes every reading once. It cannot raise the in-flight guards —
+// Bubble Tea's Init returns a command, not a model — but the first guarded
+// tick dispatch is proc_interval/slow_interval away, so these have already
+// landed in practice.
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{
 		fetchCPUCmd(),
@@ -359,14 +375,13 @@ func fetchCPUCmd() tea.Cmd {
 	}
 }
 
+// fetchProcsCmd lists processes. On a slow board a full /proc walk can outlast
+// proc_interval, so callers dispatch it through queue.
 func (m Model) fetchProcsCmd() tea.Cmd {
 	sampler := m.procSampler
 	return func() tea.Msg {
 		procs, err := sampler.List()
-		if err != nil {
-			return errMsg{err}
-		}
-		return procMsg(procs)
+		return procMsg{procs: procs, err: err}
 	}
 }
 
@@ -418,6 +433,9 @@ func fetchConnsCmd() tea.Cmd {
 	}
 }
 
+// fetchSysCmd shells out ~10 times to vcgencmd plus once to iw per wireless
+// interface, each with a 2s timeout, so it can exceed slow_interval on a CM4.
+// Callers dispatch it through queue.
 func (m Model) fetchSysCmd() tea.Cmd {
 	dev := m.cfg.BacklightDevice
 	return func() tea.Msg {
@@ -440,6 +458,22 @@ func (m Model) bodyHeight() int {
 	return bh
 }
 
+// boxWidth is the width passed to boxStyle; the rendered block is 2 columns
+// wider than this because the border sits outside it.
+func (m Model) boxWidth() int { return min(m.w-2, 140) }
+
+// box frames a tab body. The content is hard-clipped to the box's inner width
+// as well as to bodyHeight: lipgloss soft-wraps any over-wide line, and each
+// wrap adds a physical row that the height budget never accounted for, so the
+// frame outgrows the terminal and Bubble Tea's alt-screen renderer blanks the
+// display.
+func (m Model) box(content string) string {
+	w := m.boxWidth()
+	bodyH := m.bodyHeight()
+	content = hardClipLinesToWidth(content, max(1, w-2))
+	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(content, bodyH))
+}
+
 // upIfaces returns only the active interfaces.
 func (m Model) upIfaces() []probe.IfaceInfo {
 	var out []probe.IfaceInfo
@@ -451,19 +485,80 @@ func (m Model) upIfaces() []probe.IfaceInfo {
 	return out
 }
 
+// moveIfaceSel steps the interface selection by delta, cycling through the up
+// interfaces and back to "nothing selected". A selection whose interface has
+// disappeared restarts from the end the caller is heading towards.
+func (m *Model) moveIfaceSel(delta int) {
+	up := m.upIfaces()
+	if len(up) == 0 {
+		m.netIfaceName = ""
+		return
+	}
+
+	next := m.netIfaceIdx() + delta
+	switch {
+	case next >= len(up):
+		m.netIfaceName = "" // stepped off the end: deselect
+	case next == -1:
+		m.netIfaceName = "" // stepped back off the start: deselect
+	case next < -1:
+		m.netIfaceName = up[len(up)-1].Name // wrap from "none" to the last
+	default:
+		m.netIfaceName = up[next].Name
+	}
+	m.netVP.Height = m.calcNetVPHeight()
+}
+
+// evictIfaceHistory drops the throughput history of interfaces that are no
+// longer in the snapshot at all. Without it a host that churns interfaces —
+// container veths, a reconnecting VPN, ppp — accumulates a history buffer per
+// name that is never read again. Interfaces that are merely down keep theirs.
+func (m *Model) evictIfaceHistory(present map[string]bool) {
+	if len(present) == 0 {
+		return // an empty snapshot is suspect; keep what we have
+	}
+	for name := range m.rxHist {
+		if !present[name] {
+			delete(m.rxHist, name)
+			delete(m.txHist, name)
+		}
+	}
+	for name := range m.txHist {
+		if !present[name] {
+			delete(m.txHist, name)
+		}
+	}
+}
+
+// netIfaceIdx is the position of the selected interface in the up list, or -1
+// when nothing is selected or the selected interface has gone away. Selection
+// is stored by name, so an interface going down no longer silently re-points
+// it at whichever one shifted into that slot.
+func (m Model) netIfaceIdx() int {
+	if m.netIfaceName == "" {
+		return -1
+	}
+	for i, ii := range m.upIfaces() {
+		if ii.Name == m.netIfaceName {
+			return i
+		}
+	}
+	return -1
+}
+
 // netIfaceLines returns the number of lines the interface summary takes.
 func (m Model) netIfaceLines() int {
 	if m.netSnap.TakenAt.IsZero() {
-		return 3 // "Interfaces …" + "Collecting…" + blank
+		return 2 // "Interfaces … Collecting…" + blank
 	}
 	up := m.upIfaces()
 	n := 2       // total traffic line + blank
 	n += len(up) // one line per interface
-	if m.netIfaceSel >= 0 && m.netIfaceSel < len(up) {
+	if sel := m.netIfaceIdx(); sel >= 0 {
 		n += 2 // RX + TX sparklines for selected
-		if up[m.netIfaceSel].WiFi.Present {
+		if up[sel].WiFi.Present {
 			n++ // WiFi quality/signal detail line
-			if _, ok := m.iwLinks[up[m.netIfaceSel].Name]; ok {
+			if _, ok := m.iwLinks[up[sel].Name]; ok {
 				n++ // SSID / channel / bitrate line
 			}
 		}
@@ -484,12 +579,20 @@ func (m Model) latencyLines() int {
 	return n + 1 // + trailing blank
 }
 
+// netVPOverhead counts the lines viewNet draws around the connection
+// viewport. bodyHeight already excludes the box border, so budgeting for it
+// again here just left blank rows at the bottom of the Network tab.
+func (m Model) netVPOverhead() int {
+	const (
+		connSummary = 1
+		searchBlock = 2 // search line + blank
+		tableHeader = 2 // column header + rule
+	)
+	return m.netIfaceLines() + m.latencyLines() + connSummary + searchBlock + tableHeader
+}
+
 func (m Model) calcNetVPHeight() int {
-	bodyH := m.bodyHeight()
-	// iface + ping lines + conn summary + search line + blank +
-	// header (2 lines) + box border/padding (4)
-	overhead := m.netIfaceLines() + m.latencyLines() + 1 + 1 + 1 + 2 + 4
-	return max(3, bodyH-overhead)
+	return max(3, m.bodyHeight()-m.netVPOverhead())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -499,7 +602,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.w, m.h = msg.Width, msg.Height
 		bodyH := m.bodyHeight()
 
-		vpW := min(m.w-2, 140)
+		vpW := m.boxWidth()
 		m.procsVP.Width = max(10, vpW-2)
 		// 7 fixed lines above the viewport: status + detail + blank +
 		// (title, blank, colhdr, sep). Keep total == bodyH so the box
@@ -532,16 +635,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			tickEvery(m.fastInterval),
 		}
 		if m.tickCount%m.procEvery == 0 {
-			cmds = append(cmds, m.fetchProcsCmd(), fetchConnsCmd())
-			if cmd := m.fetchLatencyCmd(); cmd != nil {
-				cmds = append(cmds, cmd)
-			}
+			cmds = m.queue(cmds, fetchProcs, m.fetchProcsCmd)
+			cmds = m.queue(cmds, fetchLatency, m.fetchLatencyCmd)
+			cmds = append(cmds, fetchConnsCmd())
 			if m.detail != nil {
 				cmds = append(cmds, fetchProcDetailCmd(m.detail.pid))
 			}
 		}
 		if m.tickCount%m.slowEvery == 0 {
-			cmds = append(cmds, m.fetchDiskCmd(), fetchNetCmd(m.netSampler), fetchPowerCmd(), m.fetchSysCmd())
+			cmds = append(cmds, m.fetchDiskCmd(), fetchNetCmd(m.netSampler), fetchPowerCmd())
+			cmds = m.queue(cmds, fetchSys, m.fetchSysCmd)
 		} else {
 			cmds = append(cmds, fetchNetCmd(m.netSampler))
 		}
@@ -556,6 +659,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case cpuMsg:
 		m.cpuSnap = probe.CPUSnapshot(msg)
+		m.cpuSnap.Temperatures = m.keepTemps(m.cpuSnap.Temperatures)
 		m.err = nil
 
 		m.cpuHist = append(m.cpuHist, m.cpuSnap.TotalPercent)
@@ -622,6 +726,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case latencyMsg:
+		m.done(fetchLatency)
 		m.pings = msg
 		for _, r := range msg {
 			m.lossWin[r.Target] = append(m.lossWin[r.Target], r.OK)
@@ -645,18 +750,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case procMsg:
-		m.procs = msg
+		m.done(fetchProcs)
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		m.procs = msg.procs
 		m.refreshProcs()
 		return m, nil
 
 	case diskMsg:
-		m.disks = msg.disks
+		m.disks = m.keepDisks(msg.disks)
 		m.diskIOs = msg.ios
 		return m, nil
 
 	case netMsg:
 		m.netSnap = probe.NetSnapshot(msg)
+		m.netSnap.Ifaces = m.keepIfaces(m.netSnap.Ifaces)
+		present := make(map[string]bool, len(m.netSnap.Ifaces))
 		for _, ii := range m.netSnap.Ifaces {
+			present[ii.Name] = true
 			if !ii.IsUp {
 				continue
 			}
@@ -665,11 +778,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.txHist[ii.Name] = append(m.txHist[ii.Name], ii.TxBps)
 			m.txHist[ii.Name] = probe.ClampHistory(m.txHist[ii.Name], 200)
 		}
-		// Clamp selection if interfaces changed
-		up := m.upIfaces()
-		if m.netIfaceSel >= len(up) {
-			m.netIfaceSel = len(up) - 1
-		}
+		m.evictIfaceHistory(present)
 		m.netVP.Height = m.calcNetVPHeight()
 		return m, nil
 
@@ -681,6 +790,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case sysMsg:
+		m.done(fetchSys)
 		m.gpuSnap = msg.gpu
 		m.backlight = msg.backlight
 		m.iwLinks = msg.iwLinks
@@ -703,8 +813,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					notice = errStyle.Render(
 						fmt.Sprintf("%s %d failed: %v", kp.signal(), kp.pid, err))
 				}
-				m.procsNotice = notice
-				cmds := []tea.Cmd{m.fetchProcsCmd()}
+				m.setProcsNotice(notice)
+				cmds := m.queue(nil, fetchProcs, m.fetchProcsCmd)
 				if m.detail != nil {
 					m.detail.notice = notice
 					cmds = append(cmds, fetchProcDetailCmd(m.detail.pid))
@@ -729,35 +839,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// The process-detail overlay has its own key map.
 		if m.detail != nil && m.activeTab == tabProc && !m.procsSearching {
-			cmd, handled := m.updateProcDetail(msg.String())
-			if handled {
-				return m, cmd
+			return m, m.updateProcDetail(msg.String())
+		}
+
+		// A focused search box owns every key but ctrl+c: the global map
+		// below would otherwise steal the digits, arrows, tab and "/" that
+		// belong in the text input.
+		if m.procsSearching || m.netSearching {
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
 			}
+			break
 		}
 
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
 		case "?":
-			if !m.procsSearching && !m.netSearching {
-				m.showHelp = true
-				return m, nil
-			}
+			m.showHelp = true
+			return m, nil
 		case " ":
-			if !m.procsSearching && !m.netSearching {
-				m.paused = !m.paused
-				if m.paused {
-					m.setNotice(warnStyle.Render("sampling paused (space to resume)"))
-				} else {
-					m.setNotice(okStyle.Render("sampling resumed"))
-				}
-				return m, nil
+			m.paused = !m.paused
+			if m.paused {
+				m.setNotice(warnStyle.Render("sampling paused (space to resume)"))
+			} else {
+				m.setNotice(okStyle.Render("sampling resumed"))
 			}
+			return m, nil
 		case "tab", "right":
 			m.activeTab = (m.activeTab + 1) % numTabs
+			m.refreshOnEnterTab()
 			return m, nil
 		case "shift+tab", "left":
 			m.activeTab = (m.activeTab + numTabs - 1) % numTabs
+			m.refreshOnEnterTab()
 			return m, nil
 		case "1":
 			m.activeTab = tabCPU
@@ -793,7 +908,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.adjustBacklight(-m.cfg.BacklightStep)
 			}
 		case "up":
-			if m.activeTab == tabProc && !m.procsSearching {
+			if m.activeTab == tabProc {
 				if m.procsSel > 0 {
 					m.procsSel--
 				}
@@ -801,7 +916,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "down":
-			if m.activeTab == tabProc && !m.procsSearching {
+			if m.activeTab == tabProc {
 				if m.procsSel < len(m.procsView)-1 {
 					m.procsSel++
 				}
@@ -809,7 +924,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "pgup":
-			if m.activeTab == tabProc && !m.procsSearching {
+			if m.activeTab == tabProc {
 				m.procsSel -= max(1, m.procsVP.Height)
 				if m.procsSel < 0 {
 					m.procsSel = 0
@@ -818,7 +933,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "pgdown":
-			if m.activeTab == tabProc && !m.procsSearching {
+			if m.activeTab == tabProc {
 				m.procsSel += max(1, m.procsVP.Height)
 				if m.procsSel > len(m.procsView)-1 {
 					m.procsSel = len(m.procsView) - 1
@@ -827,44 +942,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "home":
-			if m.activeTab == tabProc && !m.procsSearching {
+			if m.activeTab == tabProc {
 				m.procsSel = 0
 				m.rerenderProcs()
 				return m, nil
 			}
 		case "end":
-			if m.activeTab == tabProc && !m.procsSearching {
+			if m.activeTab == tabProc {
 				m.procsSel = max(0, len(m.procsView)-1)
 				m.rerenderProcs()
 				return m, nil
 			}
 		case "s":
-			if m.activeTab == tabProc && !m.procsSearching {
+			if m.activeTab == tabProc {
 				m.procsSort = (m.procsSort + 1) % 4
 				m.procsSel = 0
-				m.procsNotice = ""
+				m.procsNotice.clear()
 				m.refreshProcs()
 				m.procsVP.GotoTop()
 				return m, nil
 			}
 		case "t":
-			if m.activeTab == tabProc && !m.procsSearching {
+			if m.activeTab == tabProc {
 				m.procsTree = !m.procsTree
 				m.procsSel = 0
-				m.procsNotice = ""
+				m.procsNotice.clear()
 				m.refreshProcs()
 				m.procsVP.GotoTop()
 				return m, nil
 			}
 		case "K":
-			if m.activeTab == tabProc && !m.procsSearching {
+			if m.activeTab == tabProc {
 				if p, ok := m.selectedProc(); ok {
 					m.procsKill = &killPrompt{pid: p.PID, name: p.Name, hard: true}
 				}
 				return m, nil
 			}
 		case "enter":
-			if m.activeTab == tabProc && !m.procsSearching {
+			if m.activeTab == tabProc {
 				return m, m.openProcDetail()
 			}
 		case "g":
@@ -872,7 +987,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.cycleGovernor()
 			}
 		case "f":
-			if m.activeTab == tabNet && !m.netSearching {
+			if m.activeTab == tabNet {
 				m.connFilter = (m.connFilter + 1) % numConnStates
 				m.netText = m.renderNetText()
 				m.netVP.SetContent(hardClipLinesToWidth(m.netText, m.netVP.Width))
@@ -880,14 +995,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "w":
-			if !m.procsSearching && !m.netSearching {
-				if path, err := m.exportSnapshot(); err != nil {
-					m.setNotice(errStyle.Render("snapshot failed: " + err.Error()))
-				} else {
-					m.setNotice(okStyle.Render("snapshot written: " + path))
-				}
-				return m, nil
+			if path, err := m.exportSnapshot(); err != nil {
+				m.setNotice(errStyle.Render("snapshot failed: " + err.Error()))
+			} else {
+				m.setNotice(okStyle.Render("snapshot written: " + path))
 			}
+			return m, nil
 		case "m":
 			if m.activeTab == tabAlerts {
 				m.alerts.muted = !m.alerts.muted
@@ -920,56 +1033,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "j":
-			if m.activeTab == tabNet && !m.netSearching {
-				up := m.upIfaces()
-				if len(up) > 0 {
-					m.netIfaceSel++
-					if m.netIfaceSel >= len(up) {
-						m.netIfaceSel = -1
-					}
-					m.netVP.Height = m.calcNetVPHeight()
-				}
+			if m.activeTab == tabNet {
+				m.moveIfaceSel(1)
 				return m, nil
 			}
 		case "k":
-			if m.activeTab == tabNet && !m.netSearching {
-				up := m.upIfaces()
-				if len(up) > 0 {
-					m.netIfaceSel--
-					if m.netIfaceSel < -1 {
-						m.netIfaceSel = len(up) - 1
-					}
-					m.netVP.Height = m.calcNetVPHeight()
-				}
+			if m.activeTab == tabNet {
+				m.moveIfaceSel(-1)
 				return m, nil
 			}
-			if m.activeTab == tabProc && !m.procsSearching {
+			if m.activeTab == tabProc {
 				if p, ok := m.selectedProc(); ok {
 					m.procsKill = &killPrompt{pid: p.PID, name: p.Name, hard: false}
 				}
 				return m, nil
 			}
 		case "ctrl+u":
-			if m.activeTab == tabProc && !m.procsSearching {
+			if m.activeTab == tabProc {
 				m.procsQuery = ""
 				m.procsSearch.SetValue("")
 				m.procsSel = 0
-				m.procsNotice = ""
+				m.procsNotice.clear()
 				m.refreshProcs()
 				m.procsVP.GotoTop()
 				return m, nil
 			}
-			if m.activeTab == tabNet && !m.netSearching {
+			if m.activeTab == tabNet {
 				m.netQuery = ""
 				m.netSearch.SetValue("")
 				m.netText = m.renderNetText()
-				m.netVP.SetContent(m.netText)
+				m.netVP.SetContent(hardClipLinesToWidth(m.netText, m.netVP.Width))
 				return m, nil
 			}
 		}
 	}
 
-	// search mode: processes
 	if m.activeTab == tabProc && m.procsSearching {
 		var cmd tea.Cmd
 		m.procsSearch, cmd = m.procsSearch.Update(msg)
@@ -995,7 +1093,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	// search mode: network
 	if m.activeTab == tabNet && m.netSearching {
 		var cmd tea.Cmd
 		m.netSearch, cmd = m.netSearch.Update(msg)
@@ -1006,7 +1103,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.netSearching = false
 				m.netSearch.Blur()
 				m.netText = m.renderNetText()
-				m.netVP.SetContent(m.netText)
+				m.netVP.SetContent(hardClipLinesToWidth(m.netText, m.netVP.Width))
+				m.netVP.GotoTop()
 				return m, nil
 			case "esc":
 				m.netSearching = false
@@ -1020,21 +1118,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	// scroll: processes
+	// scroll: processes. Only non-key messages (mouse wheel) reach the
+	// viewport — the cursor keys above own navigation, and the viewport's own
+	// j/d/u/b/f bindings would scroll away from the cursor only for
+	// ensureProcVisible to snap it back on the next refresh.
 	if m.activeTab == tabProc {
+		if _, isKey := msg.(tea.KeyMsg); isKey {
+			return m, nil
+		}
 		var cmd tea.Cmd
 		m.procsVP, cmd = m.procsVP.Update(msg)
 		return m, cmd
 	}
 
-	// scroll: network
 	if m.activeTab == tabNet {
 		var cmd tea.Cmd
 		m.netVP, cmd = m.netVP.Update(msg)
 		return m, cmd
 	}
 
-	// scroll: alerts
 	if m.activeTab == tabAlerts {
 		var cmd tea.Cmd
 		m.alertsVP, cmd = m.alertsVP.Update(msg)
@@ -1044,13 +1146,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// setNotice shows a transient status line in the footer for a few seconds.
-func (m *Model) setNotice(s string) {
-	m.notice = s
-	m.noticeUntil = time.Now().Add(5 * time.Second)
+// viewTooSmall replaces the whole frame on a terminal that cannot hold one.
+// It is a single line so it fits any height down to one row, and is emitted
+// before the first WindowSizeMsg arrives (when the size is still 0×0).
+func (m Model) viewTooSmall() string {
+	if m.w < 1 || m.h < 1 {
+		return ""
+	}
+	msg := fmt.Sprintf("terminal too small: need %d×%d, have %d×%d",
+		minWidth, minHeight, m.w, m.h)
+	if m.w < len(msg) {
+		msg = fmt.Sprintf("need %d×%d", minWidth, minHeight)
+	}
+	return clampToWidthOneLine(warnStyle.Render(msg), m.w)
 }
 
+// refreshOnEnterTab rebuilds content that is only regenerated on demand, so
+// arriving at a tab by cycling shows the same thing the numeric jump does.
+func (m *Model) refreshOnEnterTab() {
+	if m.activeTab == tabAlerts {
+		m.refreshAlerts()
+	}
+}
+
+// setNotice shows a transient status line in the footer.
+func (m *Model) setNotice(s string) { m.notice.set(s) }
+
+// setProcsNotice shows a transient status line on the Processes tab.
+func (m *Model) setProcsNotice(s string) { m.procsNotice.set(s) }
+
+// setSysNotice shows a transient status line on the GPU tab.
+func (m *Model) setSysNotice(s string) { m.sysNotice.set(s) }
+
 func (m Model) View() string {
+	if m.w < minWidth || m.h < minHeight {
+		return m.viewTooSmall()
+	}
+
 	header := m.renderHeader()
 
 	var body string
@@ -1099,8 +1231,8 @@ func (m Model) View() string {
 	footer := subtleStyle.Render(footerText)
 	// Transient notices and the alert banner take priority over the key hints;
 	// a hard error still trumps everything.
-	if m.notice != "" && time.Now().Before(m.noticeUntil) {
-		footer = m.notice
+	if n := m.notice.get(); n != "" {
+		footer = n
 	} else if banner := m.alertBanner(); banner != "" {
 		footer = banner
 	}
@@ -1126,10 +1258,21 @@ func (m Model) renderHeader() string {
 		renderTab(m.alertsTabLabel(), m.activeTab == tabAlerts),
 	}
 
-	left := titleStyle.Render(fmt.Sprintf("ucmon %s", version)) + " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
+	left := titleStyle.Render(fmt.Sprintf("ucmon %s", version))
+	// The size readout is a debug aid; on a narrow terminal the tabs are
+	// worth more than knowing how narrow it is.
+	if m.w >= 60 {
+		left += " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
+	}
 	if m.paused {
 		left += " " + warnStyle.Render("⏸ PAUSED")
 	}
+	if badge := m.behindBadge(); badge != "" {
+		left += " " + badge
+	}
+	// Clamping here keeps rem non-negative; lipgloss would otherwise wrap an
+	// over-wide header onto a second row and push the frame past m.h.
+	left = clampToWidthOneLine(left, m.w)
 
 	rem := m.w - lipgloss.Width(left)
 	if rem < 0 {
@@ -1138,7 +1281,7 @@ func (m Model) renderHeader() string {
 
 	right := joinTabsWithinWidth(tabs, rem)
 
-	line := left + padTo(rem, right)
+	line := clampToWidthOneLine(left+padTo(rem, right), m.w)
 	return lipgloss.NewStyle().Width(m.w).Render(line)
 }
 
@@ -1257,13 +1400,10 @@ func (m *Model) refreshAlerts() {
 }
 
 func (m Model) viewAlerts() string {
-	w := min(m.w-2, 140)
-	bodyH := m.bodyHeight()
-
 	if !m.cfg.AlertsEnabled {
 		body := titleStyle.Render("Alerts") + "\n\n" +
 			subtleStyle.Render("Alerting is disabled (set alerts_enabled = true in config.toml).")
-		return boxStyle.Width(w).Height(bodyH).Render(clipHeight(body, bodyH))
+		return m.box(body)
 	}
 
 	_, n, _ := m.alerts.summary()
@@ -1277,16 +1417,14 @@ func (m Model) viewAlerts() string {
 
 	title := titleStyle.Render("Alerts") + "  " + status
 	content := title + "\n\n" + m.alertsVP.View()
-	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(content, bodyH))
+	return m.box(content)
 }
 
 func (m Model) viewCPU() string {
-	bodyH := m.bodyHeight()
-	w := min(m.w-2, 140)
+	w := m.boxWidth()
 
 	var b strings.Builder
 
-	// Hostname & uptime from net snapshot if available
 	if m.netSnap.Hostname != "" {
 		b.WriteString(fmt.Sprintf("Host: %s  Uptime: %s\n",
 			okStyle.Render(m.netSnap.Hostname),
@@ -1295,12 +1433,11 @@ func (m Model) viewCPU() string {
 
 	if m.cpuSnap.TakenAt.IsZero() {
 		b.WriteString("Collecting CPU data…\n")
-		return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+		return m.box(b.String())
 	}
 
 	b.WriteString(fmt.Sprintf("Time: %s\n\n", m.cpuSnap.TakenAt.Format("2006-01-02 15:04:05")))
 
-	// Total CPU
 	cpuColor := "42"
 	if m.cpuSnap.TotalPercent >= 80 {
 		cpuColor = "196"
@@ -1365,7 +1502,6 @@ func (m Model) viewCPU() string {
 		b.WriteString(titleStyle.Render("Per Core") + "\n")
 		nCores := len(m.cpuSnap.PerCorePercent)
 
-		// Determine label width based on core count
 		labelW := 8 // "Core XX "
 		if nCores >= 100 {
 			labelW = 10
@@ -1376,7 +1512,6 @@ func (m Model) viewCPU() string {
 		coreBarW := min(24, chartW/3)
 		colW := 2 + labelW + coreBarW + 1 + sparkW
 
-		// Calculate columns that fit the available width
 		cols := max(1, w/colW)
 		// Cap at 4 columns max for readability
 		if cols > 4 {
@@ -1406,7 +1541,6 @@ func (m Model) viewCPU() string {
 		b.WriteString("\n")
 	}
 
-	// Temperatures (high priority)
 	if len(m.cpuSnap.Temperatures) > 0 {
 		tempPeak := ""
 		if s := m.peaks.tempSummary(); s != "" {
@@ -1434,19 +1568,18 @@ func (m Model) viewCPU() string {
 		b.WriteString(subtleStyle.Render("No temperature sensors detected") + "\n")
 	}
 
-	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+	return m.box(b.String())
 }
 
 func (m Model) viewMem() string {
-	bodyH := m.bodyHeight()
-	w := min(m.w-2, 140)
+	w := m.boxWidth()
 
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Memory") + "\n\n")
 
 	if m.memSnap.TakenAt.IsZero() {
 		b.WriteString("Collecting memory data…\n")
-		return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+		return m.box(b.String())
 	}
 
 	s := m.memSnap
@@ -1480,14 +1613,11 @@ func (m Model) viewMem() string {
 		b.WriteString(Spark(m.swapHist, min(chartW, 60)) + "\n")
 	}
 
-	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+	return m.box(b.String())
 }
 
 func (m Model) viewProcs() string {
-	procsW := min(m.w-2, 140)
-	procsH := m.bodyHeight()
-
-	innerW := max(10, min(m.w-2, 140)-2)
+	innerW := max(10, m.boxWidth()-2)
 
 	// Status line: kill prompt > notice > search/filter.
 	statusLine := subtleStyle.Render("Press / to search")
@@ -1497,8 +1627,8 @@ func (m Model) viewProcs() string {
 	if m.procsSearching {
 		statusLine = m.procsSearch.View()
 	}
-	if m.procsNotice != "" && !m.procsSearching {
-		statusLine = m.procsNotice
+	if n := m.procsNotice.get(); n != "" && !m.procsSearching {
+		statusLine = n
 	}
 	if m.procsKill != nil {
 		kp := *m.procsKill
@@ -1523,7 +1653,7 @@ func (m Model) viewProcs() string {
 	}
 
 	content := statusLine + "\n" + detailLine + "\n\n" + m.procsHeader + "\n" + m.procsVP.View()
-	return boxStyle.Width(procsW).Height(procsH).Render(clipHeight(content, procsH))
+	return m.box(content)
 }
 
 // procsCols computes the process-table column widths for the current
@@ -1563,7 +1693,7 @@ func (m Model) buildProcsHeader() string {
 		padRight("RSS", colRSS),
 		padRight("S", colStat),
 	)
-	sep := strings.Repeat("─", min(w, colPID+colUser+colName+colCPU+colMem+colRSS+colStat+14))
+	sep := rule(min(w, colPID+colUser+colName+colCPU+colMem+colRSS+colStat+14))
 
 	view := "flat"
 	if m.procsTree {
@@ -1783,8 +1913,7 @@ func (m Model) renderProcsText() string {
 }
 
 func (m Model) viewDisk() string {
-	bodyH := m.bodyHeight()
-	w := min(m.w-2, 140)
+	w := m.boxWidth()
 
 	var b strings.Builder
 	title := titleStyle.Render("Disk Usage")
@@ -1795,7 +1924,7 @@ func (m Model) viewDisk() string {
 
 	if len(m.disks) == 0 {
 		b.WriteString("Collecting disk data…\n")
-		return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+		return m.box(b.String())
 	}
 
 	barW := min(30, w/3)
@@ -1816,7 +1945,7 @@ func (m Model) viewDisk() string {
 		"USAGE",
 	)
 	b.WriteString(h)
-	b.WriteString(strings.Repeat("─", min(w-4, colDev+colMount+colFS+colTotal+colUsed+colFree+barW+20)) + "\n")
+	b.WriteString(rule(min(w-4, colDev+colMount+colFS+colTotal+colUsed+colFree+barW+20)) + "\n")
 
 	for _, d := range m.disks {
 		dev := trunc(d.Device, colDev)
@@ -1834,7 +1963,6 @@ func (m Model) viewDisk() string {
 		))
 	}
 
-	// Disk I/O
 	if len(m.diskIOs) > 0 {
 		b.WriteString("\n" + titleStyle.Render("Disk I/O") + "\n\n")
 		b.WriteString(fmt.Sprintf("%-16s  %12s  %12s\n", "DEVICE", "READ/s", "WRITE/s"))
@@ -1851,12 +1979,11 @@ func (m Model) viewDisk() string {
 		}
 	}
 
-	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+	return m.box(b.String())
 }
 
 func (m Model) viewNet() string {
-	bodyH := m.bodyHeight()
-	w := min(m.w-2, 140)
+	w := m.boxWidth()
 
 	var b strings.Builder
 
@@ -1866,7 +1993,6 @@ func (m Model) viewNet() string {
 		up := m.upIfaces()
 		chartW := min(25, w/4)
 
-		// Aggregate traffic summary
 		var totalRx, totalTx float64
 		for _, ii := range up {
 			totalRx += ii.RxBps
@@ -1880,8 +2006,9 @@ func (m Model) viewNet() string {
 		))
 
 		// Compact interface list: one line each, selected gets expanded
+		selIdx := m.netIfaceIdx()
 		for i, ii := range up {
-			selected := i == m.netIfaceSel
+			selected := i == selIdx
 			marker := "  "
 			nameStyle := subtleStyle
 			if selected {
@@ -1916,7 +2043,6 @@ func (m Model) viewNet() string {
 				wifi,
 			))
 
-			// Expanded detail for selected interface
 			if selected {
 				rxSpark := Spark(m.rxHist[ii.Name], chartW)
 				txSpark := Spark(m.txHist[ii.Name], chartW)
@@ -1973,7 +2099,7 @@ func (m Model) viewNet() string {
 	b.WriteString(m.netHeader + "\n")
 	b.WriteString(m.netVP.View())
 
-	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+	return m.box(b.String())
 }
 
 // renderLatency renders the ping block: one line per target plus a trailing
@@ -2087,7 +2213,7 @@ func (m Model) buildNetHeader() string {
 		padRight("PID", colPID),
 		"PROCESS",
 	)
-	sep := strings.Repeat("─", min(w, colProto+colLocal+colRemote+colStatus+colPID+20))
+	sep := rule(min(w, colProto+colLocal+colRemote+colStatus+colPID+20))
 	return h + "\n" + sep
 }
 
@@ -2148,14 +2274,14 @@ func (m Model) renderNetText() string {
 
 func (m Model) viewPower() string {
 	bodyH := m.bodyHeight()
-	w := min(m.w-2, 140)
+	w := m.boxWidth()
 
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Power & System Health") + "\n")
 
 	if m.powerSnap.TakenAt.IsZero() {
 		b.WriteString("Collecting power data…\n")
-		return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+		return m.box(b.String())
 	}
 
 	p := m.powerSnap
@@ -2290,7 +2416,7 @@ func (m Model) viewPower() string {
 		b.WriteString("  " + flag(t.SoftTempLimitNow, t.SoftTempLimitOccurred, "Soft temp limit") + "\n")
 	}
 
-	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+	return m.box(b.String())
 }
 
 // psiColor grades a pressure-stall percentage.
@@ -2372,7 +2498,7 @@ func (m *Model) cycleGovernor() tea.Cmd {
 // reading. Permission errors are surfaced in the status line, not fatal.
 func (m *Model) adjustBacklight(delta int) tea.Cmd {
 	if !m.backlight.Present {
-		m.sysNotice = subtleStyle.Render("no backlight device detected")
+		m.setSysNotice(subtleStyle.Render("no backlight device detected"))
 		return nil
 	}
 	target := m.backlight.Percent + delta
@@ -2383,17 +2509,16 @@ func (m *Model) adjustBacklight(delta int) tea.Cmd {
 		target = 100
 	}
 	if err := probe.SetBacklightPercent(m.backlight.Device, target); err != nil {
-		m.sysNotice = errStyle.Render("brightness: " + err.Error())
+		m.setSysNotice(errStyle.Render("brightness: " + err.Error()))
 		return nil
 	}
 	m.backlight.Percent = target // optimistic; fetchSysCmd reconciles
-	m.sysNotice = okStyle.Render(fmt.Sprintf("brightness → %d%%", target))
-	return m.fetchSysCmd()
+	m.setSysNotice(okStyle.Render(fmt.Sprintf("brightness → %d%%", target)))
+	return tea.Batch(m.queue(nil, fetchSys, m.fetchSysCmd)...)
 }
 
 func (m Model) viewGPU() string {
-	bodyH := m.bodyHeight()
-	w := min(m.w-2, 140)
+	w := m.boxWidth()
 	chartW := max(10, w-20)
 
 	var b strings.Builder
@@ -2416,15 +2541,15 @@ func (m Model) viewGPU() string {
 		}
 		b.WriteString(hint + "\n")
 	}
-	if m.sysNotice != "" {
-		b.WriteString("  " + m.sysNotice + "\n")
+	if n := m.sysNotice.get(); n != "" {
+		b.WriteString("  " + n + "\n")
 	}
 	b.WriteString("\n")
 
 	b.WriteString(titleStyle.Render("VideoCore") + "\n")
 	if !m.gpuSnap.Available {
 		b.WriteString("  " + subtleStyle.Render("vcgencmd unavailable (not a Raspberry Pi / uConsole)") + "\n")
-		return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+		return m.box(b.String())
 	}
 
 	g := m.gpuSnap
@@ -2453,7 +2578,7 @@ func (m Model) viewGPU() string {
 		}
 	}
 
-	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(b.String(), bodyH))
+	return m.box(b.String())
 }
 
 func statusStyled(s string) string {

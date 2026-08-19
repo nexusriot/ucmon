@@ -35,7 +35,6 @@ func (m Model) buildReport(now time.Time) string {
 
 	fmt.Fprintf(&b, "ucmon %s — snapshot %s\n%s\n\n", version, now.Format("2006-01-02 15:04:05"), hr)
 
-	// CPU & temperatures.
 	b.WriteString("CPU\n")
 	fmt.Fprintf(&b, "  total          %.1f%%\n", m.cpuSnap.TotalPercent)
 	for i, p := range m.cpuSnap.PerCorePercent {
@@ -49,7 +48,6 @@ func (m Model) buildReport(now time.Time) string {
 	}
 	b.WriteString("\n")
 
-	// Memory.
 	s := m.memSnap
 	b.WriteString("Memory\n")
 	fmt.Fprintf(&b, "  RAM            %s / %s (%.1f%%)\n",
@@ -63,7 +61,6 @@ func (m Model) buildReport(now time.Time) string {
 	}
 	b.WriteString("\n")
 
-	// CPU frequency / governor.
 	if len(m.cpuSnap.Freqs) > 0 {
 		b.WriteString("Frequency\n")
 		for _, f := range m.cpuSnap.Freqs {
@@ -73,7 +70,6 @@ func (m Model) buildReport(now time.Time) string {
 		b.WriteString("\n")
 	}
 
-	// Pressure stall information.
 	if m.psi.Present {
 		b.WriteString("Pressure (PSI, some avg10/avg60)\n")
 		for _, res := range []struct {
@@ -92,7 +88,6 @@ func (m Model) buildReport(now time.Time) string {
 		b.WriteString("\n")
 	}
 
-	// Power: load, battery, throttle.
 	p := m.powerSnap
 	b.WriteString("Power\n")
 	fmt.Fprintf(&b, "  load (1/5/15)  %.2f / %.2f / %.2f  (%d cores)\n",
@@ -119,7 +114,6 @@ func (m Model) buildReport(now time.Time) string {
 	}
 	b.WriteString("\n")
 
-	// Filesystems.
 	if len(m.disks) > 0 {
 		b.WriteString("Disks\n")
 		for _, d := range m.disks {
@@ -129,7 +123,6 @@ func (m Model) buildReport(now time.Time) string {
 		b.WriteString("\n")
 	}
 
-	// Network interfaces (up only).
 	up := m.upIfaces()
 	if len(up) > 0 {
 		b.WriteString("Network\n")
@@ -147,7 +140,6 @@ func (m Model) buildReport(now time.Time) string {
 		b.WriteString("\n")
 	}
 
-	// Connectivity latency.
 	if len(m.pings) > 0 {
 		b.WriteString("Latency\n")
 		for _, r := range m.pings {
@@ -164,7 +156,6 @@ func (m Model) buildReport(now time.Time) string {
 		b.WriteString("\n")
 	}
 
-	// Top processes by CPU.
 	if len(m.procs) > 0 {
 		ps := make([]probe.ProcInfo, len(m.procs))
 		copy(ps, m.procs)
@@ -176,12 +167,11 @@ func (m Model) buildReport(now time.Time) string {
 		fmt.Fprintf(&b, "  %-7s %-18s %7s %7s\n", "PID", "NAME", "CPU%", "MEM%")
 		for _, pr := range ps {
 			fmt.Fprintf(&b, "  %-7d %-18s %6.1f%% %6.1f%%\n",
-				pr.PID, truncName(pr.Name, 18), pr.CPUPct, pr.MemPct)
+				pr.PID, trunc(pr.Name, 18), pr.CPUPct, pr.MemPct)
 		}
 		b.WriteString("\n")
 	}
 
-	// Session peaks.
 	b.WriteString("Session peaks\n")
 	fmt.Fprintf(&b, "  cpu            %.1f%%\n", m.peaks.cpuPct)
 	if m.peaks.tempC > 0 {
@@ -194,7 +184,6 @@ func (m Model) buildReport(now time.Time) string {
 	}
 	b.WriteString("\n")
 
-	// Alerts.
 	b.WriteString("Alerts\n")
 	if act := m.alerts.activeList(); len(act) > 0 {
 		b.WriteString("  active:\n")
@@ -248,14 +237,4 @@ func throttleFlags(t probe.ThrottleInfo) string {
 		return " (ok)"
 	}
 	return " (" + strings.Join(f, ", ") + ")"
-}
-
-func truncName(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	if n <= 1 {
-		return s[:n]
-	}
-	return s[:n-1] + "…"
 }

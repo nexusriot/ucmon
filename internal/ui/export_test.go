@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nexusriot/ucmon/internal/config"
 	"github.com/nexusriot/ucmon/internal/probe"
@@ -120,12 +121,20 @@ func TestThrottleFlags(t *testing.T) {
 	}
 }
 
-func TestTruncNameAndBoolWord(t *testing.T) {
-	if got := truncName("short", 10); got != "short" {
-		t.Errorf("truncName = %q", got)
+func TestReportNameTruncationAndBoolWord(t *testing.T) {
+	if got := trunc("short", 10); got != "short" {
+		t.Errorf("trunc = %q", got)
 	}
-	if got := truncName("a-very-long-process-name", 10); got != "a-very-lo…" {
-		t.Errorf("truncName = %q", got)
+	if got := trunc("a-very-long-process-name", 10); got != "a-very-lo…" {
+		t.Errorf("trunc = %q", got)
+	}
+	// A multi-byte name must not be cut mid-sequence into invalid UTF-8.
+	got := trunc("日本語のプロセス名です", 6)
+	if !utf8.ValidString(got) {
+		t.Errorf("truncated name is not valid UTF-8: %q", got)
+	}
+	if utf8.RuneCountInString(got) != 6 {
+		t.Errorf("trunc kept %d runes, want 6: %q", utf8.RuneCountInString(got), got)
 	}
 	if boolWord(true, "on", "off") != "on" || boolWord(false, "on", "off") != "off" {
 		t.Error("boolWord")

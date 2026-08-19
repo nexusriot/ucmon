@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"slices"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
@@ -19,6 +21,16 @@ func trunc(s string, max int) string {
 		return "…"
 	}
 	return string(r[:max-1]) + "…"
+}
+
+// rule draws a horizontal separator n columns wide, treating a negative count
+// as zero. Separator widths are computed from the terminal size, and
+// strings.Repeat panics below zero.
+func rule(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.Repeat("─", n)
 }
 
 func padRight(s string, w int) string {
@@ -47,40 +59,52 @@ func containsFold(s, q string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(q))
 }
 
+// highlightFold reverse-videos every case-insensitive occurrence of q in s.
+// Matching runs entirely on rune slices: a byte-indexed search would drift
+// against rune-indexed slicing as soon as the row holds a multi-byte
+// character (the "…" trunc appends is one), corrupting the output or slicing
+// out of range.
 func highlightFold(s, q string) string {
 	q = strings.TrimSpace(q)
 	if q == "" {
 		return s
 	}
 
-	rs := []rune(s)
-	rq := []rune(q)
-
-	ls := strings.ToLower(string(rs))
-	lq := strings.ToLower(string(rq))
+	rs, lq := []rune(s), lowerRunes([]rune(q))
+	ls := lowerRunes(rs)
 
 	var out strings.Builder
 	i := 0
-	for {
-		j := strings.Index(ls[i:], lq)
+	for i < len(rs) {
+		j := indexRunes(ls[i:], lq)
 		if j < 0 {
-			out.WriteString(string(rs[i:]))
 			break
 		}
-		j += i
-
-		out.WriteString(string(rs[i:j]))
-
-		end := j + len([]rune(lq))
-		if end > len(rs) {
-			end = len(rs)
-		}
-		out.WriteString(hlStyle.Render(string(rs[j:end])))
-
-		i = end
+		out.WriteString(string(rs[i : i+j]))
+		out.WriteString(hlStyle.Render(string(rs[i+j : i+j+len(lq)])))
+		i += j + len(lq)
 	}
+	out.WriteString(string(rs[i:]))
 
 	return out.String()
+}
+
+func lowerRunes(in []rune) []rune {
+	out := make([]rune, len(in))
+	for i, r := range in {
+		out[i] = unicode.ToLower(r)
+	}
+	return out
+}
+
+// indexRunes reports the index of the first occurrence of sub in r, or -1.
+func indexRunes(r, sub []rune) int {
+	for i := 0; i+len(sub) <= len(r); i++ {
+		if slices.Equal(r[i:i+len(sub)], sub) {
+			return i
+		}
+	}
+	return -1
 }
 
 func ansiSafeTruncate(s string, maxWidth int) string {

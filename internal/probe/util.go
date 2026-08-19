@@ -32,6 +32,18 @@ func HumanBytesPerSec(bps float64) string {
 	return fmt.Sprintf("%.1f %s", bps/div, suffix)
 }
 
+// CounterRate is the per-second rate between two readings of a monotonic
+// byte counter. A counter that went backwards — an interface bounced, a
+// driver reloaded, a 32-bit counter wrapped — reports 0 instead of the
+// ~18 EiB/s that unsigned wrap-around would otherwise produce and that would
+// then flatten every sparkline sharing the history buffer.
+func CounterRate(cur, prev uint64, dt float64) float64 {
+	if dt <= 0 || cur < prev {
+		return 0
+	}
+	return float64(cur-prev) / dt
+}
+
 func ClampHistory[T any](s []T, max int) []T {
 	if max <= 0 {
 		return s[:0]

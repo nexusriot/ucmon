@@ -130,3 +130,68 @@ func TestClampToWidthOneLine(t *testing.T) {
 		t.Errorf("clamp = %q", got)
 	}
 }
+
+// A multi-byte rune anywhere in the row used to desynchronise highlightFold's
+// byte-indexed search from its rune-indexed slicing — corrupting the row or
+// panicking with a slice-bounds error. trunc appends "…" routinely, so any
+// filter over a truncated process name hit this.
+func TestHighlightFoldMultibyte(t *testing.T) {
+	cases := []struct{ row, q string }{
+		{"aaa… b1", "1"},
+		{"…S", "s"},
+		{"x…y…z", "z"},
+		{"proc…name S", "s"},
+		{"  9999  root  verylongprocname…  0.0  0.0  1.0 MB  S", "s"},
+		{"héllo wörld", "o"},
+		{"└─ systemd", "s"},
+		{"日本語プロセス", "語"},
+	}
+	for _, c := range cases {
+		got := stripANSICodes(highlightFold(c.row, c.q))
+		if got != c.row {
+			t.Errorf("highlightFold(%q, %q) corrupted the row: %q", c.row, c.q, got)
+		}
+	}
+}
+
+func TestHighlightFoldMarksEveryMatch(t *testing.T) {
+	out := highlightFold("a…A…a", "a")
+	if n := strings.Count(out, hlStyle.Render("a")) + strings.Count(out, hlStyle.Render("A")); n != 3 {
+		t.Errorf("expected 3 highlighted matches in %q", out)
+	}
+	if got := stripANSICodes(out); got != "a…A…a" {
+		t.Errorf("row = %q", got)
+	}
+}
+
+// stripANSICodes removes SGR sequences so a test can compare rendered text.
+func stripANSICodes(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && !(s[j] >= 0x40 && s[j] <= 0x7e) {
+				j++
+			}
+			i = j + 1
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+// Separator widths are derived from the terminal size and can go negative;
+// strings.Repeat panics there, so rule clamps instead.
+func TestRule(t *testing.T) {
+	cases := []struct {
+		n    int
+		want string
+	}{{-10, ""}, {-1, ""}, {0, ""}, {1, "─"}, {3, "───"}}
+	for _, c := range cases {
+		if got := rule(c.n); got != c.want {
+			t.Errorf("rule(%d) = %q, want %q", c.n, got, c.want)
+		}
+	}
+}

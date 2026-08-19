@@ -68,7 +68,7 @@ func helpContent() string {
 }
 
 func (m Model) viewHelp() string {
-	w := min(m.w-2, 140)
+	w := m.boxWidth()
 	bodyH := m.bodyHeight()
 
 	head := titleStyle.Render("Help — key bindings") + "  " +
@@ -81,7 +81,7 @@ func (m Model) viewHelp() string {
 		content = twoColumns(lines, bodyH, w/2-2)
 	}
 
-	return boxStyle.Width(w).Height(bodyH).Render(clipHeight(content, bodyH))
+	return m.box(content)
 }
 
 // twoColumns lays lines out side by side when they exceed the height budget.

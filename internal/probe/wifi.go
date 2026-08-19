@@ -102,10 +102,14 @@ type IWLink struct {
 	RxMbps    float64
 }
 
-// iwBinPath locates the iw binary; sbin dirs are checked explicitly because
-// non-root PATHs often lack them.
+// iwPaths are the absolute locations checked before PATH, because non-root
+// PATHs often lack the sbin dirs. A var so tests can point it at a fake tree,
+// matching wirelessPath.
+var iwPaths = []string{"/usr/sbin/iw", "/sbin/iw", "/usr/bin/iw"}
+
+// iwBinPath locates the iw binary.
 func iwBinPath() string {
-	for _, p := range []string{"/usr/sbin/iw", "/sbin/iw", "/usr/bin/iw"} {
+	for _, p := range iwPaths {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}

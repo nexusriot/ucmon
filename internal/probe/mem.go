@@ -17,7 +17,6 @@ type MemSnapshot struct {
 
 	SwapTotal   uint64
 	SwapUsed    uint64
-	SwapFree    uint64
 	SwapUsedPct float64
 
 	TakenAt time.Time
@@ -44,7 +43,6 @@ func SampleMem() (MemSnapshot, error) {
 	if sm, err := mem.SwapMemory(); err == nil {
 		snap.SwapTotal = sm.Total
 		snap.SwapUsed = sm.Used
-		snap.SwapFree = sm.Free
 		snap.SwapUsedPct = sm.UsedPercent
 	}
 

@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/shirou/gopsutil/v4/process"
+	"golang.org/x/sys/unix"
 )
 
 type ProcInfo struct {
@@ -156,7 +157,7 @@ func GetProcDetail(pid int32) (ProcDetail, error) {
 	d.CmdLine, _ = p.Cmdline()
 	d.Exe, _ = p.Exe()
 	d.Cwd, _ = p.Cwd()
-	d.Nice, _ = p.Nice()
+	d.Nice = int32(getNice(pid))
 	d.Threads, _ = p.NumThreads()
 	if n, err := p.NumFDs(); err == nil {
 		d.FDs = n
@@ -203,6 +204,21 @@ func ResumeProcess(pid int32) error {
 		return err
 	}
 	return p.Resume()
+}
+
+// getNice returns pid's real niceness (-20..19). getpriority(2) returns
+// 20-nice at the syscall boundary so a valid low priority can never be
+// mistaken for the -1 error value; glibc undoes that shift but
+// golang.org/x/sys/unix does not, and gopsutil's Process.Nice() forwards the
+// raw number (its source carries a "FIXME: is this true?" on that line). Left
+// unconverted, a normal process reads as nice 20, and renicing by ±1 from
+// there lands on 19 — the lowest priority — in a single keypress.
+func getNice(pid int32) int {
+	raw, err := unix.Getpriority(unix.PRIO_PROCESS, int(pid))
+	if err != nil {
+		return 0
+	}
+	return 20 - raw
 }
 
 // ClampNice bounds a niceness value to the kernel's -20..19 range.

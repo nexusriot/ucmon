@@ -1,0 +1,198 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Every probe reads procfs/sysfs or shells out, and the tests fake those with
+  # temp trees. Keep the timeout generous enough for the -race build on a cold
+  # module cache without letting a hung ping wedge the job.
+  GOTOOLCHAIN: local
+
+jobs:
+  test:
+    name: Test (race + coverage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: make fmt-check
+
+      - name: go vet
+        run: make vet
+
+      # -race needs cgo, so this job deliberately leaves CGO_ENABLED alone;
+      # the release binaries are built with CGO_ENABLED=0 by the build job.
+      - name: Test with race detector
+        run: make test-race
+        timeout-minutes: 10
+
+      - name: Coverage summary
+        run: |
+          set -eu
+          {
+            echo '### Coverage'
+            echo '```'
+            for pkg in config probe ui; do
+              pct=$(go tool cover -func=coverage.out \
+                    | grep "/internal/$pkg/" | awk '{gsub("%","",$3); s+=$3; n++} END{if(n)printf "%.1f", s/n}')
+              printf 'internal/%-8s %s%%\n' "$pkg" "$pct"
+            done
+            go tool cover -func=coverage.out | tail -1
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: error
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Pinned rather than @latest: a new check landing upstream should be an
+      # intentional upgrade, not a red build on an untouched commit.
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+
+      - name: staticcheck
+        run: |
+          staticcheck -checks 'all,-ST1000,-ST1003,-ST1020,-ST1021,-ST1022' ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64.8
+          args: >-
+            --no-config --timeout 5m
+            --disable-all
+            -E unused,ineffassign,unparam,unconvert,staticcheck,govet
+
+  build:
+    name: Cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The pure-Go, CGO_ENABLED=0 stance exists so all four targets build from
+      # one machine. This job is what keeps that true — a dependency pulling in
+      # cgo would break here long before anyone flashed a board.
+      - name: Build every target
+        run: make
+
+      - name: Verify the produced binaries
+        run: |
+          set -eu
+          version=$(make version)
+          echo "version: $version"
+          fail=0
+          for arch in amd64 arm64 armv7 riscv64; do
+            f="dist/ucmon-${version}-linux-${arch}"
+            if [ ! -f "$f" ]; then
+              echo "MISSING $f"; fail=1; continue
+            fi
+            printf '%-12s %s\n' "$arch" "$(file -b "$f")"
+            case "$(file -b "$f")" in
+              *"dynamically linked"*) echo "  ERROR: not statically linked"; fail=1 ;;
+            esac
+          done
+          exit $fail
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: dist/ucmon-*
+          if-no-files-found: error
+
+  smoke:
+    name: Smoke (--version, --once)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # main() is the one function unit tests cannot reach, so exercise the CLI
+      # for real: flag parsing, config loading, and the whole headless report.
+      - name: Build native
+        run: go build -o ucmon ./cmd/ucmon
+
+      - name: --version and --help
+        run: |
+          set -eu
+          ./ucmon --version | tee /dev/stderr | grep -qE '^ucmon [0-9]+\.[0-9]+\.[0-9]+$'
+          # The reported version must be the one the Makefile derives, or the
+          # .deb and the binary would disagree.
+          test "$(./ucmon --version)" = "ucmon $(make version)"
+          # flag.PrintDefaults prints single-dash names, so match on those.
+          ./ucmon --help 2>&1 | tee /dev/stderr | grep -q -- '-once'
+          for flag in -config -tab -version; do
+            ./ucmon --help 2>&1 | grep -q -- "$flag"
+          done
+
+      - name: --once produces a full report
+        run: |
+          set -eu
+          # Disabling ping keeps this offline and fast; it is asserted below so a
+          # regression cannot quietly make CI depend on the runner's egress.
+          # Every line here also carries an inline comment, which is the shape
+          # that silently did nothing before 0.8.0.
+          cat > ci.toml <<'EOF'
+          ping_enabled = false     # keep the smoke run offline
+          start_tab    = "net"     # overridden by --tab below
+          temp_crit    = 70        # a non-default value must actually apply
+          net_ignore   = "veth*, br-*, docker*"
+          EOF
+          ./ucmon --config ci.toml --once | tee report.txt
+          for section in CPU Memory Power Disks Network "Session peaks" Alerts; do
+            grep -q "^${section}" report.txt || { echo "missing section: $section"; exit 1; }
+          done
+          # An ignored interface must not reach the report.
+          if grep -qE '^\s+(veth|br-|docker)' report.txt; then
+            echo "net_ignore did not filter the report"; exit 1
+          fi
+          if grep -q '^Latency' report.txt; then
+            echo "ping_enabled = false still produced a Latency block"; exit 1
+          fi
+          # --tab overrides start_tab; an unknown value must fall back, not fail.
+          ./ucmon --config ci.toml --tab power --once >/dev/null
+          ./ucmon --config ci.toml --tab nonsense --once >/dev/null
+
+      - name: Unknown flags and bad configs fail or degrade cleanly
+        run: |
+          set -eu
+          ! ./ucmon --nonexistent-flag 2>/dev/null
+          # A missing config file is not an error: the defaults apply.
+          ./ucmon --config /nonexistent/ucmon.toml --once >/dev/null
+          # An unparseable file must not prevent startup either.
+          printf 'this is not toml\n= nonsense\n' > junk.toml
+          ./ucmon --config junk.toml --once >/dev/null

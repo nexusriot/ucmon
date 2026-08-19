@@ -25,6 +25,7 @@ func RunOnce(cfg config.Config) (string, error) {
 	time.Sleep(600 * time.Millisecond)
 
 	if snap, err := probe.SampleCPU(); err == nil {
+		snap.Temperatures = m.keepTemps(snap.Temperatures)
 		m.cpuSnap = snap
 		m.peaks.observeCPU(snap.TotalPercent, snap.Temperatures)
 	}
@@ -38,9 +39,10 @@ func RunOnce(cfg config.Config) (string, error) {
 		m.peaks.observeBattery(snap.Battery.Capacity)
 	}
 	if disks, ios, err := m.diskSampler.Sample(); err == nil {
-		m.disks, m.diskIOs = disks, ios
+		m.disks, m.diskIOs = m.keepDisks(disks), ios
 	}
 	if snap, err := m.netSampler.Sample(); err == nil {
+		snap.Ifaces = m.keepIfaces(snap.Ifaces)
 		m.netSnap = snap
 	}
 	if procs, err := m.procSampler.List(); err == nil {

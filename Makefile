@@ -36,7 +36,7 @@ licheerv_triple := linux riscv64 .  riscv64
 PLATFORMS := amd64 uconsole pizero2w licheerv
 
 .PHONY: all build $(PLATFORMS) deb $(addprefix deb-,$(PLATFORMS)) \
-        install uninstall run fmt vet test clean version help
+        install uninstall run fmt fmt-check vet test test-race clean version help
 
 all: build
 
@@ -89,18 +89,26 @@ run: ## Build and run natively
 fmt: ## gofmt -w
 	gofmt -w internal cmd
 
+fmt-check: ## Fail if anything needs gofmt (used by CI)
+	@out=$$(gofmt -l internal cmd); \
+	if [ -n "$$out" ]; then echo "not gofmt'd:"; echo "$$out"; exit 1; fi
+
 vet: ## go vet
 	$(GO) vet ./...
 
 test: ## go test
 	$(GO) test ./...
 
+test-race: ## go test -race with a coverage profile
+	$(GO) test -race -covermode=atomic -coverprofile=coverage.out ./...
+	@$(GO) tool cover -func=coverage.out | tail -1
+
 version: ## Print the version derived from the source
 	@echo $(VERSION)
 
 clean: ## Remove build artifacts
 	rm -rf $(DIST) build
-	rm -f $(BIN) cmd/ucmon/ucmon *.deb
+	rm -f $(BIN) cmd/ucmon/ucmon *.deb coverage.out
 
 help: ## List targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \

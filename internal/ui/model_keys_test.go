@@ -78,7 +78,7 @@ func TestBacklightKeysWithoutDevice(t *testing.T) {
 	m.backlight = probe.BacklightInfo{} // not present
 
 	m, _ = press(t, m, key('+'))
-	if m.sysNotice == "" {
+	if m.sysNotice.get() == "" {
 		t.Error("+ without a backlight should set a notice")
 	}
 }
@@ -91,8 +91,8 @@ func TestSnapshotKeyWritesReport(t *testing.T) {
 	m.memSnap = probe.MemSnapshot{Total: 1 << 30, Used: 1 << 29, UsedPct: 50, TakenAt: time.Now()}
 
 	m, _ = press(t, m, key('w'))
-	if m.notice == "" || !strings.Contains(m.notice, "snapshot written") {
-		t.Fatalf("notice = %q", m.notice)
+	if m.notice.get() == "" || !strings.Contains(m.notice.get(), "snapshot written") {
+		t.Fatalf("notice = %q", m.notice.get())
 	}
 
 	matches, err := filepath.Glob(filepath.Join(home, "ucmon-report-*.txt"))

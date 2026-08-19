@@ -99,3 +99,70 @@ func TestSetBacklightPercent(t *testing.T) {
 		t.Error("missing device should error")
 	}
 }
+
+// SetBacklightPercent and ReadBacklight must round-trip: a truncating read-back
+// used to land a step below what was just written, so pressing "+" with a small
+// backlight_step oscillated instead of climbing.
+func TestBacklightPercentRoundTrip(t *testing.T) {
+	base := t.TempDir()
+	old := backlightBase
+	backlightBase = base
+	defer func() { backlightBase = old }()
+
+	fakeBacklight(t, base, "panel0", "255", "255")
+
+	for pct := 0; pct <= 100; pct++ {
+		if err := SetBacklightPercent("panel0", pct); err != nil {
+			t.Fatalf("set %d%%: %v", pct, err)
+		}
+		bl := ReadBacklight("panel0")
+		if !bl.Present {
+			t.Fatalf("%d%%: device vanished", pct)
+		}
+		if bl.Percent != pct {
+			t.Errorf("set %d%% read back %d%% (raw %d/%d)", pct, bl.Percent, bl.Brightness, bl.Max)
+		}
+	}
+}
+
+// Every step must strictly advance the reported percentage, at any step size.
+func TestBacklightStepAlwaysAdvances(t *testing.T) {
+	base := t.TempDir()
+	old := backlightBase
+	backlightBase = base
+	defer func() { backlightBase = old }()
+
+	fakeBacklight(t, base, "panel0", "0", "255")
+
+	prev := ReadBacklight("panel0").Percent
+	for i := 0; i < 100; i++ {
+		if err := SetBacklightPercent("panel0", prev+1); err != nil {
+			t.Fatal(err)
+		}
+		got := ReadBacklight("panel0").Percent
+		if got <= prev {
+			t.Fatalf("step from %d%% landed on %d%% — brightness is stuck", prev, got)
+		}
+		prev = got
+	}
+}
+
+// With no override ReadBacklight takes the first device in the directory,
+// which os.ReadDir returns in lexical order.
+func TestReadBacklightPicksFirstDevice(t *testing.T) {
+	base := t.TempDir()
+	old := backlightBase
+	backlightBase = base
+	defer func() { backlightBase = old }()
+
+	fakeBacklight(t, base, "panel0", "10", "100")
+	fakeBacklight(t, base, "acpi_video0", "80", "100")
+
+	bl := ReadBacklight("")
+	if bl.Device != "acpi_video0" || bl.Percent != 80 {
+		t.Errorf("auto-detect chose %+v, want acpi_video0 at 80%%", bl)
+	}
+	if bl := ReadBacklight("panel0"); bl.Device != "panel0" || bl.Percent != 10 {
+		t.Errorf("override chose %+v, want panel0 at 10%%", bl)
+	}
+}

@@ -2,6 +2,7 @@ package probe
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -81,16 +82,29 @@ func (s *LatencySampler) Sample(timeout time.Duration) []PingResult {
 	return results
 }
 
+// pingOnce measures one target within timeout. Every step — name resolution
+// included — draws from a single deadline, so a wedged resolver costs one
+// sample instead of blocking for its whole retry budget (tens of seconds
+// against unreachable nameservers) while the next tick queues another.
 func pingOnce(name, addr string, timeout time.Duration) PingResult {
 	res := PingResult{Target: name, Addr: addr, Method: "icmp"}
+	deadline := time.Now().Add(timeout)
 
-	ip := resolveIPv4(addr)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	ip := resolveIPv4(ctx, addr)
 	if ip == "" {
 		return res // unresolvable now — counts as loss
 	}
 	res.Addr = ip
 
-	rtt, err := icmpPing(ip, timeout)
+	left := time.Until(deadline)
+	if left <= 0 {
+		return res // resolution consumed the whole budget
+	}
+
+	rtt, err := icmpPing(ip, left)
 	if err == nil {
 		res.OK, res.RTT = true, rtt
 		return res
@@ -100,10 +114,16 @@ func pingOnce(name, addr string, timeout time.Duration) PingResult {
 	}
 
 	// No unprivileged ICMP → time TCP connects. A RST (connection refused)
-	// still measures a full round trip, so it counts as success.
+	// still measures a full round trip, so it counts as success. Each port
+	// gets an equal share of whatever time is left.
 	res.Method = "tcp"
-	for _, port := range []int{80, 443} {
-		if rtt, err := tcpPing(ip, port, timeout/2); err == nil {
+	ports := []int{80, 443}
+	for i, port := range ports {
+		left = time.Until(deadline)
+		if left <= 0 {
+			break
+		}
+		if rtt, err := tcpPing(ip, port, left/time.Duration(len(ports)-i)); err == nil {
 			res.OK, res.RTT = true, rtt
 			return res
 		}
@@ -111,25 +131,20 @@ func pingOnce(name, addr string, timeout time.Duration) PingResult {
 	return res
 }
 
-// resolveIPv4 returns addr if it already is an IPv4 literal, else resolves
-// the name and picks the first IPv4 record.
-func resolveIPv4(addr string) string {
+// resolveIPv4 returns addr if it already is an IPv4 literal, else resolves the
+// name under ctx and takes the first IPv4 record.
+func resolveIPv4(ctx context.Context, addr string) string {
 	if ip := net.ParseIP(addr); ip != nil {
 		if ip.To4() != nil {
 			return addr
 		}
 		return "" // IPv6 targets are not supported yet
 	}
-	ips, err := net.LookupIP(addr)
-	if err != nil {
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", addr)
+	if err != nil || len(ips) == 0 {
 		return ""
 	}
-	for _, ip := range ips {
-		if v4 := ip.To4(); v4 != nil {
-			return v4.String()
-		}
-	}
-	return ""
+	return ips[0].String()
 }
 
 // errICMPSocket marks "the ICMP socket could not be created at all" (as

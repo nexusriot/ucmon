@@ -94,8 +94,8 @@ func (s *NetSampler) Sample() (NetSnapshot, error) {
 
 		if c, ok := cur[nif.Name]; ok {
 			if prev, ok2 := s.last[nif.Name]; ok2 {
-				ii.RxBps = float64(c.BytesRecv-prev.BytesRecv) / dt
-				ii.TxBps = float64(c.BytesSent-prev.BytesSent) / dt
+				ii.RxBps = CounterRate(c.BytesRecv, prev.BytesRecv, dt)
+				ii.TxBps = CounterRate(c.BytesSent, prev.BytesSent, dt)
 			}
 		}
 
@@ -112,8 +112,6 @@ func (s *NetSampler) Sample() (NetSnapshot, error) {
 		TakenAt:  now,
 	}, nil
 }
-
-// Connection info
 
 type ConnInfo struct {
 	Proto      string

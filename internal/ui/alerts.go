@@ -251,7 +251,6 @@ func (m Model) currentAlertConds() map[string]alertCond {
 		}
 	}
 
-	// Memory & swap.
 	if m.memSnap.Total > 0 && m.memSnap.UsedPct >= c.MemWarnPct {
 		conds["mem"] = alertCond{sevWarn,
 			fmt.Sprintf("RAM %.0f%% used ≥ %.0f%%", m.memSnap.UsedPct, c.MemWarnPct)}
@@ -303,7 +302,6 @@ func (m Model) currentAlertConds() map[string]alertCond {
 		}
 	}
 
-	// Load average vs core count.
 	if n := m.powerSnap.Load.CPUCount; n > 0 {
 		if limit := float64(n) * c.LoadWarnFactor; m.powerSnap.Load.Load1 >= limit {
 			conds["load"] = alertCond{sevWarn,
