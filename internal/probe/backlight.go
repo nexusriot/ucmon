@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // backlightBase is a var so tests can point it at a fake sysfs tree.
@@ -32,7 +33,7 @@ func ReadBacklight(override string) BacklightInfo {
 		if err != nil || len(entries) == 0 {
 			return BacklightInfo{}
 		}
-		dev = entries[0].Name()
+		dev = pickBacklight(entries)
 	}
 
 	dir := filepath.Join(backlightBase, dev)
@@ -61,6 +62,33 @@ func ReadBacklight(override string) BacklightInfo {
 		Percent:    pct,
 		Writable:   writable(filepath.Join(dir, "brightness")),
 	}
+}
+
+// pickBacklight chooses a backlight device when the config names none.
+//
+// Taking the first directory entry means taking the alphabetically first,
+// which on a laptop is "acpi_video0" ahead of "intel_backlight" — and
+// acpi_video is the one that commonly ignores writes. The kernel's own
+// preference order is native panel drivers first, firmware interfaces last,
+// so this follows it. The uConsole has a single device either way.
+func pickBacklight(entries []os.DirEntry) string {
+	rank := func(name string) int {
+		switch {
+		case strings.HasPrefix(name, "acpi_video"):
+			return 2 // firmware interface: last resort
+		case name == "intel_backlight" || name == "amdgpu_bl0" || name == "nv_backlight":
+			return 0 // native panel driver
+		default:
+			return 1
+		}
+	}
+	best := entries[0].Name()
+	for _, e := range entries[1:] {
+		if rank(e.Name()) < rank(best) {
+			best = e.Name()
+		}
+	}
+	return best
 }
 
 // SetBacklightPercent writes a 0–100 brightness percentage to the device's

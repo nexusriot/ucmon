@@ -12,9 +12,19 @@ import (
 // probes (CPU%, network and disk throughput) are primed, then re-sampled
 // after a short window so the report shows real rates instead of zeros.
 func RunOnce(cfg config.Config) (string, error) {
+	m, err := collectOnce(cfg)
+	if err != nil {
+		return "", err
+	}
+	return m.buildReport(time.Now()), nil
+}
+
+// collectOnce primes the delta-based samplers, waits a short window, then
+// reads everything once.
+func collectOnce(cfg config.Config) (Model, error) {
 	cfg.Sanitize()
-	probe.SetTempThresholds(cfg.TempWarn, cfg.TempHot, cfg.TempCrit)
-	m := NewModel(cfg)
+	m := NewModel(cfg) // NewModel sanitizes, calibrates and applies thresholds
+	cfg = m.cfg
 
 	// Prime the delta-based samplers.
 	_, _ = probe.SampleCPU()
@@ -52,9 +62,13 @@ func RunOnce(cfg config.Config) (string, error) {
 		m.conns = conns
 	}
 	m.psi = probe.ReadPSI()
+	m.storage = probe.ReadStorageHealth()
+	if cfg.ModemEnabled {
+		m.modem = probe.ReadModem()
+	}
 	m.gpuSnap = probe.SampleGPU()
 	m.backlight = probe.ReadBacklight(cfg.BacklightDevice)
-	m.iwLinks = probe.ReadIWLinks()
+	m.iwLinks = probe.ReadIWLinks(func(n string) bool { return !cfg.HideIface(n) })
 
 	if m.latSampler != nil {
 		results := m.latSampler.Sample(1 * time.Second)
@@ -67,6 +81,18 @@ func RunOnce(cfg config.Config) (string, error) {
 	if cfg.AlertsEnabled {
 		m.alerts.update(m.currentAlertConds(), time.Now())
 	}
+	m.recordTrend(time.Now())
 
-	return m.buildReport(time.Now()), nil
+	return m, nil
+}
+
+// RunOnceJSON is RunOnce in the machine-readable shape, for scripts and cron
+// jobs that would otherwise have to re-parse the text report's layout every
+// time the layout changes.
+func RunOnceJSON(cfg config.Config) (string, error) {
+	m, err := collectOnce(cfg)
+	if err != nil {
+		return "", err
+	}
+	return m.buildJSONReport(time.Now())
 }

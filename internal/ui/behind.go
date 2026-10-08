@@ -8,11 +8,13 @@ import (
 )
 
 // fetchKind identifies the sampling rounds slow enough to outlast their own
-// interval: the /proc walk, the vcgencmd + iw shell-outs, and the ping round.
+// interval: the /proc walk, the socket walk, the vcgencmd + iw shell-outs,
+// and the ping round.
 type fetchKind int
 
 const (
 	fetchProcs fetchKind = iota
+	fetchConns
 	fetchSys
 	fetchLatency
 	numFetchKinds
@@ -20,6 +22,8 @@ const (
 
 func (f fetchKind) String() string {
 	switch f {
+	case fetchConns:
+		return "connections"
 	case fetchSys:
 		return "gpu/soc"
 	case fetchLatency:
@@ -50,6 +54,23 @@ func (m *Model) queue(cmds []tea.Cmd, k fetchKind, build func() tea.Cmd) []tea.C
 	m.inFlight[k] = true
 	m.behindSkips[k] = 0 // dispatched on schedule: this probe has caught up
 	return append(cmds, cmd)
+}
+
+// queueUser dispatches a refresh a keypress asked for. It shares the
+// in-flight guard — two concurrent vcgencmd rounds are no more welcome here —
+// but colliding with a scheduled round is not sampling lateness, and counting
+// it as such lit the header's "slow" badge every time someone held down the
+// brightness key.
+func (m *Model) queueUser(k fetchKind, build func() tea.Cmd) tea.Cmd {
+	if m.inFlight[k] {
+		return nil
+	}
+	cmd := build()
+	if cmd == nil {
+		return nil
+	}
+	m.inFlight[k] = true
+	return cmd
 }
 
 // done clears a probe's guard when its reply lands.

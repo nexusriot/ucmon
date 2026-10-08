@@ -20,6 +20,33 @@ type IfaceInfo struct {
 	RxBps float64
 	TxBps float64
 	WiFi  WiFiInfo // populated for wireless interfaces (WiFi.Present)
+
+	// Error and drop counters, as totals since boot and as per-second rates
+	// over the sampling interval. A link that is passing traffic while
+	// dropping frames is the whole diagnosis for flaky WiFi, and throughput
+	// alone cannot show it.
+	ErrIn      uint64
+	ErrOut     uint64
+	DropIn     uint64
+	DropOut    uint64
+	ErrInPs    float64
+	ErrOutPs   float64
+	DropInPs   float64
+	DropOutPs  float64
+	PacketsRx  uint64
+	PacketsTx  uint64
+	HasCounter bool // false when the kernel reported no counters for this name
+}
+
+// BadFrames is the combined error + drop rate on an interface, the single
+// number worth colouring a row by.
+func (i IfaceInfo) BadFrames() float64 {
+	return i.ErrInPs + i.ErrOutPs + i.DropInPs + i.DropOutPs
+}
+
+// BadFramesTotal is the combined error + drop count since boot.
+func (i IfaceInfo) BadFramesTotal() uint64 {
+	return i.ErrIn + i.ErrOut + i.DropIn + i.DropOut
 }
 
 type NetSnapshot struct {
@@ -93,9 +120,17 @@ func (s *NetSampler) Sample() (NetSnapshot, error) {
 		}
 
 		if c, ok := cur[nif.Name]; ok {
+			ii.HasCounter = true
+			ii.ErrIn, ii.ErrOut = c.Errin, c.Errout
+			ii.DropIn, ii.DropOut = c.Dropin, c.Dropout
+			ii.PacketsRx, ii.PacketsTx = c.PacketsRecv, c.PacketsSent
 			if prev, ok2 := s.last[nif.Name]; ok2 {
 				ii.RxBps = CounterRate(c.BytesRecv, prev.BytesRecv, dt)
 				ii.TxBps = CounterRate(c.BytesSent, prev.BytesSent, dt)
+				ii.ErrInPs = CounterRate(c.Errin, prev.Errin, dt)
+				ii.ErrOutPs = CounterRate(c.Errout, prev.Errout, dt)
+				ii.DropInPs = CounterRate(c.Dropin, prev.Dropin, dt)
+				ii.DropOutPs = CounterRate(c.Dropout, prev.Dropout, dt)
 			}
 		}
 
@@ -124,7 +159,21 @@ type ConnInfo struct {
 
 // protoLabel maps a socket type + address family to a display label.
 // Unknown types yield "" (the connection is skipped).
+//
+// The family check has to come first. A Unix socket carries the same
+// SOCK_STREAM/SOCK_DGRAM type as an inet one, so keying only on the type
+// labels /run/dbus/system_bus_socket as "TCP" and files it in the connection
+// table next to real sockets.
 func protoLabel(typ, family uint32) string {
+	if family == syscall.AF_UNIX {
+		switch typ {
+		case syscall.SOCK_STREAM, syscall.SOCK_DGRAM, syscall.SOCK_SEQPACKET:
+			return "UNIX"
+		default:
+			return ""
+		}
+	}
+
 	proto := ""
 	switch typ {
 	case syscall.SOCK_STREAM:
@@ -152,7 +201,14 @@ func convertConns(conns []gnet.ConnectionStat) []ConnInfo {
 			continue
 		}
 
+		// A Unix socket's "address" is its filesystem path with no port; an
+		// unnamed one has neither.
 		local := fmt.Sprintf("%s:%d", c.Laddr.IP, c.Laddr.Port)
+		if proto == "UNIX" {
+			if local = c.Laddr.IP; local == "" {
+				local = "(unnamed)"
+			}
+		}
 		remote := fmt.Sprintf("%s:%d", c.Raddr.IP, c.Raddr.Port)
 		if c.Raddr.IP == "" {
 			remote = "-"
@@ -182,8 +238,13 @@ func convertConns(conns []gnet.ConnectionStat) []ConnInfo {
 	return out
 }
 
+// ListConnections returns the host's inet sockets. "inet" rather than "all"
+// deliberately: the Unix sockets "all" adds are a third of the rows on a
+// desktop, carry no address, port, state or peer worth a table column, and
+// cost a parse of a /proc/net/unix with hundreds of lines. The per-process
+// view still lists them, where they say something about that one process.
 func ListConnections() ([]ConnInfo, error) {
-	conns, err := gnet.Connections("all")
+	conns, err := gnet.Connections("inet")
 	if err != nil {
 		return nil, err
 	}

@@ -16,13 +16,15 @@ ucmon/
 │   │   ├── cpu.go              # CPU load & temperature sensors
 │   │   ├── cpufreq.go          # cpufreq policies: clocks + governor read/set (sysfs)
 │   │   ├── mem.go              # RAM & swap
-│   │   ├── procs.go            # ProcSampler (interval CPU%), detail, kill/renice/stop
+│   │   ├── procs.go            # ProcSampler: direct /proc walk, interval CPU%/IO, detail, signals
 │   │   ├── disk.go             # Disk usage & I/O counters
 │   │   ├── net.go              # Network interfaces & connections (TCP6/UDP6 aware)
 │   │   ├── wifi.go             # WiFi quality (/proc/net/wireless) + SSID/bitrate (iw)
 │   │   ├── latency.go          # Gateway/target RTT: unprivileged ICMP + TCP fallback
 │   │   ├── psi.go              # Pressure stall information (/proc/pressure)
 │   │   ├── power.go            # Battery (incl. health), RPi throttle, load average
+│   │   ├── storage.go          # SD/eMMC wear, pre-EOL, read-only lockout (sysfs)
+│   │   ├── modem.go            # WWAN modem status via mmcli (ModemManager)
 │   │   ├── gpu.go              # VideoCore clocks/temp/volts/mem (vcgencmd)
 │   │   ├── backlight.go        # Display backlight read/set (/sys/class/backlight)
 │   │   └── util.go             # Formatting helpers
@@ -38,7 +40,12 @@ ucmon/
 │       ├── detail.go           # Process detail overlay (renice, STOP/CONT, kill)
 │       ├── help.go             # Key-binding help overlay (?)
 │       ├── peaks.go            # Session peak tracker
-│       ├── once.go             # RunOnce: headless one-shot snapshot for --once
+│       ├── once.go             # RunOnce / RunOnceJSON: headless one-shot snapshot
+│       ├── metrics.go          # JSON snapshot + Prometheus text exposition
+│       ├── exporter.go         # HTTP server for --metrics / metrics_listen
+│       ├── history.go          # sparkline + peak persistence across restarts
+│       ├── trend.go            # rate-of-change tracking behind predictive alerts
+│       ├── zoom.go             # full-screen braille graph for one metric (z)
 │       ├── export.go           # Plain-text snapshot report writer
 │       ├── styles.go           # Lipgloss style definitions
 │       ├── spark.go            # Unicode sparkline chart renderer
@@ -82,22 +89,53 @@ Chosen for consistency with the existing project family (ducknetview). The Elm a
 - Non-blocking async data collection via Cmd/Msg pattern
 - Predictable UI updates on terminal resize, key events, and data ticks
 
-### Data Collection: gopsutil
+### Data Collection: gopsutil, except for the process walk
 
 `shirou/gopsutil/v4` provides cross-platform access to system metrics. For temperature sensors on Raspberry Pi / uConsole, we also read `/sys/class/thermal/thermal_zone*` directly as a fallback, since gopsutil may not detect all ARM thermal zones.
 
-**Process CPU% semantics**: `ProcSampler` keeps one gopsutil `Process` handle
-per PID across refreshes. gopsutil computes `CPUPercent()` as the delta since
-the previous call on the same handle, so reuse yields usage *since the last
-refresh* (htop-style). Recreating handles every refresh — the old behaviour —
-silently degrades to an average over the whole process lifetime. The first
-sample for a new PID still reports the lifetime average. Known trade-offs:
-a recycled PID or an exec() that changes the process name can serve one stale
-sample/name from the cached handle.
+**The process walk reads `/proc` directly.** gopsutil's accessors each re-read
+and re-parse the file they need, and one refresh needed eight of them per PID:
+`/proc/<pid>/stat` twice (Ppid + CPUPercent), `/proc/<pid>/status` twice
+(Status + Username), a full `/etc/passwd` scan per process (pure-Go
+`user.LookupId`), and `/proc/meminfo` parsed once per process
+(`MemoryPercent`). Measured over 533 processes that was **~90 ms of work for
+~7 ms of actual file reads**; on a CM4 it is several hundred milliseconds
+against a 3 s interval, which is exactly what the lateness badge was built to
+report.
+
+`ProcSampler` now reads `stat` and `cmdline`, stats the directory for the
+owner uid, and reads `io` when permitted — and keeps the previous refresh's
+raw counters, so CPU% and per-process block I/O are rates over the interval
+(htop-style) rather than lifetime averages. The same measurement takes
+**~12 ms**. The uid→name map is cached per sampler; `MemTotal` is read once
+per refresh instead of once per process.
+
+Reading `stat` also settles **PID reuse** for free: column 22 is the process
+start time, so a recycled PID is detected and gets a fresh first sample
+instead of a delta against a different process's counters. `comm` is capped at
+15 characters by the kernel, so a name that arrives at the cap is refined from
+argv[0].
+
+`GetProcDetail` stays on gopsutil: it runs for a single PID on the proc tick,
+where the per-call parsing overhead is irrelevant, and it carries exe, cwd,
+fd count and children for free.
 
 **Delta-based rates** (network, disk I/O) divide counter deltas by the real
 elapsed time tracked inside each sampler — never by an assumed interval,
 since the disk sampler runs on the slow cadence.
+
+### Temperature thresholds
+
+ucmon's 50/65/80 °C defaults were chosen for a Raspberry Pi, whose firmware
+starts throttling at 80 °C. They travel badly: a laptop that declares a 109 °C
+critical trip shows red nearly 30 °C before its hardware minds, and a board
+that throttles at 70 °C would never show red at all. When the config names no
+threshold, `probe.ReadTripPoints` reads `trip_point_*_{type,temp}` from the
+same thermal zone directory the sensors come from and `TripThresholds` derives
+red from the shutdown trip, orange from where throttling begins, and yellow a
+proportional step below. Setting any of `temp_warn`/`temp_hot`/`temp_crit`
+marks the config explicit and switches the calibration off;
+`temp_from_trip_points = false` does the same.
 
 ### Latency monitor
 
@@ -123,9 +161,22 @@ context; the ICMP and TCP attempts share whatever time is left.
 Loss is tracked per target over a rolling 50-sample window; the alert only
 evaluates once ≥ 10 samples exist.
 
+### Connections: inet only
+
+`ListConnections` asks gopsutil for `"inet"`, not `"all"`. `"all"` adds
+`AF_UNIX`, and a Unix socket carries the same `SOCK_STREAM`/`SOCK_DGRAM` type
+as an inet one — so keying the protocol label on the type alone filed
+`/run/dbus/system_bus_socket` in the table as **TCP**, with a filesystem path
+in the LOCAL column, status `NONE` and frequently pid 0. On a desktop that was
+91 of 257 rows. `protoLabel` now checks the family first and labels Unix
+sockets honestly (the per-process view still lists them, where they say
+something about that one process), and the host table skips them: it is also
+~30% faster for not parsing a `/proc/net/unix` with hundreds of lines.
+
 ### Rendering
 
-- **Sparkline charts** (from ducknetview's `spark.go`): Unicode block characters `▁▂▃▄▅▆▇█` for time-series visualization of CPU load, temperatures, and network throughput
+- **Sparkline charts** (from ducknetview's `spark.go`): Unicode block characters `▁▂▃▄▅▆▇█`. `Spark` auto-scales to the data's own range, which is right for unbounded series (bytes/s, MHz, RTT). `SparkPct` draws on a fixed 0–100 axis and is used for every percentage. Auto-scaling a bounded reading is actively misleading: a core idling between 2% and 3% and one pinned between 97% and 98% both span one percentage point, so both drew the identical full-height zigzag, and a core flat at 100% drew the *lowest* row — the same picture as one flat at 0%
+- **Expanded graphs** (`internal/ui/zoom.go`): `z` promotes one series to a full-frame braille chart. A braille cell is 2×4 dots, so the same character count carries eight times the resolution of a block sparkline; the plot gets a real value axis, min/max/avg, and `←`/`→` to step through every series the tab offers. The one-row sparklines stay the default — the uConsole's 1280×480 panel is wide but short
 - **Bar charts** (inspired by s3duck-tui's `SummaryGraph`): `█` filled / `░` empty blocks for disk usage percentages with color coding (green → yellow → orange → red)
 - **Viewport scrolling** (from Bubble Tea's `bubbles/viewport`): for process and connection lists that exceed terminal height
 - **Search/filter** (from ducknetview pattern): `/` activates inline search, `ctrl+u` clears, `enter` applies. While a search box is focused it owns every key but `ctrl+c`, so digits, arrows, `tab` and `/` reach the text input instead of the global map
@@ -142,6 +193,10 @@ evaluates once ≥ 10 samples exist.
   `/sys/devices/system/cpu/cpufreq/policy*`. `g` cycles every policy to the
   next available governor (sysfs write; read-only without root/udev, marked
   `(ro)`)
+- **Time breakdown** of the interval (user/sys/nice/iowait/irq/steal) from
+  `cpu.Times` deltas. One utilisation number describes a box saturating its
+  cores and a box parked in iowait behind a slow card identically; on these
+  boards it is usually the card, so a dominant iowait share is called out
 - **CPU pressure** (PSI `some` avg10/avg60) when the kernel exposes it
 - Temperature sensor readings with color-coded values, bars, sparkline
   history, and the session-peak sensor
@@ -158,10 +213,16 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
 
 ### Tab 3: Processes
 
-- Columns: PID, USER, NAME, CPU%, MEM%, RSS, STATUS (up to 200 rows, scrollable)
+- Columns: PID, USER, NAME, CPU%, MEM%, RSS, DISK I/O, S (up to `procs_cap`
+  rows, scrollable). The I/O column is dropped below 92 columns, where the
+  process name is worth more
+- **DISK I/O** is the per-process block-I/O rate over the interval, from
+  `/proc/<pid>/io`: the answer to "what is thrashing my card". An unreadable
+  counter (another user's process without `CAP_SYS_PTRACE`) shows `-`, which
+  is a different statement from a confident zero
 - CPU% is the usage since the previous refresh (persistent `ProcSampler`)
 - Movable cursor (`↑↓` / PgUp/PgDn / Home/End) with the selected row highlighted
-- Sort cycle via `s`: CPU → MEM → PID → NAME (active sort shown in the header)
+- Sort cycle via `s`: CPU → MEM → I/O → PID → NAME (active sort in the header)
 - Tree view toggle via `t`: renders a parent/child process tree (built from
   PPID) with `├─`/`└─` branch glyphs; siblings ordered by the active sort.
   Falls back to the flat list while a search filter is active.
@@ -183,6 +244,11 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
 - Disk I/O rates (read/write bytes per second) per block device, computed over
   the real elapsed time between slow-tick samples
 - I/O pressure (PSI some + full) in the title line
+- **Device health**: SD/eMMC wear from `/sys/block/*/device` — the eMMC 5.0
+  life-time bands (10% granularity, worst of type A/B), the pre-EOL reserve
+  state (normal/warning/urgent) and the read-only lockout a controller sets
+  when a card is finished. Graded harsher than filesystem usage: a full
+  filesystem is an inconvenience, a worn-out card is an unbootable device
 
 ### Tab 5: Network
 
@@ -200,6 +266,12 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
 - **Ping block**: one line per target (default gateway + optional
   `ping_target`) with color-coded RTT, sparkline, rolling loss %, and the
   measurement method (icmp/tcp)
+- Per-interface **error and drop counters** (totals since boot plus the live
+  rate), coloured by whether frames are being lost right now. A link passing
+  traffic while dropping frames is invisible in throughput alone
+- **Modem block** when `modem_enabled` is set: registration state, operator,
+  access technology and signal/RSSI from `mmcli`, with the same graceful
+  absence as `vcgencmd` and `iw`
 - Connection summary line with total/listen/established/other counts and the
   active state filter (`f` cycles all → LISTEN → ESTABLISHED)
 - Connection table: protocol (TCP/UDP with a `6` suffix for IPv6), local/remote
@@ -246,6 +318,21 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
   (`wifi_low_dbm`), packet loss to a ping target (`ping_loss_warn_pct`, once
   the loss window has ≥ 10 samples), and PSI pressure (`psi_warn_pct` against
   each resource's some-avg10).
+- **Predictive conditions** (`internal/ui/trend.go`): a level threshold cannot
+  tell a pack discharging over eight hours from one dumping in twenty minutes,
+  and by the time a 16 GB card reads 90% full there may be minutes left. The
+  trend tracker keeps a two-minute window per reading and answers "how fast is
+  this moving, and when does it hit the wall" — battery drain %/h with a
+  time-to-empty, filesystem fill with a time-to-full, temperature climb with a
+  time-to-critical. A rate needs a 45 s baseline before it is trusted, so a
+  one-tick wobble cannot set a slope.
+- **Storage wear**: a card at 90% of its rated write endurance looks perfect in
+  every throughput and usage reading right up to the day it goes read-only,
+  which makes it the one condition nothing else in ucmon could hint at.
+- **Pause does not stop alerting.** `space` freezes the readings, which is what
+  it is for; silencing the bell, the hook and the log at the same time would
+  disarm the monitor at exactly the moment someone stopped it to look at
+  something worrying.
 - **Delivery**: `alertEngine.update` returns the events recorded per tick;
   the model then runs the configured side effects — a terminal bell on a new
   critical (`alert_bell`, suppressed while muted), an `alert_cmd` shell hook
@@ -267,6 +354,17 @@ peaks, and the active/recent alerts — to `~/ucmon-report-<timestamp>.txt`. A
 transient footer notice reports the path written. The report is ANSI-free and
 reuses the same `probe` formatting helpers as the live views.
 
+`--once --json` (`internal/ui/metrics.go`) emits the same readings as a JSON
+document instead, because parsing the text report in a script means
+re-deriving its layout every time the layout changes.
+
+`ucmon --metrics :9100` (`internal/ui/exporter.go`) serves `/metrics` in the
+Prometheus text exposition format, `/snapshot` as JSON and `/healthz`, with no
+TUI; `metrics_listen` runs the same server alongside the monitor. Sampling is
+lazy — nothing is collected until something scrapes — and a result is reused
+for 5 seconds, so a careless 1 s scrape loop cannot drive a full `/proc` walk
+as fast as it can ask.
+
 `ucmon --once` (`internal/ui/once.go`) produces the same report on stdout
 without starting the TUI: it primes the delta-based samplers (CPU%, net/disk
 rates), waits ~600 ms, re-samples everything, runs one alert evaluation, and
@@ -274,6 +372,13 @@ prints. Useful over SSH and from cron.
 
 ### Overlays, pause, session peaks
 
+- `z` opens an **expanded graph** of one metric: a full-frame braille chart
+  with a value axis, min/max/avg and `←`/`→` to step through every series the
+  tab offers. `Z` resets the session peaks and the trend history together.
+- `history_file` persists the sparkline ring buffers and session peaks across
+  restarts (`internal/ui/history.go`), written atomically and ignored when
+  stale, foreign-format or unparseable — replaying yesterday's shape next to
+  this minute's reading would be a lie told convincingly.
 - `?` opens a **help overlay** listing every key binding (two-column layout on
   wide-but-short screens like the uConsole); any of `?`/`esc`/`q` closes it.
 - `space` **pauses** sampling: the tick loop keeps running but issues no fetch
@@ -303,8 +408,13 @@ Three configurable cadences drive all sampling (defaults shown). The base
 | Processes / connections / ping  | `proc_interval` | 3s      |
 | Disk / battery / GPU / SoC / iw | `slow_interval` | 5s      |
 
-The three slow rounds — the `/proc` walk, the vcgencmd + `iw` shell-outs, and
-the ping round — carry an in-flight guard. A tick that finds the previous round
+The four slow rounds — the `/proc` walk, the socket walk, the vcgencmd + `iw`
+shell-outs, and the ping round — carry an in-flight guard. The socket walk
+needs one most of all: `gnet.Connections` readlinks every `/proc/<pid>/fd`
+entry on the host, which is strictly more work than the process walk beside
+it, and it used to be dispatched bare. A refresh a *keypress* asked for goes
+through `queueUser`, which shares the guard but does not count a collision as
+lateness — holding down the brightness key used to light the badge. A tick that finds the previous round
 still running skips this one rather than queueing a second goroutine onto the
 sampler's mutex, and records the skip; the header then shows which probe is
 lagging (`⏳ slow: gpu/soc`). A fetch that is merely disabled is not lateness.
@@ -356,7 +466,8 @@ raise a WiFi alert or hold a history buffer. The default lists are empty.
 | `shift+tab` / `←`| Previous tab              |
 | `1` - `8`        | Jump to tab               |
 | `?`              | Help overlay              |
-| `space`          | Pause / resume sampling   |
+| `space`          | Pause sampling (alerts keep running) |
+| `z` / `Z`        | Expand a metric / reset peaks |
 | `g`              | Cycle cpufreq governor (tab 1) |
 | `+` / `-`        | Adjust backlight (tab 7)  |
 | `w`              | Write snapshot report     |
@@ -411,7 +522,10 @@ architectures cross-compile from one machine. Each `.deb` installs the binary to
 - `github.com/charmbracelet/bubbles` - UI components (viewport, textinput)
 - `github.com/charmbracelet/lipgloss` - Terminal styling
 - `github.com/shirou/gopsutil/v4` - System metrics collection
-- `golang.org/x/sys/unix` - Unprivileged ICMP datagram sockets (latency monitor)
+- `golang.org/x/sys/unix` - Unprivileged ICMP datagram sockets, uid lookups
+- `github.com/tklauser/go-sysconf` - USER_HZ for the `/proc/<pid>/stat` columns
 
 Optional external tools, degraded gracefully when absent: `vcgencmd`
-(VideoCore/throttle), `iw` (SSID/channel/bitrates).
+(VideoCore/throttle), `iw` (SSID/channel/bitrates), `mmcli` (WWAN modem).
+All three are pure shell-outs on the slow tick; the HTTP exporter uses only
+the standard library, so the pure-Go cross-compile stance is unchanged.

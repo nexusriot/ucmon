@@ -121,15 +121,23 @@ func iwBinPath() string {
 }
 
 // ReadIWLinks runs `iw dev <iface> link` for every wireless interface found
-// in /proc/net/wireless. A missing iw binary (or no wireless hardware)
-// yields an empty map — same graceful-absence pattern as vcgencmd.
-func ReadIWLinks() map[string]IWLink {
+// in /proc/net/wireless that keep accepts. A missing iw binary (or no
+// wireless hardware) yields an empty map — same graceful-absence pattern as
+// vcgencmd.
+//
+// keep is the ignore-list predicate: filtering happens in the UI layer, where
+// snapshots land, but an interface the user has hidden should not still cost
+// a fork and a 2s timeout on every slow tick. A nil keep queries everything.
+func ReadIWLinks(keep func(iface string) bool) map[string]IWLink {
 	out := map[string]IWLink{}
 	bin := iwBinPath()
 	if bin == "" {
 		return out
 	}
 	for name := range readWirelessStats() {
+		if keep != nil && !keep(name) {
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		b, err := exec.CommandContext(ctx, bin, "dev", name, "link").Output()
 		cancel()

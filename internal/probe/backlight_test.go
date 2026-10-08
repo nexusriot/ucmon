@@ -147,9 +147,10 @@ func TestBacklightStepAlwaysAdvances(t *testing.T) {
 	}
 }
 
-// With no override ReadBacklight takes the first device in the directory,
-// which os.ReadDir returns in lexical order.
-func TestReadBacklightPicksFirstDevice(t *testing.T) {
+// With no override ReadBacklight prefers a real panel driver over the ACPI
+// firmware interface. Taking the lexically first entry picked acpi_video0 on
+// a laptop, which is routinely the one that ignores writes.
+func TestReadBacklightPrefersPanelOverACPI(t *testing.T) {
 	base := t.TempDir()
 	old := backlightBase
 	backlightBase = base
@@ -159,10 +160,35 @@ func TestReadBacklightPicksFirstDevice(t *testing.T) {
 	fakeBacklight(t, base, "acpi_video0", "80", "100")
 
 	bl := ReadBacklight("")
-	if bl.Device != "acpi_video0" || bl.Percent != 80 {
-		t.Errorf("auto-detect chose %+v, want acpi_video0 at 80%%", bl)
+	if bl.Device != "panel0" || bl.Percent != 10 {
+		t.Errorf("auto-detect chose %+v, want panel0 at 10%%", bl)
 	}
-	if bl := ReadBacklight("panel0"); bl.Device != "panel0" || bl.Percent != 10 {
-		t.Errorf("override chose %+v, want panel0 at 10%%", bl)
+	if bl := ReadBacklight("acpi_video0"); bl.Device != "acpi_video0" || bl.Percent != 80 {
+		t.Errorf("override chose %+v, want acpi_video0 at 80%%", bl)
+	}
+}
+
+func TestPickBacklightOrder(t *testing.T) {
+	base := t.TempDir()
+	old := backlightBase
+	backlightBase = base
+	defer func() { backlightBase = old }()
+
+	// A native driver outranks both the generic and the firmware interface,
+	// whatever order the directory lists them in.
+	fakeBacklight(t, base, "acpi_video0", "1", "100")
+	fakeBacklight(t, base, "intel_backlight", "2", "100")
+	fakeBacklight(t, base, "zz_other", "3", "100")
+
+	if got := ReadBacklight("").Device; got != "intel_backlight" {
+		t.Errorf("picked %q, want intel_backlight", got)
+	}
+
+	// With only a firmware interface present it is still better than nothing.
+	base2 := t.TempDir()
+	backlightBase = base2
+	fakeBacklight(t, base2, "acpi_video0", "40", "100")
+	if got := ReadBacklight("").Device; got != "acpi_video0" {
+		t.Errorf("picked %q, want acpi_video0 as the only device", got)
 	}
 }

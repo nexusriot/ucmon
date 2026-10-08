@@ -15,7 +15,7 @@ import (
 	"github.com/nexusriot/ucmon/internal/probe"
 )
 
-const version = "0.8.0"
+const version = "0.10.0"
 
 // Version reports the ucmon release for the --version flag.
 func Version() string { return version }
@@ -71,23 +71,48 @@ const (
 	minHeight = 6
 )
 
-// procsDisplayCap bounds how many process rows are rendered (the viewport
-// scrolls within this); keeps the rendered string small on slow devices.
+// procsDisplayCap is the fallback bound on rendered process rows (the
+// viewport scrolls within it) for a model built without a sanitized config.
 const procsDisplayCap = 200
+
+// procsCap is the configured cap on rendered process rows.
+func (m Model) procsCap() int {
+	if m.cfg.ProcsCap > 0 {
+		return m.cfg.ProcsCap
+	}
+	return procsDisplayCap
+}
+
+// histLen is the configured sparkline ring length. The fallback matters:
+// ClampHistory(s, 0) truncates to nothing, so a Model built without a
+// sanitized config would silently keep no history at all.
+func (m Model) histLen() int {
+	if m.cfg.HistoryLen > 0 {
+		return m.cfg.HistoryLen
+	}
+	return defaultHistoryLen
+}
+
+// defaultHistoryLen is the fallback sparkline ring length.
+const defaultHistoryLen = 200
 
 type procSort int
 
 const (
 	sortCPU procSort = iota
 	sortMem
+	sortIO
 	sortPID
 	sortName
+	numProcSorts
 )
 
 func (s procSort) String() string {
 	switch s {
 	case sortMem:
 		return "MEM"
+	case sortIO:
+		return "I/O"
 	case sortPID:
 		return "PID"
 	case sortName:
@@ -166,6 +191,10 @@ type sysMsg struct {
 	gpu       probe.GPUInfo
 	backlight probe.BacklightInfo
 	iwLinks   map[string]probe.IWLink
+}
+type healthMsg struct {
+	storage []probe.StorageHealth
+	modem   probe.ModemInfo
 }
 type errMsg struct{ error }
 
@@ -248,6 +277,15 @@ type Model struct {
 	backlight probe.BacklightInfo
 	sysNotice notice // transient backlight-set status
 
+	storage []probe.StorageHealth
+	modem   probe.ModemInfo
+
+	trends     trendTracker // rate-of-change history behind the predictive alerts
+	zoom       *zoomState   // non-nil while a metric is expanded full-screen
+	started    time.Time
+	peaksReset time.Time
+	restored   bool // sparkline history came from a previous session
+
 	alerts   alertEngine
 	alertsVP viewport.Model
 	notice   notice // transient global status (e.g. snapshot written)
@@ -265,6 +303,7 @@ type Model struct {
 
 func NewModel(cfg config.Config) Model {
 	cfg.Sanitize()
+	calibrateTemps(&cfg)
 	probe.SetTempThresholds(cfg.TempWarn, cfg.TempHot, cfg.TempCrit)
 
 	pvp := viewport.New(0, 0)
@@ -319,7 +358,33 @@ func NewModel(cfg config.Config) Model {
 		lossWin:      map[string][]bool{},
 		iwLinks:      map[string]probe.IWLink{},
 		alerts:       newAlertEngine(cfg.AlertLogCap, cfg.AlertClearTicks),
+		trends:       newTrendTracker(),
+		started:      time.Now(),
 	}
+}
+
+// calibrateTemps seeds the temperature thresholds from the board's own
+// thermal trip points when the config named none.
+//
+// The built-in 50/65/80 was chosen for a Raspberry Pi, whose firmware starts
+// throttling at 80 °C, and it travels badly: a laptop that declares a 109 °C
+// critical trip shows red nearly 30 °C before its hardware considers anything
+// wrong, and a board that throttles at 70 °C would never show red at all. The
+// kernel already publishes the right numbers next to the sensors ucmon reads.
+func calibrateTemps(cfg *config.Config) {
+	if cfg.TempExplicit || !cfg.TempFromTripPoints {
+		return
+	}
+	tp, ok := probe.ReadTripPoints()
+	if !ok {
+		return
+	}
+	warn, hot, crit, ok := probe.TripThresholds(tp)
+	if !ok {
+		return
+	}
+	cfg.TempWarn, cfg.TempHot, cfg.TempCrit = warn, hot, crit
+	cfg.Sanitize()
 }
 
 // Init primes every reading once. It cannot raise the in-flight guards —
@@ -337,6 +402,7 @@ func (m Model) Init() tea.Cmd {
 		fetchPowerCmd(),
 		fetchPSICmd(),
 		m.fetchSysCmd(),
+		m.fetchHealthCmd(),
 		tickEvery(m.fastInterval),
 	}
 	if cmd := m.fetchLatencyCmd(); cmd != nil {
@@ -423,11 +489,16 @@ func fetchNetCmd(s *probe.NetSampler) tea.Cmd {
 	}
 }
 
+// fetchConnsCmdFn matches queue's builder signature. The fetch carries no
+// error path of its own: a failure yields an empty list rather than an errMsg,
+// so the in-flight guard always sees the round complete.
+func fetchConnsCmdFn() tea.Cmd { return fetchConnsCmd() }
+
 func fetchConnsCmd() tea.Cmd {
 	return func() tea.Msg {
 		conns, err := probe.ListConnections()
 		if err != nil {
-			return errMsg{err}
+			return connMsg(nil)
 		}
 		return connMsg(conns)
 	}
@@ -438,12 +509,28 @@ func fetchConnsCmd() tea.Cmd {
 // Callers dispatch it through queue.
 func (m Model) fetchSysCmd() tea.Cmd {
 	dev := m.cfg.BacklightDevice
+	cfg := m.cfg
+	keep := func(iface string) bool { return !cfg.HideIface(iface) }
 	return func() tea.Msg {
 		return sysMsg{
 			gpu:       probe.SampleGPU(),
 			backlight: probe.ReadBacklight(dev),
-			iwLinks:   probe.ReadIWLinks(),
+			iwLinks:   probe.ReadIWLinks(keep),
 		}
+	}
+}
+
+// fetchHealthCmd reads storage wear and modem status. Both are cheap sysfs
+// reads or a short-lived shell-out on the slow cadence, and both are absent
+// on most hosts.
+func (m Model) fetchHealthCmd() tea.Cmd {
+	wantModem := m.cfg.ModemEnabled
+	return func() tea.Msg {
+		h := healthMsg{storage: probe.ReadStorageHealth()}
+		if wantModem {
+			h.modem = probe.ReadModem()
+		}
+		return h
 	}
 }
 
@@ -567,6 +654,14 @@ func (m Model) netIfaceLines() int {
 	return n
 }
 
+// modemLines returns the height of the modem block (0 when absent).
+func (m Model) modemLines() int {
+	if !m.modem.Present {
+		return 0
+	}
+	return 2 // status line + blank
+}
+
 // latencyLines returns the height of the ping block (0 when disabled).
 func (m Model) latencyLines() int {
 	if m.latSampler == nil {
@@ -588,7 +683,7 @@ func (m Model) netVPOverhead() int {
 		searchBlock = 2 // search line + blank
 		tableHeader = 2 // column header + rule
 	)
-	return m.netIfaceLines() + m.latencyLines() + connSummary + searchBlock + tableHeader
+	return m.netIfaceLines() + m.modemLines() + m.latencyLines() + connSummary + searchBlock + tableHeader
 }
 
 func (m Model) calcNetVPHeight() int {
@@ -623,31 +718,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
+		var cmds []tea.Cmd
 		if m.paused {
-			// Keep the heartbeat alive but fetch nothing; snapshots freeze.
-			return m, tickEvery(m.fastInterval)
-		}
-		m.tickCount++
-		cmds := []tea.Cmd{
-			fetchCPUCmd(),
-			fetchMemCmd(),
-			fetchPSICmd(),
-			tickEvery(m.fastInterval),
-		}
-		if m.tickCount%m.procEvery == 0 {
-			cmds = m.queue(cmds, fetchProcs, m.fetchProcsCmd)
-			cmds = m.queue(cmds, fetchLatency, m.fetchLatencyCmd)
-			cmds = append(cmds, fetchConnsCmd())
-			if m.detail != nil {
-				cmds = append(cmds, fetchProcDetailCmd(m.detail.pid))
+			// Fetch nothing: every snapshot freezes where it stands. The
+			// heartbeat keeps running so the frame still redraws.
+			cmds = []tea.Cmd{tickEvery(m.fastInterval)}
+		} else {
+			m.tickCount++
+			cmds = []tea.Cmd{
+				fetchCPUCmd(),
+				fetchMemCmd(),
+				fetchPSICmd(),
+				tickEvery(m.fastInterval),
+			}
+			if m.tickCount%m.procEvery == 0 {
+				cmds = m.queue(cmds, fetchProcs, m.fetchProcsCmd)
+				cmds = m.queue(cmds, fetchLatency, m.fetchLatencyCmd)
+				// The socket walk readlinks every /proc/<pid>/fd entry on the
+				// host — strictly more work than the process walk beside it,
+				// so it needs the same guard rather than a bare dispatch.
+				cmds = m.queue(cmds, fetchConns, fetchConnsCmdFn)
+				if m.detail != nil {
+					cmds = append(cmds, fetchProcDetailCmd(m.detail.pid))
+				}
+			}
+			if m.tickCount%m.slowEvery == 0 {
+				cmds = append(cmds, m.fetchDiskCmd(), fetchNetCmd(m.netSampler), fetchPowerCmd())
+				cmds = m.queue(cmds, fetchSys, m.fetchSysCmd)
+				cmds = append(cmds, m.fetchHealthCmd())
+			} else {
+				cmds = append(cmds, fetchNetCmd(m.netSampler))
 			}
 		}
-		if m.tickCount%m.slowEvery == 0 {
-			cmds = append(cmds, m.fetchDiskCmd(), fetchNetCmd(m.netSampler), fetchPowerCmd())
-			cmds = m.queue(cmds, fetchSys, m.fetchSysCmd)
-		} else {
-			cmds = append(cmds, fetchNetCmd(m.netSampler))
-		}
+
+		// Alerting runs whether or not sampling is paused. Pause freezes the
+		// readings, which is what it is for; silencing the bell and the hook
+		// at the same time would disarm the monitor at exactly the moment
+		// someone stopped it to look at something worrying.
 		if m.cfg.AlertsEnabled {
 			events := m.alerts.update(m.currentAlertConds(), time.Time(msg))
 			m.handleAlertEvents(events)
@@ -655,6 +762,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshAlerts()
 			}
 		}
+		m.recordTrend(time.Time(msg))
 		return m, tea.Batch(cmds...)
 
 	case cpuMsg:
@@ -663,7 +771,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = nil
 
 		m.cpuHist = append(m.cpuHist, m.cpuSnap.TotalPercent)
-		m.cpuHist = probe.ClampHistory(m.cpuHist, 200)
+		m.cpuHist = probe.ClampHistory(m.cpuHist, m.histLen())
 
 		// per-core history
 		for len(m.coreHists) < len(m.cpuSnap.PerCorePercent) {
@@ -671,19 +779,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		for i, pct := range m.cpuSnap.PerCorePercent {
 			m.coreHists[i] = append(m.coreHists[i], pct)
-			m.coreHists[i] = probe.ClampHistory(m.coreHists[i], 200)
+			m.coreHists[i] = probe.ClampHistory(m.coreHists[i], m.histLen())
 		}
 
 		// temp history
 		for _, t := range m.cpuSnap.Temperatures {
 			m.tempHist[t.Label] = append(m.tempHist[t.Label], t.Temp)
-			m.tempHist[t.Label] = probe.ClampHistory(m.tempHist[t.Label], 200)
+			m.tempHist[t.Label] = probe.ClampHistory(m.tempHist[t.Label], m.histLen())
 		}
 
 		// cpufreq history
 		for _, f := range m.cpuSnap.Freqs {
 			m.freqHist[f.Policy] = append(m.freqHist[f.Policy], f.CurMHz)
-			m.freqHist[f.Policy] = probe.ClampHistory(m.freqHist[f.Policy], 200)
+			m.freqHist[f.Policy] = probe.ClampHistory(m.freqHist[f.Policy], m.histLen())
 		}
 
 		m.peaks.observeCPU(m.cpuSnap.TotalPercent, m.cpuSnap.Temperatures)
@@ -692,10 +800,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case memMsg:
 		m.memSnap = probe.MemSnapshot(msg)
 		m.memHist = append(m.memHist, m.memSnap.UsedPct)
-		m.memHist = probe.ClampHistory(m.memHist, 200)
+		m.memHist = probe.ClampHistory(m.memHist, m.histLen())
 		if m.memSnap.SwapTotal > 0 {
 			m.swapHist = append(m.swapHist, m.memSnap.SwapUsedPct)
-			m.swapHist = probe.ClampHistory(m.swapHist, 200)
+			m.swapHist = probe.ClampHistory(m.swapHist, m.histLen())
 		}
 		m.peaks.observeMem(m.memSnap.UsedPct)
 		return m, nil
@@ -705,7 +813,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		bat := m.powerSnap.Battery
 		if bat.Present && bat.Capacity >= 0 {
 			m.battHist = append(m.battHist, float64(bat.Capacity))
-			m.battHist = probe.ClampHistory(m.battHist, 200)
+			m.battHist = probe.ClampHistory(m.battHist, m.histLen())
 			m.peaks.observeBattery(bat.Capacity)
 		}
 		if bat.Present && bat.PowerW > 0 {
@@ -714,10 +822,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				w = -w
 			}
 			m.battWHist = append(m.battWHist, w)
-			m.battWHist = probe.ClampHistory(m.battWHist, 200)
+			m.battWHist = probe.ClampHistory(m.battWHist, m.histLen())
 		}
 		m.loadHist = append(m.loadHist, m.powerSnap.Load.Load1)
-		m.loadHist = probe.ClampHistory(m.loadHist, 200)
+		m.loadHist = probe.ClampHistory(m.loadHist, m.histLen())
 		m.peaks.observeLoad(m.powerSnap.Load.Load1)
 		return m, nil
 
@@ -736,7 +844,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if r.OK {
 				ms := float64(r.RTT.Microseconds()) / 1000
 				m.rttHist[r.Target] = append(m.rttHist[r.Target], ms)
-				m.rttHist[r.Target] = probe.ClampHistory(m.rttHist[r.Target], 200)
+				m.rttHist[r.Target] = probe.ClampHistory(m.rttHist[r.Target], m.histLen())
 			}
 		}
 		m.netVP.Height = m.calcNetVPHeight()
@@ -774,15 +882,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				continue
 			}
 			m.rxHist[ii.Name] = append(m.rxHist[ii.Name], ii.RxBps)
-			m.rxHist[ii.Name] = probe.ClampHistory(m.rxHist[ii.Name], 200)
+			m.rxHist[ii.Name] = probe.ClampHistory(m.rxHist[ii.Name], m.histLen())
 			m.txHist[ii.Name] = append(m.txHist[ii.Name], ii.TxBps)
-			m.txHist[ii.Name] = probe.ClampHistory(m.txHist[ii.Name], 200)
+			m.txHist[ii.Name] = probe.ClampHistory(m.txHist[ii.Name], m.histLen())
 		}
 		m.evictIfaceHistory(present)
 		m.netVP.Height = m.calcNetVPHeight()
 		return m, nil
 
 	case connMsg:
+		m.done(fetchConns)
 		m.conns = msg
 		m.netHeader = m.buildNetHeader()
 		m.netText = m.renderNetText()
@@ -794,6 +903,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.gpuSnap = msg.gpu
 		m.backlight = msg.backlight
 		m.iwLinks = msg.iwLinks
+		// The selected interface grows an SSID line once iw data lands, so
+		// the connection viewport's budget has to move with it.
+		m.netVP.Height = m.calcNetVPHeight()
+		return m, nil
+
+	case healthMsg:
+		m.storage = msg.storage
+		hadModem := m.modem.Present
+		m.modem = msg.modem
+		if hadModem != m.modem.Present {
+			m.netVP.Height = m.calcNetVPHeight()
+		}
 		return m, nil
 
 	case errMsg:
@@ -814,7 +935,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						fmt.Sprintf("%s %d failed: %v", kp.signal(), kp.pid, err))
 				}
 				m.setProcsNotice(notice)
-				cmds := m.queue(nil, fetchProcs, m.fetchProcsCmd)
+				var cmds []tea.Cmd
+				if c := m.queueUser(fetchProcs, m.fetchProcsCmd); c != nil {
+					cmds = append(cmds, c)
+				}
 				if m.detail != nil {
 					m.detail.notice = notice
 					cmds = append(cmds, fetchProcDetailCmd(m.detail.pid))
@@ -833,6 +957,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			case "?", "esc", "q", "enter":
 				m.showHelp = false
+			}
+			return m, nil
+		}
+
+		// The zoom overlay owns its keys while open.
+		if m.zoom != nil {
+			switch msg.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "z", "esc", "q", "enter":
+				m.zoom = nil
+			case "right", "down", "j", "tab":
+				m.cycleZoom(1)
+			case "left", "up", "k", "shift+tab":
+				m.cycleZoom(-1)
+			case " ":
+				m.paused = !m.paused
+			case "w":
+				if path, err := m.exportSnapshot(); err != nil {
+					m.setNotice(errStyle.Render("snapshot failed: " + err.Error()))
+				} else {
+					m.setNotice(okStyle.Render("snapshot written: " + path))
+				}
 			}
 			return m, nil
 		}
@@ -865,6 +1012,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.setNotice(okStyle.Render("sampling resumed"))
 			}
+			return m, nil
+		case "z":
+			m.toggleZoom()
+			return m, nil
+		case "Z":
+			m.peaks = newSessionPeaks()
+			m.trends.reset()
+			m.peaksReset = time.Now()
+			m.setNotice(okStyle.Render("session peaks reset"))
 			return m, nil
 		case "tab", "right":
 			m.activeTab = (m.activeTab + 1) % numTabs
@@ -955,7 +1111,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "s":
 			if m.activeTab == tabProc {
-				m.procsSort = (m.procsSort + 1) % 4
+				m.procsSort = (m.procsSort + 1) % numProcSorts
 				m.procsSel = 0
 				m.procsNotice.clear()
 				m.refreshProcs()
@@ -1189,6 +1345,8 @@ func (m Model) View() string {
 	switch {
 	case m.showHelp:
 		body = m.viewHelp()
+	case m.zoom != nil:
+		body = m.viewZoom()
 	case m.detail != nil && m.activeTab == tabProc:
 		body = m.viewProcDetail()
 	default:
@@ -1212,7 +1370,7 @@ func (m Model) View() string {
 		}
 	}
 
-	footerText := "Keys: tab/←/→ switch • 1-8 jump • ? help • space pause • w snapshot • ctrl+c quit"
+	footerText := "Keys: tab/←/→ switch • 1-8 jump • z graph • ? help • space pause • w snapshot • ctrl+c quit"
 	if m.activeTab == tabNet && !m.netSearching {
 		footerText = "Keys: j/k iface • f conn state • / search • ? help • w snapshot • ctrl+c quit"
 	}
@@ -1220,13 +1378,16 @@ func (m Model) View() string {
 		footerText = "Keys: ↑↓ select • enter details • s sort • t tree • k/K kill • / filter • ? help"
 	}
 	if m.activeTab == tabCPU {
-		footerText = "Keys: g governor • tab/←/→ switch • ? help • space pause • w snapshot • ctrl+c quit"
+		footerText = "Keys: g governor • z graph • tab/←/→ switch • ? help • space pause • w snapshot"
 	}
 	if m.activeTab == tabGPU {
 		footerText = "Keys: +/- brightness • tab/←/→ switch • ? help • w snapshot • ctrl+c quit"
 	}
 	if m.activeTab == tabAlerts {
 		footerText = "Keys: ↑↓ scroll • m mute • c clear log • ? help • w snapshot • ctrl+c quit"
+	}
+	if m.zoom != nil {
+		footerText = "Keys: ←/→ metric • z/esc close • space pause • w snapshot • ctrl+c quit"
 	}
 	footer := subtleStyle.Render(footerText)
 	// Transient notices and the alert banner take priority over the key hints;
@@ -1453,7 +1614,7 @@ func (m Model) viewCPU() string {
 	}
 	b.WriteString(titleStyle.Render("CPU Total") + " " + cpuStyle.Render(fmt.Sprintf("%.1f%%", m.cpuSnap.TotalPercent)) + peak + "\n")
 	b.WriteString(RenderBarWithLabel("", m.cpuSnap.TotalPercent, min(40, chartW)) + "\n")
-	b.WriteString(Spark(m.cpuHist, min(chartW, 60)) + "\n\n")
+	b.WriteString(SparkPct(m.cpuHist, min(chartW, 60)) + "\n\n")
 
 	// Load average (one-line summary; full detail on Power tab)
 	if m.powerSnap.Load.CPUCount > 0 {
@@ -1491,6 +1652,10 @@ func (m Model) viewCPU() string {
 			b.WriteString(line + "\n")
 		}
 		b.WriteString("\n")
+	}
+
+	if bd := m.cpuSnap.Breakdown; bd.Valid {
+		b.WriteString(titleStyle.Render("Time") + " " + cpuBreakdownLine(bd) + "\n\n")
 	}
 
 	if psi := m.psiLine(m.psi.CPU, false); psi != "" {
@@ -1532,7 +1697,7 @@ func (m Model) viewCPU() string {
 				bar := RenderBarWithLabel("", pct, coreBarW)
 				spark := ""
 				if i < len(m.coreHists) {
-					spark = Spark(m.coreHists[i], sparkW)
+					spark = SparkPct(m.coreHists[i], sparkW)
 				}
 				line.WriteString(fmt.Sprintf("  %-*s%s %s", labelW, label, bar, spark))
 			}
@@ -1593,7 +1758,7 @@ func (m Model) viewMem() string {
 	b.WriteString(titleStyle.Render("RAM") + "  " +
 		fmt.Sprintf("%s used of %s", probe.HumanBytes(s.Used), probe.HumanBytes(s.Total)) + memPeak + "\n")
 	b.WriteString(RenderBarWithLabel("", s.UsedPct, barW) + "\n")
-	b.WriteString(Spark(m.memHist, min(chartW, 60)) + "\n\n")
+	b.WriteString(SparkPct(m.memHist, min(chartW, 60)) + "\n\n")
 
 	if psi := m.psiLine(m.psi.Mem, true); psi != "" {
 		b.WriteString(titleStyle.Render("Pressure") + " " + psi + "\n\n")
@@ -1610,7 +1775,7 @@ func (m Model) viewMem() string {
 	} else {
 		b.WriteString("  " + fmt.Sprintf("%s used of %s", probe.HumanBytes(s.SwapUsed), probe.HumanBytes(s.SwapTotal)) + "\n")
 		b.WriteString(RenderBarWithLabel("", s.SwapUsedPct, barW) + "\n")
-		b.WriteString(Spark(m.swapHist, min(chartW, 60)) + "\n")
+		b.WriteString(SparkPct(m.swapHist, min(chartW, 60)) + "\n")
 	}
 
 	return m.box(b.String())
@@ -1658,22 +1823,33 @@ func (m Model) viewProcs() string {
 
 // procsCols computes the process-table column widths for the current
 // viewport; the header and the rows must agree on them.
-func (m Model) procsCols() (colPID, colUser, colName, colCPU, colMem, colRSS, colStat int) {
+func (m Model) procsCols() (colPID, colUser, colName, colCPU, colMem, colRSS, colIO, colStat int) {
 	w := m.procsVP.Width
 	if w <= 0 {
 		w = 120
 	}
 
 	colPID, colUser, colCPU, colMem, colRSS, colStat = 7, 10, 7, 7, 10, 3
+	// The I/O column answers "what is thrashing the card", which is the
+	// question that matters most on an SD-booted board — but it costs 11
+	// columns, so a narrow terminal keeps the name instead.
+	colIO = 11
+	if w < 92 {
+		colIO = 0
+	}
 	nameCap := 30
 	if m.procsTree && m.procsQuery == "" {
 		nameCap = 48 // leave room for tree-branch indentation
 	}
-	colName = max(12, w-colPID-colUser-colCPU-colMem-colRSS-colStat-14)
+	fixed := colPID + colUser + colCPU + colMem + colRSS + colStat + 14
+	if colIO > 0 {
+		fixed += colIO + 2
+	}
+	colName = max(12, w-fixed)
 	if colName > nameCap {
 		colName = nameCap
 	}
-	return colPID, colUser, colName, colCPU, colMem, colRSS, colStat
+	return colPID, colUser, colName, colCPU, colMem, colRSS, colIO, colStat
 }
 
 func (m Model) buildProcsHeader() string {
@@ -1682,18 +1858,23 @@ func (m Model) buildProcsHeader() string {
 		w = 120
 	}
 
-	colPID, colUser, colName, colCPU, colMem, colRSS, colStat := m.procsCols()
+	colPID, colUser, colName, colCPU, colMem, colRSS, colIO, colStat := m.procsCols()
 
-	h := fmt.Sprintf("  %s  %s  %s  %s  %s  %s  %s",
+	h := fmt.Sprintf("  %s  %s  %s  %s  %s  %s",
 		padRight("PID", colPID),
 		padRight("USER", colUser),
 		padRight("NAME", colName),
 		padRight("CPU%", colCPU),
 		padRight("MEM%", colMem),
 		padRight("RSS", colRSS),
-		padRight("S", colStat),
 	)
-	sep := rule(min(w, colPID+colUser+colName+colCPU+colMem+colRSS+colStat+14))
+	total := colPID + colUser + colName + colCPU + colMem + colRSS + colStat + 14
+	if colIO > 0 {
+		h += "  " + padRight("DISK I/O", colIO)
+		total += colIO + 2
+	}
+	h += "  " + padRight("S", colStat)
+	sep := rule(min(w, total))
 
 	view := "flat"
 	if m.procsTree {
@@ -1730,8 +1911,8 @@ func (m Model) computeProcsView() []probe.ProcInfo {
 
 	m.sortProcSlice(out)
 
-	if len(out) > procsDisplayCap {
-		out = out[:procsDisplayCap]
+	if cap := m.procsCap(); len(out) > cap {
+		out = out[:cap]
 	}
 	return out
 }
@@ -1742,6 +1923,8 @@ func (m Model) sortProcSlice(ps []probe.ProcInfo) {
 		switch m.procsSort {
 		case sortMem:
 			return ps[i].MemPct > ps[j].MemPct
+		case sortIO:
+			return ps[i].IOReadBps+ps[i].IOWriteBps > ps[j].IOReadBps+ps[j].IOWriteBps
 		case sortPID:
 			return ps[i].PID < ps[j].PID
 		case sortName:
@@ -1780,7 +1963,7 @@ func (m Model) computeProcsTree() ([]probe.ProcInfo, []string) {
 	visited := make(map[int32]bool, len(m.procs))
 	var walk func(p probe.ProcInfo, indent string, last, isRoot bool)
 	walk = func(p probe.ProcInfo, indent string, last, isRoot bool) {
-		if len(out) >= procsDisplayCap || visited[p.PID] {
+		if len(out) >= m.procsCap() || visited[p.PID] {
 			return
 		}
 		visited[p.PID] = true
@@ -1858,7 +2041,7 @@ func (m Model) selectedProc() (probe.ProcInfo, bool) {
 func (m Model) renderProcsText() string {
 	var b strings.Builder
 
-	colPID, colUser, colName, colCPU, colMem, colRSS, colStat := m.procsCols()
+	colPID, colUser, colName, colCPU, colMem, colRSS, colIO, colStat := m.procsCols()
 
 	if len(m.procs) == 0 {
 		b.WriteString("No data (yet)…\n")
@@ -1898,8 +2081,12 @@ func (m Model) renderProcsText() string {
 		rssS := padRight(probe.HumanBytes(p.MemRSS), colRSS)
 		statS := padRight(p.Status, colStat)
 
-		row := fmt.Sprintf("%s%s  %s  %s  %s  %s  %s  %s",
-			marker, pidS, userS, nameS, cpuS, memS, rssS, statS)
+		row := fmt.Sprintf("%s%s  %s  %s  %s  %s  %s",
+			marker, pidS, userS, nameS, cpuS, memS, rssS)
+		if colIO > 0 {
+			row += "  " + padRight(trunc(procIOText(p), colIO), colIO)
+		}
+		row += "  " + statS
 
 		if selected {
 			b.WriteString(selectedStyle.Render(row) + "\n")
@@ -1961,6 +2148,13 @@ func (m Model) viewDisk() string {
 			padRight(probe.HumanBytes(d.Free), colFree),
 			bar,
 		))
+	}
+
+	if len(m.storage) > 0 {
+		b.WriteString("\n" + titleStyle.Render("Device health") + "\n")
+		for _, h := range m.storage {
+			b.WriteString("  " + storageHealthLine(h) + "\n")
+		}
 	}
 
 	if len(m.diskIOs) > 0 {
@@ -2033,6 +2227,9 @@ func (m Model) viewNet() string {
 			if ii.WiFi.Present {
 				wifi = "  " + wifiSummary(ii.WiFi)
 			}
+			if tag := ifaceErrTag(ii); tag != "" {
+				wifi += "  " + tag
+			}
 
 			b.WriteString(fmt.Sprintf("%s%s  %s  %s  %s%s\n",
 				marker,
@@ -2079,6 +2276,10 @@ func (m Model) viewNet() string {
 			}
 		}
 		b.WriteString("\n")
+	}
+
+	if m.modem.Present {
+		b.WriteString(modemLine(m.modem) + "\n\n")
 	}
 
 	if m.latSampler != nil {
@@ -2321,7 +2522,7 @@ func (m Model) viewPower() string {
 		if bat.Capacity >= 0 {
 			b.WriteString("  " + RenderBar(float64(bat.Capacity), min(40, chartW), col) + "\n")
 			if roomy {
-				b.WriteString("  " + Spark(m.battHist, min(chartW, 60)) + "\n")
+				b.WriteString("  " + SparkPct(m.battHist, min(chartW, 60)) + "\n")
 			}
 		}
 		var det []string
@@ -2514,7 +2715,7 @@ func (m *Model) adjustBacklight(delta int) tea.Cmd {
 	}
 	m.backlight.Percent = target // optimistic; fetchSysCmd reconciles
 	m.setSysNotice(okStyle.Render(fmt.Sprintf("brightness → %d%%", target)))
-	return tea.Batch(m.queue(nil, fetchSys, m.fetchSysCmd)...)
+	return m.queueUser(fetchSys, m.fetchSysCmd)
 }
 
 func (m Model) viewGPU() string {
@@ -2592,4 +2793,164 @@ func statusStyled(s string) string {
 	default:
 		return subtleStyle.Render(s)
 	}
+}
+
+// cpuBreakdownLine renders where the interval's CPU time actually went.
+// "80% busy" describes a box saturating its cores and a box parked in iowait
+// behind a slow card identically; only the split tells them apart, and on
+// these boards it is usually the card.
+func cpuBreakdownLine(b probe.CPUBreakdown) string {
+	part := func(label string, v float64, color string) string {
+		if v < 0.5 {
+			return ""
+		}
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(color)).
+			Render(fmt.Sprintf("%s %.0f%%", label, v))
+	}
+
+	var parts []string
+	for _, c := range []struct {
+		label, color string
+		v            float64
+	}{
+		{"user", "42", b.User},
+		{"sys", "45", b.System},
+		{"nice", "245", b.Nice},
+		{"iowait", "196", b.Iowait}, // the one worth noticing on an SD card
+		{"irq", "214", b.IRQ},
+		{"steal", "214", b.Steal},
+	} {
+		if p := part(c.label, c.v, c.color); p != "" {
+			parts = append(parts, p)
+		}
+	}
+	if len(parts) == 0 {
+		return subtleStyle.Render("idle")
+	}
+
+	line := strings.Join(parts, "  ")
+	// iowait is the finding, not a footnote: say so when it dominates.
+	if b.Busiest == "iowait" && b.Iowait >= 10 {
+		line += "  " + errStyle.Render("← blocked on I/O, not compute")
+	}
+	return line
+}
+
+// storageHealthLine renders one device's wear state.
+func storageHealthLine(h probe.StorageHealth) string {
+	style := okStyle
+	switch h.Severity() {
+	case 1:
+		style = warnStyle
+	case 2:
+		style = errStyle
+	}
+
+	line := subtleStyle.Render(padRight(h.Device, 10)) + " " +
+		subtleStyle.Render(padRight(h.Kind, 5))
+	if h.Name != "" {
+		line += " " + padRight(trunc(h.Name, 16), 16)
+	}
+	if h.SizeB > 0 {
+		line += " " + subtleStyle.Render(padRight(probe.HumanBytes(h.SizeB), 10))
+	}
+
+	switch {
+	case h.ReadOnly:
+		line += " " + errStyle.Render("READ-ONLY — controller retired it")
+	default:
+		pct, ok := h.WearPct()
+		if ok {
+			line += " " + style.Render(fmt.Sprintf("wear %3.0f%%", pct)) + " " +
+				RenderBar(pct, 16, wearColor(pct))
+		} else {
+			line += " " + subtleStyle.Render("no wear data")
+		}
+		if lbl := h.EOLLabel(); lbl != "" && lbl != "normal" {
+			line += " " + style.Render("reserve "+lbl)
+		}
+	}
+	return line
+}
+
+// wearColor grades consumed write endurance. The scale is deliberately
+// harsher than the disk-usage one: a full filesystem is an inconvenience, a
+// worn-out card is an unbootable device.
+func wearColor(pct float64) string {
+	switch {
+	case pct >= 90:
+		return "196"
+	case pct >= 70:
+		return "214"
+	case pct >= 50:
+		return "226"
+	default:
+		return "42"
+	}
+}
+
+// ifaceErrTag renders a compact, coloured error/drop tag for an interface
+// row, or "" when the link is clean.
+func ifaceErrTag(ii probe.IfaceInfo) string {
+	total := ii.BadFramesTotal()
+	if total == 0 {
+		return ""
+	}
+	rate := ii.BadFrames()
+	style := subtleStyle
+	switch {
+	case rate >= 1:
+		style = errStyle // actively dropping frames right now
+	case rate > 0:
+		style = warnStyle
+	}
+	if rate > 0 {
+		return style.Render(fmt.Sprintf("err/drop %d (+%.0f/s)", total, rate))
+	}
+	return style.Render(fmt.Sprintf("err/drop %d", total))
+}
+
+// modemLine renders the WWAN modem status for the Network tab.
+func modemLine(mi probe.ModemInfo) string {
+	state := errStyle.Render(mi.State)
+	if mi.Registered() {
+		state = okStyle.Render(mi.State)
+	}
+
+	var det []string
+	if mi.Operator != "" {
+		det = append(det, mi.Operator)
+	}
+	if mi.AccessTech != "" {
+		det = append(det, strings.ToUpper(mi.AccessTech))
+	}
+	if mi.SignalPct >= 0 {
+		det = append(det, fmt.Sprintf("%d%%", mi.SignalPct))
+	}
+	if mi.HasRSSI {
+		det = append(det, fmt.Sprintf("%.0f dBm", mi.RSSIdBm))
+	}
+	if mi.FailedReason != "" {
+		det = append(det, "reason: "+mi.FailedReason)
+	}
+
+	line := titleStyle.Render("Modem") + "  " + state
+	if len(det) > 0 {
+		line += "  " + subtleStyle.Render(strings.Join(det, "  •  "))
+	}
+	return line
+}
+
+// procIOText renders a process's combined block-I/O rate. "-" means the
+// counters were unreadable (another user's process without CAP_SYS_PTRACE),
+// which is a different statement from a confident zero.
+func procIOText(p probe.ProcInfo) string {
+	if !p.IOKnown {
+		return "-"
+	}
+	total := p.IOReadBps + p.IOWriteBps
+	if total <= 0 {
+		return ""
+	}
+	return probe.HumanBytesPerSec(total)
 }

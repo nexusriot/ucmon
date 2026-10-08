@@ -1,12 +1,19 @@
 package probe
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unicode/utf8"
 
 	"github.com/shirou/gopsutil/v4/process"
+	"github.com/tklauser/go-sysconf"
 	"golang.org/x/sys/unix"
 )
 
@@ -20,49 +27,98 @@ type ProcInfo struct {
 	Status  string
 	User    string
 	CmdLine string
+
+	// Per-process block-I/O rates since the previous refresh. Zero when
+	// /proc/<pid>/io is unreadable, which it is for other users' processes
+	// without CAP_SYS_PTRACE.
+	IOReadBps  float64
+	IOWriteBps float64
+	IOKnown    bool
 }
 
-// ProcSampler lists processes while reusing gopsutil Process handles across
-// refreshes. gopsutil computes CPUPercent as the delta since the previous call
-// on the same handle, so reuse makes the CPU%% column reflect usage since the
-// last refresh (htop-style) instead of an average over the process lifetime.
-// The first sample for a PID still reports the lifetime average.
+// procBase is a var so tests can point the sampler at a fake /proc tree.
+var procBase = "/proc"
+
+// clockTicks is USER_HZ: the unit of the utime/stime/starttime columns in
+// /proc/<pid>/stat. It is 100 on every Linux/arch combination ucmon ships
+// for, but sysconf settles it rather than assuming.
+var clockTicks = func() float64 {
+	if n, err := sysconf.Sysconf(sysconf.SC_CLK_TCK); err == nil && n > 0 {
+		return float64(n)
+	}
+	return 100
+}()
+
+var pageSize = uint64(os.Getpagesize())
+
+// procSample is the previous refresh's raw counters for one PID, kept so the
+// next refresh can report rates over the interval rather than over the
+// process lifetime.
+type procSample struct {
+	cpuTicks  uint64 // utime + stime
+	startTime uint64 // field 22: identifies the process across PID reuse
+	ioRead    uint64
+	ioWrite   uint64
+	at        time.Time
+}
+
+// ProcSampler walks /proc directly instead of going through gopsutil, and
+// keeps the previous refresh's counters so CPU% and per-process I/O are rates
+// over the interval (htop-style) rather than lifetime averages.
+//
+// Going direct matters on the boards ucmon targets. gopsutil's accessors each
+// re-read and re-parse the file they need, so one refresh read /proc/<pid>/stat
+// twice (Ppid + CPUPercent), /proc/<pid>/status twice (Status + Username),
+// scanned /etc/passwd once per process (pure-Go user.LookupId), and parsed
+// /proc/meminfo once per process (MemoryPercent). Measured over 533 processes
+// that was ~90 ms of work for ~7 ms of actual file reads.
 type ProcSampler struct {
 	mu    sync.Mutex
-	procs map[int32]*process.Process
+	prev  map[int32]procSample
+	users map[uint32]string // uid -> name, resolved once per uid per process
 }
 
 func NewProcSampler() *ProcSampler {
-	return &ProcSampler{procs: map[int32]*process.Process{}}
+	return &ProcSampler{
+		prev:  map[int32]procSample{},
+		users: map[uint32]string{},
+	}
 }
 
 func (s *ProcSampler) List() ([]ProcInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	pids, err := process.Pids()
+	entries, err := os.ReadDir(procBase)
 	if err != nil {
 		return nil, err
 	}
 
-	seen := make(map[int32]bool, len(pids))
-	out := make([]ProcInfo, 0, len(pids))
-	for _, pid := range pids {
-		seen[pid] = true
-		p, ok := s.procs[pid]
-		if !ok {
-			p, err = process.NewProcess(pid)
-			if err != nil {
-				continue // exited between listing and open
-			}
-			s.procs[pid] = p
+	now := time.Now()
+	memTotal := readMemTotal()
+
+	seen := make(map[int32]bool, len(entries))
+	out := make([]ProcInfo, 0, len(entries))
+
+	for _, e := range entries {
+		pid64, err := strconv.ParseInt(e.Name(), 10, 32)
+		if err != nil || pid64 <= 0 {
+			continue // not a pid directory
 		}
-		out = append(out, snapshotProc(p))
+		pid := int32(pid64)
+
+		info, cur, ok := s.readProc(pid, memTotal, now)
+		if !ok {
+			continue // exited between the listing and the read
+		}
+		seen[pid] = true
+		s.prev[pid] = cur
+		out = append(out, info)
 	}
 
-	for pid := range s.procs {
+	for pid := range s.prev {
 		if !seen[pid] {
-			delete(s.procs, pid)
+			delete(s.prev, pid)
 		}
 	}
 
@@ -73,37 +129,233 @@ func (s *ProcSampler) List() ([]ProcInfo, error) {
 	return out, nil
 }
 
-func snapshotProc(p *process.Process) ProcInfo {
-	name, _ := p.Name()
-	ppid, _ := p.Ppid()
-	cpuPct, _ := p.CPUPercent()
-	memPct, _ := p.MemoryPercent()
-	memInfo, _ := p.MemoryInfo()
-	status, _ := p.Status()
-	user, _ := p.Username()
-	cmdline, _ := p.Cmdline()
+// readProc builds one row from /proc/<pid>. It reads stat and cmdline, stats
+// the directory for the owner uid, and reads io when permitted — four cheap
+// operations against the eight parsing round trips the gopsutil path took.
+func (s *ProcSampler) readProc(pid int32, memTotal uint64, now time.Time) (ProcInfo, procSample, bool) {
+	dir := filepath.Join(procBase, strconv.Itoa(int(pid)))
 
-	var rss uint64
-	if memInfo != nil {
-		rss = memInfo.RSS
+	statBytes, err := os.ReadFile(filepath.Join(dir, "stat"))
+	if err != nil {
+		return ProcInfo{}, procSample{}, false
+	}
+	st, ok := parseProcStat(statBytes)
+	if !ok {
+		return ProcInfo{}, procSample{}, false
 	}
 
-	statusStr := ""
-	if len(status) > 0 {
-		statusStr = status[0]
+	info := ProcInfo{
+		PID:    pid,
+		PPID:   st.ppid,
+		Name:   st.comm,
+		Status: st.state,
+		MemRSS: st.rssPages * pageSize,
+	}
+	if memTotal > 0 {
+		info.MemPct = float32(float64(info.MemRSS) / float64(memTotal) * 100)
 	}
 
-	return ProcInfo{
-		PID:     p.Pid,
-		PPID:    ppid,
-		Name:    name,
-		CPUPct:  cpuPct,
-		MemPct:  memPct,
-		MemRSS:  rss,
-		Status:  statusStr,
-		User:    user,
-		CmdLine: runeTrunc(cmdline, 200),
+	if b, err := os.ReadFile(filepath.Join(dir, "cmdline")); err == nil {
+		info.CmdLine = runeTrunc(cmdlineString(b), 200)
+		// comm is capped at 15 characters by the kernel; the executable's
+		// own name from argv[0] is the better label when it was cut.
+		if utf8.RuneCountInString(info.Name) >= 15 {
+			if full := argv0Base(info.CmdLine); full != "" {
+				info.Name = full
+			}
+		}
 	}
+
+	info.User = s.userName(dir)
+
+	cur := procSample{cpuTicks: st.utime + st.stime, startTime: st.startTime, at: now}
+	if ioRead, ioWrite, ok := readProcIO(dir); ok {
+		cur.ioRead, cur.ioWrite = ioRead, ioWrite
+		info.IOKnown = true
+	}
+
+	// A PID the kernel recycled is a different process: its counters restart,
+	// so a delta against the old ones would report a wild rate. startTime
+	// settles it, and it costs nothing — it is already in the stat we read.
+	if prev, ok := s.prev[pid]; ok && prev.startTime == st.startTime {
+		if dt := now.Sub(prev.at).Seconds(); dt > 0 {
+			info.CPUPct = float64(cur.cpuTicks-prev.cpuTicks) / clockTicks / dt * 100
+			if info.CPUPct < 0 {
+				info.CPUPct = 0
+			}
+			if info.IOKnown {
+				info.IOReadBps = CounterRate(cur.ioRead, prev.ioRead, dt)
+				info.IOWriteBps = CounterRate(cur.ioWrite, prev.ioWrite, dt)
+			}
+		}
+	}
+
+	return info, cur, true
+}
+
+// userName resolves the owner of a /proc/<pid> directory, caching by uid. The
+// directory's own ownership gives the uid in one stat call, where reading
+// /proc/<pid>/status means parsing fifty lines for one of them.
+func (s *ProcSampler) userName(dir string) string {
+	var st unix.Stat_t
+	if err := unix.Stat(dir, &st); err != nil {
+		return ""
+	}
+	uid := st.Uid
+	if name, ok := s.users[uid]; ok {
+		return name
+	}
+	name := lookupUser(uid)
+	s.users[uid] = name
+	return name
+}
+
+// passwdPath is a var so tests can point the uid lookup at a fake file.
+var passwdPath = "/etc/passwd"
+
+// lookupUser maps a uid to a login name via /etc/passwd, falling back to the
+// numeric uid. os/user would do the same scan, but once per call rather than
+// once per uid, which is a full file scan per process in a pure-Go build.
+func lookupUser(uid uint32) string {
+	want := strconv.FormatUint(uint64(uid), 10)
+	if b, err := os.ReadFile(passwdPath); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			fields := strings.Split(line, ":")
+			if len(fields) >= 3 && fields[2] == want {
+				return fields[0]
+			}
+		}
+	}
+	return want
+}
+
+// procStat holds the /proc/<pid>/stat columns ucmon uses.
+type procStat struct {
+	comm      string
+	state     string
+	ppid      int32
+	utime     uint64
+	stime     uint64
+	startTime uint64
+	rssPages  uint64
+}
+
+// parseProcStat reads the columns ucmon needs out of /proc/<pid>/stat. The
+// comm field is wrapped in parentheses and may itself contain spaces and
+// parentheses, so the split starts after the *last* ')' rather than at the
+// second field.
+func parseProcStat(b []byte) (procStat, bool) {
+	var st procStat
+
+	open := bytes.IndexByte(b, '(')
+	close := bytes.LastIndexByte(b, ')')
+	if open < 0 || close < open {
+		return st, false
+	}
+	st.comm = string(b[open+1 : close])
+
+	// Columns are 1-indexed in proc(5) and the first one after ')' is state
+	// (column 3), so column N lives at index N-3.
+	fields := strings.Fields(string(b[close+1:]))
+	const (
+		idxState     = 0  // column 3
+		idxPPID      = 1  // column 4
+		idxUTime     = 11 // column 14
+		idxSTime     = 12 // column 15
+		idxStartTime = 19 // column 22
+		idxRSS       = 21 // column 24, in pages
+	)
+	if len(fields) <= idxRSS {
+		return st, false
+	}
+
+	st.state = fields[idxState]
+	if v, err := strconv.ParseInt(fields[idxPPID], 10, 32); err == nil {
+		st.ppid = int32(v)
+	}
+	st.utime, _ = strconv.ParseUint(fields[idxUTime], 10, 64)
+	st.stime, _ = strconv.ParseUint(fields[idxSTime], 10, 64)
+	st.startTime, _ = strconv.ParseUint(fields[idxStartTime], 10, 64)
+	// rss is signed in proc(5) and reads 0 for kernel threads.
+	if v, err := strconv.ParseInt(fields[idxRSS], 10, 64); err == nil && v > 0 {
+		st.rssPages = uint64(v)
+	}
+	return st, true
+}
+
+// readProcIO returns the cumulative read_bytes / write_bytes counters, which
+// are the ones that reach the block layer (read/write count what the process
+// asked for, cache hits included). Unreadable for other users' processes
+// without CAP_SYS_PTRACE, which is reported rather than faked as zero.
+func readProcIO(dir string) (read, write uint64, ok bool) {
+	b, err := os.ReadFile(filepath.Join(dir, "io"))
+	if err != nil {
+		return 0, 0, false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		name, val, found := strings.Cut(line, ":")
+		if !found {
+			continue
+		}
+		v, err := strconv.ParseUint(strings.TrimSpace(val), 10, 64)
+		if err != nil {
+			continue
+		}
+		switch name {
+		case "read_bytes":
+			read, ok = v, true
+		case "write_bytes":
+			write, ok = v, true
+		}
+	}
+	return read, write, ok
+}
+
+// meminfoPath is a var so tests can point readMemTotal at a fake file.
+var meminfoPath = "/proc/meminfo"
+
+// readMemTotal reads MemTotal once per refresh. gopsutil's MemoryPercent
+// re-read and re-parsed this file for every process in the list.
+func readMemTotal() uint64 {
+	b, err := os.ReadFile(meminfoPath)
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0
+		}
+		kb, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0
+		}
+		return kb * 1024
+	}
+	return 0
+}
+
+// cmdlineString joins the NUL-separated argv of /proc/<pid>/cmdline. Kernel
+// threads have an empty one.
+func cmdlineString(b []byte) string {
+	b = bytes.TrimRight(b, "\x00")
+	if len(b) == 0 {
+		return ""
+	}
+	return string(bytes.ReplaceAll(b, []byte{0}, []byte{' '}))
+}
+
+// argv0Base is the basename of a command line's first word, used to recover a
+// name the kernel truncated to 15 characters in comm.
+func argv0Base(cmdline string) string {
+	first, _, _ := strings.Cut(cmdline, " ")
+	if first == "" {
+		return ""
+	}
+	return filepath.Base(first)
 }
 
 // runeTrunc cuts s to at most n runes without splitting a UTF-8 sequence.
@@ -142,6 +394,10 @@ type ProcDetail struct {
 	Conns      []ConnInfo
 }
 
+// GetProcDetail reads one process in depth for the detail overlay. This path
+// stays on gopsutil: it runs for a single PID on the proc tick, so the
+// per-call parsing overhead that makes it wrong for the whole-list walk is
+// irrelevant here, and it carries exe/cwd/fd/children for free.
 func GetProcDetail(pid int32) (ProcDetail, error) {
 	p, err := process.NewProcess(pid)
 	if err != nil {

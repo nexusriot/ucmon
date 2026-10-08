@@ -6,18 +6,21 @@ Built in Go with the [Bubble Tea](https://github.com/charmbracelet/bubbletea) fr
 
 ## Features
 
-- **CPU & Temperature** — total and per-core usage with bar charts and sparkline history; color-coded thermal sensor readings; load-average summary; **cpufreq clocks and governor** per policy (current/min/max MHz with sparkline, `g` cycles the governor — performance vs battery on demand); CPU pressure (PSI)
+- **CPU & Temperature** — total and per-core usage with bar charts and sparkline history; a **time breakdown** (user/sys/nice/iowait/irq/steal) that separates "saturating the cores" from "blocked on the SD card"; color-coded thermal sensor readings with thresholds **calibrated from the kernel's own thermal trip points**; load-average summary; **cpufreq clocks and governor** per policy (current/min/max MHz with sparkline, `g` cycles the governor — performance vs battery on demand); CPU pressure (PSI)
 - **Memory** — RAM total/used/free/available/cached/buffers and swap, with bars, sparkline history, and memory pressure (PSI)
-- **Processes** — searchable list (matches name, PID, user, **and command line**) with a movable cursor, sortable by CPU / MEM / PID / NAME, a parent/child tree view, and SIGTERM/SIGKILL with confirmation. CPU% is measured **since the previous refresh** (htop-style). `enter` opens a **detail view**: threads, open fds, memory breakdown, per-process disk I/O, sockets, start time — with **renice (`+`/`-`)** and **SIGSTOP/SIGCONT** controls
-- **Disk** — partition usage with color-coded bars, per-device read/write rates, and I/O pressure (PSI)
-- **Network** — interface throughput with sparklines and a searchable connection table (protocol incl. TCP6/UDP6, addresses, status, PID, process) with a **state filter** (`f`: all → LISTEN → ESTABLISHED) and per-state counts; **WiFi link quality / signal dBm** (from `/proc/net/wireless`) plus **SSID, channel, and bitrates** via `iw` when available; **connectivity monitor** pinging the default gateway (and an optional external target) with RTT sparkline and packet-loss tracking — unprivileged ICMP with a TCP-connect fallback
+- **Processes** — searchable list (matches name, PID, user, **and command line**) with a movable cursor, sortable by CPU / MEM / **DISK I/O** / PID / NAME, a parent/child tree view, and SIGTERM/SIGKILL with confirmation. CPU% and the **per-process disk I/O rate** are measured **since the previous refresh** (htop-style); the walk reads `/proc` directly, which is ~7× faster than the gopsutil accessor path it replaced. `enter` opens a **detail view**: threads, open fds, memory breakdown, per-process disk I/O, sockets, start time — with **renice (`+`/`-`)** and **SIGSTOP/SIGCONT** controls
+- **Disk** — partition usage with color-coded bars, per-device read/write rates, I/O pressure (PSI), and **SD/eMMC wear**: life-time bands, pre-EOL reserve state and read-only lockout from `/sys/block/*/device`. Card death is the characteristic failure of these boards and the one reading nothing else hints at
+- **Network** — interface throughput with sparklines and a searchable connection table (protocol incl. TCP6/UDP6, addresses, status, PID, process — inet only, so Unix sockets no longer pad it out) with per-interface **error and drop counters**, a **state filter** (`f`: all → LISTEN → ESTABLISHED) and per-state counts; **WiFi link quality / signal dBm** (from `/proc/net/wireless`) plus **SSID, channel, and bitrates** via `iw` when available; **connectivity monitor** pinging the default gateway (and an optional external target) with RTT sparkline and packet-loss tracking — unprivileged ICMP with a TCP-connect fallback; **4G/LTE modem status** (operator, registration, access technology, RSSI) via `mmcli` when `modem_enabled` is set
 - **Power & System Health** — battery charge/status/time-left/**pack health** (uConsole/Pi via `/sys/class/power_supply`), power-draw sparkline, 1/5/15-min load average, and Raspberry Pi throttle / under-voltage flags via `vcgencmd`
 - **GPU / VideoCore** — Raspberry Pi / uConsole SoC core temp, voltage, clock domains (arm/core/v3d/…) and CPU↔GPU memory split via `vcgencmd`, plus **display backlight readout and `+`/`-` control** (`/sys/class/backlight`)
-- **Alerts** — configurable thresholds (temperature, RAM/swap, disk, battery, load, live Pi throttle flags, **weak WiFi signal, packet loss, PSI pressure**) raise edge-triggered alerts with **flap damping**. A severity-colored banner shows the top alert on every tab; the Alerts tab keeps a timestamped log. Optional **terminal bell** on criticals, an **`alert_cmd` shell hook** (gets `UCMON_ALERT_STATE/SEV/MSG`), and an **on-disk alert log**
-- **Session peaks** — max CPU/temperature/load/memory and minimum battery since start, shown inline and in reports
+- **Alerts** — configurable thresholds (temperature, RAM/swap, disk, battery, load, live Pi throttle flags, **weak WiFi signal, packet loss, PSI pressure, storage wear, modem registration**) raise edge-triggered alerts with **flap damping**, plus **predictive alerts on the rate of change** — battery drain %/h with a time-to-empty, filesystem fill with a time-to-full, and temperature climb with a time-to-critical. Alerting keeps running while sampling is paused. A severity-colored banner shows the top alert on every tab; the Alerts tab keeps a timestamped log. Optional **terminal bell** on criticals, an **`alert_cmd` shell hook** (gets `UCMON_ALERT_STATE/SEV/MSG`), and an **on-disk alert log**
+- **Session peaks** — max CPU/temperature/load/memory and minimum battery since start, shown inline and in reports; `Z` resets them
+- **Expanded graphs** — `z` blows one metric up to a full-screen braille chart with a real value axis and min/max/avg, stepping between every series the tab offers. Sparklines of bounded readings (CPU, memory, battery) are drawn on a fixed 0–100 axis, so a core pinned at 100% no longer looks like one sitting idle
+- **Persistent history** — set `history_file` and the sparklines and session peaks survive a restart
 - **Snapshot export** — press `w` on any tab to write a plain-text report of all current readings to `~/ucmon-report-<timestamp>.txt`
 - **Pause** (`space`) freezes sampling to inspect readings; **help overlay** (`?`) lists every key
-- **Headless mode** — `ucmon --once` prints the full snapshot report to stdout and exits (for SSH sessions and cron)
+- **Headless mode** — `ucmon --once` prints the full snapshot report to stdout and exits (for SSH sessions and cron); `--once --json` emits the same readings as JSON for scripts
+- **Prometheus exporter** — `ucmon --metrics :9100` serves `/metrics` and `/snapshot` without a TUI, or `metrics_listen` runs one alongside the monitor. Sampling is lazy and rate-limited, so a tight scrape loop cannot peg a CM4
 - **Ignore lists** — `net_ignore` / `disk_ignore` / `temp_ignore` hide noisy names (container veths, snap loop mounts, per-core `coretemp` sensors) from their tab, the `--once` report and the alert engine alike; comma-separated globs where `*` spans `/`, so `/snap/*` covers a whole subtree
 - **Sampling-lateness badge** — when a probe cannot finish inside its interval ucmon skips the next round rather than piling up work, and the header names what is lagging (`⏳ slow: gpu/soc`) so a stall on a slow board is diagnosable instead of invisible
 
@@ -40,10 +43,16 @@ binaries, and a smoke job that drives the real CLI. See
 ```
 ucmon [flags]
   --once            print one snapshot report to stdout and exit (no TUI)
+  --json            with --once, print the snapshot as JSON instead of text
+  --metrics <addr>  serve Prometheus metrics on this address (e.g. :9100), no TUI
   --config <path>   use an explicit config file
   --tab <name>      start tab: cpu|mem|proc|disk|net|power|gpu|alerts
   --version         print the version and exit
 ```
+
+The exporter serves `/metrics` (Prometheus text format), `/snapshot` (the JSON
+report) and `/healthz`. It re-samples at most once every 5 seconds however
+often it is scraped.
 
 ## Configuration
 
@@ -90,6 +99,30 @@ ping_enabled     = true    # ping the default gateway on the proc interval
 
 # Pressure stall information
 # psi_warn_pct   = 40      # warn when some-avg10 pressure ≥ this % (0 = off)
+
+# Rate-based (predictive) alerts. A level threshold cannot tell a pack
+# discharging over eight hours from one dumping in twenty minutes; these fire
+# on the slope, while there is still time to act. 0 disables each.
+batt_drain_warn_pct_h    = 25   # discharging faster than this %/hour warns
+disk_full_warn_hours     = 6    # warn when a filesystem is this many hours from full
+temp_rise_warn_c_per_min = 3    # warn when a sensor climbs this fast
+
+# Temperature thresholds are seeded from the kernel's own thermal trip points
+# unless temp_warn/temp_hot/temp_crit are set above. The built-in 50/65/80
+# suits a Raspberry Pi (which throttles at 80 °C) and is wrong by tens of
+# degrees elsewhere.
+temp_from_trip_points = true
+
+# WWAN modem (uConsole 4G board) via ModemManager. Off by default: it shells
+# out to mmcli on the slow tick.
+# modem_enabled  = true
+
+# History, limits and output paths
+history_len    = 200     # sparkline ring-buffer length
+procs_cap      = 200     # process rows rendered
+# report_dir   = "~/reports"             # where `w` writes snapshots (default: ~)
+# history_file = "~/.cache/ucmon/history.json"  # keep sparklines across restarts
+# metrics_listen = ":9100"               # also serve Prometheus metrics from the TUI
 ```
 
 Intervals accept a Go duration (`"500ms"`, `"2s"`) or a bare number of seconds.
@@ -144,7 +177,9 @@ make help               # list all targets
 | `shift+tab` / `←`  | Previous tab                 |
 | `1` – `8`          | Jump to tab                  |
 | `?`                | Help overlay (all bindings)  |
-| `space`            | Pause / resume sampling      |
+| `space`            | Pause / resume sampling (alerts keep running) |
+| `z`                | Expand a metric to a full-screen graph |
+| `Z`                | Reset session peaks          |
 | `w`                | Write snapshot report to `~/ucmon-report-*.txt` |
 | `g`                | Cycle cpufreq governor (CPU tab) |
 | `+` / `-`          | Adjust backlight (GPU tab)    |
@@ -155,7 +190,7 @@ make help               # list all targets
 | `esc`              | Cancel search / kill / close overlay |
 | `ctrl+u`           | Clear search filter          |
 | `↑` `↓` PgUp/PgDn  | Move cursor (procs) / scroll |
-| `s`                | Cycle process sort (CPU/MEM/PID/NAME) |
+| `s`                | Cycle process sort (CPU/MEM/I-O/PID/NAME) |
 | `t`                | Toggle process tree / flat view |
 | `k` / `K`          | SIGTERM / SIGKILL selected process (confirm with `y`) |
 | `j` / `k`          | Select interface (network tab) |
@@ -163,6 +198,8 @@ make help               # list all targets
 | `ctrl+c`           | Quit                         |
 
 In the process detail view: `+`/`-` renice, `p` SIGSTOP, `c` SIGCONT, `k`/`K` kill, `esc` close.
+
+In the expanded graph (`z`): `←`/`→` (or `j`/`k`) step between metrics, `z`/`esc` closes.
 
 ## Refresh Intervals
 
@@ -177,6 +214,7 @@ In the process detail view: `+`/`-` renice, `p` SIGSTOP, `c` SIGCONT, `k`/`K` ki
 | Disk usage/IO   | 5s       |
 | Battery/throttle| 5s       |
 | WiFi `iw` details | 5s     |
+| Storage wear / modem | 5s  |
 
 ## Target Platforms
 

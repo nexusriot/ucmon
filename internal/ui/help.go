@@ -15,17 +15,23 @@ var helpSections = []struct {
 	{"Global", [][2]string{
 		{"tab / → , shift+tab / ←", "next / previous tab"},
 		{"1–8", "jump to tab"},
-		{"space", "pause / resume sampling"},
+		{"space", "pause sampling (alerts keep running)"},
+		{"z", "expand a metric to a full-screen graph"},
+		{"Z", "reset session peaks"},
 		{"w", "write snapshot report"},
 		{"?", "toggle this help"},
 		{"ctrl+c", "quit"},
+	}},
+	{"Expanded graph (z)", [][2]string{
+		{"← → / j k", "previous / next metric"},
+		{"z / esc / q", "close"},
 	}},
 	{"CPU tab", [][2]string{
 		{"g", "cycle cpufreq governor"},
 	}},
 	{"Processes tab", [][2]string{
 		{"↑ ↓ pgup pgdn home end", "move cursor"},
-		{"s", "cycle sort (CPU/MEM/PID/NAME)"},
+		{"s", "cycle sort (CPU/MEM/I-O/PID/NAME)"},
 		{"t", "toggle tree view"},
 		{"enter", "open process details"},
 		{"k / K", "SIGTERM / SIGKILL (y confirms)"},

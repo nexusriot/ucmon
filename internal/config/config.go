@@ -27,6 +27,17 @@ type Config struct {
 	TempHot  float64 // °C, orange threshold
 	TempCrit float64 // °C, red threshold
 
+	// TempExplicit records that the config file set a temperature threshold
+	// by hand, which switches off the trip-point calibration below. Without
+	// it there is no way to tell "the user wants 80" from "nobody said".
+	TempExplicit bool
+
+	// TempFromTripPoints seeds the thresholds from the kernel's own thermal
+	// trip points when the config names none. The built-in 50/65/80 suits a
+	// Raspberry Pi, whose firmware throttles at 80 °C, and is wrong by tens
+	// of degrees on anything else.
+	TempFromTripPoints bool
+
 	BacklightStep   int    // percent change per +/- keypress
 	BacklightDevice string // optional /sys/class/backlight device override
 
@@ -63,6 +74,23 @@ type Config struct {
 
 	// PSI pressure alert: warn when some avg10 ≥ this %% for cpu/mem/io (0 = off).
 	PSIWarnPct float64
+
+	// Rate-based (predictive) alerts. A level threshold cannot tell a slow
+	// drift from a fast one; these fire on the slope, while there is still
+	// time to act. 0 disables each.
+	BattDrainWarnPctH   float64 // discharge faster than this %%/hour warns
+	DiskFullWarnHours   float64 // warn when a filesystem is this many hours from full
+	TempRiseWarnCPerMin float64 // warn when a sensor climbs this fast
+
+	// Storage wear + WWAN modem polling.
+	ModemEnabled bool // poll ModemManager on the slow interval
+
+	// History and UI constants that were fixed in source.
+	HistoryLen    int    // sparkline ring-buffer length
+	ProcsCap      int    // process rows rendered
+	ReportDir     string // where "w" writes snapshot reports
+	HistoryFile   string // persist sparkline history here ("" = off)
+	MetricsListen string // Prometheus exporter address, e.g. ":9100" ("" = off)
 }
 
 // Default returns the built-in configuration used when no file is present.
@@ -77,6 +105,8 @@ func Default() Config {
 		TempCrit:      80,
 		BacklightStep: 10,
 
+		TempFromTripPoints: true,
+
 		AlertsEnabled:  true,
 		MemWarnPct:     90,
 		SwapWarnPct:    50,
@@ -90,6 +120,13 @@ func Default() Config {
 		AlertBell:       true,
 
 		PingEnabled: true,
+
+		BattDrainWarnPctH:   25,
+		DiskFullWarnHours:   6,
+		TempRiseWarnCPerMin: 3,
+
+		HistoryLen: 200,
+		ProcsCap:   200,
 	}
 }
 
@@ -199,15 +236,20 @@ func apply(cfg *Config, key, val string) {
 	case "temp_warn", "tempwarn":
 		if f, err := strconv.ParseFloat(val, 64); err == nil {
 			cfg.TempWarn = f
+			cfg.TempExplicit = true
 		}
 	case "temp_hot", "temphot":
 		if f, err := strconv.ParseFloat(val, 64); err == nil {
 			cfg.TempHot = f
+			cfg.TempExplicit = true
 		}
 	case "temp_crit", "tempcrit":
 		if f, err := strconv.ParseFloat(val, 64); err == nil {
 			cfg.TempCrit = f
+			cfg.TempExplicit = true
 		}
+	case "temp_from_trip_points", "tempfromtrippoints", "temp_auto":
+		cfg.TempFromTripPoints = parseBool(val, cfg.TempFromTripPoints)
 	case "backlight_step", "backlightstep":
 		if n, err := strconv.Atoi(val); err == nil {
 			cfg.BacklightStep = n
@@ -276,6 +318,34 @@ func apply(cfg *Config, key, val string) {
 		if f, err := strconv.ParseFloat(val, 64); err == nil {
 			cfg.PSIWarnPct = f
 		}
+	case "batt_drain_warn_pct_h", "battdrainwarnpcth", "batt_drain_warn":
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			cfg.BattDrainWarnPctH = f
+		}
+	case "disk_full_warn_hours", "diskfullwarnhours", "disk_full_warn":
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			cfg.DiskFullWarnHours = f
+		}
+	case "temp_rise_warn_c_per_min", "temprisewarncpermin", "temp_rise_warn":
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			cfg.TempRiseWarnCPerMin = f
+		}
+	case "modem_enabled", "modemenabled", "modem":
+		cfg.ModemEnabled = parseBool(val, cfg.ModemEnabled)
+	case "history_len", "historylen", "spark_history":
+		if n, err := strconv.Atoi(val); err == nil {
+			cfg.HistoryLen = n
+		}
+	case "procs_cap", "procscap", "proc_display_cap":
+		if n, err := strconv.Atoi(val); err == nil {
+			cfg.ProcsCap = n
+		}
+	case "report_dir", "reportdir", "snapshot_dir":
+		cfg.ReportDir = expandHome(val)
+	case "history_file", "historyfile":
+		cfg.HistoryFile = expandHome(val)
+	case "metrics_listen", "metricslisten", "metrics":
+		cfg.MetricsListen = val
 	}
 }
 
@@ -384,6 +454,32 @@ func (c *Config) Sanitize() {
 	}
 	if c.PSIWarnPct > 100 {
 		c.PSIWarnPct = 100
+	}
+
+	// A negative rate threshold would fire on every reading; 0 means off.
+	if c.BattDrainWarnPctH < 0 {
+		c.BattDrainWarnPctH = 0
+	}
+	if c.DiskFullWarnHours < 0 {
+		c.DiskFullWarnHours = 0
+	}
+	if c.TempRiseWarnCPerMin < 0 {
+		c.TempRiseWarnCPerMin = 0
+	}
+
+	// History shorter than a sparkline is wide draws nothing; absurdly long
+	// costs memory per interface, sensor and core for no visible gain.
+	if c.HistoryLen < 10 {
+		c.HistoryLen = 10
+	}
+	if c.HistoryLen > 5000 {
+		c.HistoryLen = 5000
+	}
+	if c.ProcsCap < 10 {
+		c.ProcsCap = 10
+	}
+	if c.ProcsCap > 10000 {
+		c.ProcsCap = 10000
 	}
 }
 

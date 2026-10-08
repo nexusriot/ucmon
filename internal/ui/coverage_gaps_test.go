@@ -101,15 +101,15 @@ func TestInitDispatchesEveryProbe(t *testing.T) {
 	}
 
 	withPing := NewModel(config.Default())
-	if got := batchLen(withPing.Init()); got != 11 {
-		t.Errorf("Init dispatched %d commands with ping enabled, want 11", got)
+	if got := batchLen(withPing.Init()); got != 12 {
+		t.Errorf("Init dispatched %d commands with ping enabled, want 12", got)
 	}
 
 	cfg := config.Default()
 	cfg.PingEnabled = false
 	noPing := NewModel(cfg)
-	if got := batchLen(noPing.Init()); got != 10 {
-		t.Errorf("Init dispatched %d commands with ping disabled, want 10", got)
+	if got := batchLen(noPing.Init()); got != 11 {
+		t.Errorf("Init dispatched %d commands with ping disabled, want 11", got)
 	}
 	if noPing.latSampler != nil {
 		t.Error("ping_enabled = false still built a latency sampler")

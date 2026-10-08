@@ -336,6 +336,32 @@ func (m Model) currentAlertConds() map[string]alertCond {
 		}
 	}
 
+	// Storage wear. A card at 90% of its rated write endurance looks perfect
+	// in every throughput and usage reading right up to the day it goes
+	// read-only, so this is the one condition nothing else can hint at.
+	for _, h := range m.storage {
+		switch h.Severity() {
+		case 2:
+			conds["storage:"+h.Device] = alertCond{sevCrit, storageAlertMsg(h)}
+		case 1:
+			conds["storage:"+h.Device] = alertCond{sevWarn, storageAlertMsg(h)}
+		}
+	}
+
+	// Modem link. Only meaningful once the user has asked for modem polling.
+	if c.ModemEnabled && m.modem.Present && !m.modem.Registered() {
+		msg := fmt.Sprintf("modem not registered (%s)", m.modem.State)
+		if m.modem.FailedReason != "" {
+			msg += ": " + m.modem.FailedReason
+		}
+		conds["modem"] = alertCond{sevWarn, msg}
+	}
+
+	// Rate-based conditions. A level threshold cannot tell a pack discharging
+	// over eight hours from one dumping in twenty minutes; a slope can, and
+	// it fires while there is still time to act on it.
+	m.trendConds(conds)
+
 	// PSI pressure ("some" share of the last 10s).
 	if c.PSIWarnPct > 0 && m.psi.Present {
 		for _, res := range []struct {
@@ -350,6 +376,86 @@ func (m Model) currentAlertConds() map[string]alertCond {
 	}
 
 	return conds
+}
+
+// storageAlertMsg describes why a device is failing its health check, in the
+// terms the device itself reports.
+func storageAlertMsg(h probe.StorageHealth) string {
+	switch {
+	case h.ReadOnly:
+		return fmt.Sprintf("%s (%s) has gone read-only — the controller retired it", h.Device, h.Kind)
+	case h.PreEOL == 3:
+		return fmt.Sprintf("%s (%s) reserve blocks exhausted — replace it", h.Device, h.Kind)
+	case h.PreEOL == 2:
+		return fmt.Sprintf("%s (%s) reserve blocks 80%% used", h.Device, h.Kind)
+	}
+	if pct, ok := h.WearPct(); ok {
+		return fmt.Sprintf("%s (%s) at %.0f%% of rated write endurance", h.Device, h.Kind, pct)
+	}
+	return fmt.Sprintf("%s (%s) reports degraded health", h.Device, h.Kind)
+}
+
+// trendConds adds the predictive conditions: where a reading is heading and
+// how soon it gets there.
+func (m Model) trendConds(conds map[string]alertCond) {
+	c := m.cfg
+
+	// A battery draining fast enough to matter, while there is still charge
+	// to act on. The flat batt_low_pct alert only speaks once it is nearly
+	// too late.
+	if c.BattDrainWarnPctH > 0 {
+		b := m.powerSnap.Battery
+		if b.Present && b.Capacity >= 0 && b.Status != "Charging" && b.Status != "Full" {
+			if perHour, ok := m.trends.rate("batt"); ok && -perHour >= c.BattDrainWarnPctH {
+				msg := fmt.Sprintf("battery draining %.0f%%/h", -perHour)
+				if eta, ok := m.trends.etaTo("batt", float64(b.Capacity), 0); ok {
+					msg += fmt.Sprintf(" — empty in %s", humanETA(eta))
+				}
+				conds["batt:rate"] = alertCond{sevWarn, msg}
+			}
+		}
+	}
+
+	// A filesystem filling fast enough to run out within the horizon. On a
+	// 16 GB card the gap between "90% full" and "full" can be minutes.
+	if c.DiskFullWarnHours > 0 {
+		for _, d := range m.disks {
+			if d.FSType == "squashfs" || d.UsedPct >= 100 {
+				continue
+			}
+			key := "disk:" + d.MountPoint
+			eta, ok := m.trends.etaTo(key, d.UsedPct, 100)
+			if !ok || eta.Hours() > c.DiskFullWarnHours {
+				continue
+			}
+			sev := sevWarn
+			if eta < time.Hour {
+				sev = sevCrit
+			}
+			conds["diskfill:"+d.MountPoint] = alertCond{sev,
+				fmt.Sprintf("%s filling — full in %s (now %.0f%%)", d.MountPoint, humanETA(eta), d.UsedPct)}
+		}
+	}
+
+	// A sensor climbing toward its own critical threshold. Catches a failed
+	// fan or a blocked vent before the throttle flags do.
+	if c.TempRiseWarnCPerMin > 0 {
+		for _, t := range m.cpuSnap.Temperatures {
+			perHour, ok := m.trends.rate("temp:" + t.Label)
+			if !ok {
+				continue
+			}
+			perMin := perHour / 60
+			if perMin < c.TempRiseWarnCPerMin || t.Temp >= c.TempCrit {
+				continue // already-critical sensors are the level alert's job
+			}
+			msg := fmt.Sprintf("%s rising %.1f°C/min (now %.0f°C)", t.Label, perMin, t.Temp)
+			if eta, ok := m.trends.etaTo("temp:"+t.Label, t.Temp, c.TempCrit); ok {
+				msg += fmt.Sprintf(" — %.0f°C in %s", c.TempCrit, humanETA(eta))
+			}
+			conds["temprise:"+t.Label] = alertCond{sevWarn, msg}
+		}
+	}
 }
 
 // lossPct is the failure share of a ping success/failure window, in percent.

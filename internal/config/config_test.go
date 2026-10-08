@@ -372,3 +372,93 @@ func TestPathWithNoHome(t *testing.T) {
 		t.Error("an empty path did not fall back to the defaults")
 	}
 }
+
+func TestLoadRateAndExporterKeys(t *testing.T) {
+	path := writeConfig(t, `
+batt_drain_warn_pct_h = 40
+disk_full_warn_hours  = 3
+temp_rise_warn_c_per_min = 1.5
+modem_enabled   = true
+history_len     = 400
+procs_cap       = 50
+report_dir      = "/tmp/reports"
+history_file    = "/tmp/hist.json"
+metrics_listen  = ":9100"
+temp_from_trip_points = false
+`)
+	cfg := LoadFrom(path)
+
+	if cfg.BattDrainWarnPctH != 40 {
+		t.Errorf("BattDrainWarnPctH = %v", cfg.BattDrainWarnPctH)
+	}
+	if cfg.DiskFullWarnHours != 3 {
+		t.Errorf("DiskFullWarnHours = %v", cfg.DiskFullWarnHours)
+	}
+	if cfg.TempRiseWarnCPerMin != 1.5 {
+		t.Errorf("TempRiseWarnCPerMin = %v", cfg.TempRiseWarnCPerMin)
+	}
+	if !cfg.ModemEnabled {
+		t.Error("ModemEnabled not set")
+	}
+	if cfg.HistoryLen != 400 || cfg.ProcsCap != 50 {
+		t.Errorf("HistoryLen/ProcsCap = %d/%d", cfg.HistoryLen, cfg.ProcsCap)
+	}
+	if cfg.ReportDir != "/tmp/reports" || cfg.HistoryFile != "/tmp/hist.json" {
+		t.Errorf("paths = %q / %q", cfg.ReportDir, cfg.HistoryFile)
+	}
+	if cfg.MetricsListen != ":9100" {
+		t.Errorf("MetricsListen = %q", cfg.MetricsListen)
+	}
+	if cfg.TempFromTripPoints {
+		t.Error("temp_from_trip_points = false was not honoured")
+	}
+}
+
+// Setting any temperature threshold by hand must switch off the trip-point
+// calibration, or the config would be silently overwritten.
+func TestTempExplicitMarksAHandWrittenThreshold(t *testing.T) {
+	if cfg := LoadFrom(writeConfig(t, "temp_crit = 70\n")); !cfg.TempExplicit {
+		t.Error("temp_crit did not mark the thresholds as explicit")
+	}
+	if cfg := LoadFrom(writeConfig(t, "temp_warn = 45\n")); !cfg.TempExplicit {
+		t.Error("temp_warn did not mark the thresholds as explicit")
+	}
+	if cfg := LoadFrom(writeConfig(t, "mem_warn_pct = 80\n")); cfg.TempExplicit {
+		t.Error("an unrelated key marked the thresholds as explicit")
+	}
+	if !Default().TempFromTripPoints {
+		t.Error("trip-point calibration should be on by default")
+	}
+}
+
+func TestSanitizeClampsNewKeys(t *testing.T) {
+	cfg := Default()
+	cfg.BattDrainWarnPctH = -5
+	cfg.DiskFullWarnHours = -1
+	cfg.TempRiseWarnCPerMin = -2
+	cfg.HistoryLen = 2
+	cfg.ProcsCap = 0
+	cfg.Sanitize()
+
+	if cfg.BattDrainWarnPctH != 0 || cfg.DiskFullWarnHours != 0 || cfg.TempRiseWarnCPerMin != 0 {
+		t.Errorf("negative rate thresholds survived: %+v", cfg)
+	}
+	if cfg.HistoryLen < 10 {
+		t.Errorf("HistoryLen = %d, want a usable floor", cfg.HistoryLen)
+	}
+	if cfg.ProcsCap < 10 {
+		t.Errorf("ProcsCap = %d, want a usable floor", cfg.ProcsCap)
+	}
+
+	// A history longer than the ring is ever read from costs memory per
+	// interface, sensor and core for nothing.
+	cfg.HistoryLen = 1 << 20
+	cfg.ProcsCap = 1 << 20
+	cfg.Sanitize()
+	if cfg.HistoryLen > 5000 {
+		t.Errorf("HistoryLen = %d, want a ceiling", cfg.HistoryLen)
+	}
+	if cfg.ProcsCap > 10000 {
+		t.Errorf("ProcsCap = %d, want a ceiling", cfg.ProcsCap)
+	}
+}

@@ -155,7 +155,7 @@ jobs:
           test "$(./ucmon --version)" = "ucmon $(make version)"
           # flag.PrintDefaults prints single-dash names, so match on those.
           ./ucmon --help 2>&1 | tee /dev/stderr | grep -q -- '-once'
-          for flag in -config -tab -version; do
+          for flag in -config -tab -version -json -metrics; do
             ./ucmon --help 2>&1 | grep -q -- "$flag"
           done
 
@@ -187,6 +187,44 @@ jobs:
           ./ucmon --config ci.toml --tab power --once >/dev/null
           ./ucmon --config ci.toml --tab nonsense --once >/dev/null
 
+      - name: --once --json is valid, machine-readable JSON
+        run: |
+          set -eu
+          ./ucmon --config ci.toml --once --json > snap.json
+          python3 -c '
+          import json, sys
+          d = json.load(open("snap.json"))
+          for key in ("version", "timestamp", "cpu", "memory", "load", "session_peaks", "active_alerts"):
+              assert key in d, "missing key: " + key
+          assert isinstance(d["cpu"]["total_pct"], (int, float)), d["cpu"]
+          assert isinstance(d["active_alerts"], list), d["active_alerts"]
+          # ping_enabled = false must leave the latency block out here too.
+          assert not d.get("latency"), d.get("latency")
+          print("json ok:", sorted(d))
+          '
+
+      - name: --metrics serves a scrapeable endpoint
+        run: |
+          set -eu
+          ./ucmon --config ci.toml --metrics :19100 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          # Wait for the listener rather than sleeping a guessed interval.
+          for _ in $(seq 1 50); do
+            curl -fsS localhost:19100/healthz >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+          curl -fsS localhost:19100/metrics > metrics.txt
+          tee /dev/stderr < metrics.txt | head -20
+          for metric in ucmon_cpu_usage_percent ucmon_memory_used_percent ucmon_load1 ucmon_alerts_active; do
+            grep -q "^${metric}" metrics.txt || { echo "missing metric: $metric"; exit 1; }
+          done
+          # Every sample must be preceded by its TYPE, or a scrape rejects the
+          # whole document.
+          grep -q '^# TYPE ucmon_cpu_usage_percent gauge' metrics.txt
+          curl -fsS localhost:19100/snapshot | python3 -c 'import json,sys; json.load(sys.stdin)'
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:19100/nope)" = 404
+
       - name: Unknown flags and bad configs fail or degrade cleanly
         run: |
           set -eu
@@ -196,3 +234,13 @@ jobs:
           # An unparseable file must not prevent startup either.
           printf 'this is not toml\n= nonsense\n' > junk.toml
           ./ucmon --config junk.toml --once >/dev/null
+          # --metrics on an occupied port must report the failure, not start
+          # silently and serve nothing.
+          ./ucmon --metrics :19101 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            curl -fsS localhost:19101/healthz >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+          ! ./ucmon --metrics :19101 2>/dev/null

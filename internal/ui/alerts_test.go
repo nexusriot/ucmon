@@ -165,6 +165,9 @@ func TestLossPct(t *testing.T) {
 
 func TestCurrentAlertCondsClassicConditions(t *testing.T) {
 	cfg := config.Default()
+	// Pin the thresholds: without this the model would calibrate them from
+	// whatever thermal trip points the host running the tests declares.
+	cfg.TempExplicit = true
 	m := NewModel(cfg)
 
 	m.cpuSnap = probe.CPUSnapshot{

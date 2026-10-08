@@ -17,9 +17,15 @@ func (m Model) exportSnapshot() (string, error) {
 	now := time.Now()
 	report := m.buildReport(now)
 
-	dir, err := os.UserHomeDir()
-	if err != nil || dir == "" {
-		dir = "."
+	dir := m.cfg.ReportDir
+	if dir == "" {
+		var err error
+		if dir, err = os.UserHomeDir(); err != nil || dir == "" {
+			dir = "."
+		}
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
 	}
 	path := filepath.Join(dir, fmt.Sprintf("ucmon-report-%s.txt", now.Format("20060102-150405")))
 	if err := os.WriteFile(path, []byte(report), 0o644); err != nil {
@@ -39,6 +45,13 @@ func (m Model) buildReport(now time.Time) string {
 	fmt.Fprintf(&b, "  total          %.1f%%\n", m.cpuSnap.TotalPercent)
 	for i, p := range m.cpuSnap.PerCorePercent {
 		fmt.Fprintf(&b, "  core %-2d        %.1f%%\n", i, p)
+	}
+	if bd := m.cpuSnap.Breakdown; bd.Valid {
+		fmt.Fprintf(&b, "  time           user %.0f%%  sys %.0f%%  nice %.0f%%  iowait %.0f%%  irq %.0f%%  steal %.0f%%  idle %.0f%%\n",
+			bd.User, bd.System, bd.Nice, bd.Iowait, bd.IRQ, bd.Steal, bd.Idle)
+		if bd.Busiest != "" {
+			fmt.Fprintf(&b, "  busiest        %s\n", bd.Busiest)
+		}
 	}
 	if len(m.cpuSnap.Temperatures) > 0 {
 		b.WriteString("  temperatures:\n")
@@ -94,7 +107,11 @@ func (m Model) buildReport(now time.Time) string {
 		p.Load.Load1, p.Load.Load5, p.Load.Load15, p.Load.CPUCount)
 	if p.Battery.Present {
 		bat := p.Battery
-		line := fmt.Sprintf("  battery        %d%% %s", bat.Capacity, bat.Status)
+		charge := "n/a"
+		if bat.Capacity >= 0 {
+			charge = fmt.Sprintf("%d%%", bat.Capacity)
+		}
+		line := fmt.Sprintf("  battery        %s %s", charge, bat.Status)
 		if bat.PowerW > 0 {
 			line += fmt.Sprintf(", %.1f W", bat.PowerW)
 		}
@@ -123,6 +140,26 @@ func (m Model) buildReport(now time.Time) string {
 		b.WriteString("\n")
 	}
 
+	if len(m.storage) > 0 {
+		b.WriteString("Storage health\n")
+		for _, h := range m.storage {
+			line := fmt.Sprintf("  %-10s %-5s %-18s", h.Device, h.Kind, trunc(h.Name, 18))
+			if pct, ok := h.WearPct(); ok {
+				line += fmt.Sprintf(" wear %3.0f%%", pct)
+			} else {
+				line += " wear n/a "
+			}
+			if lbl := h.EOLLabel(); lbl != "" {
+				line += "  reserve " + lbl
+			}
+			if h.ReadOnly {
+				line += "  READ-ONLY"
+			}
+			b.WriteString(line + "\n")
+		}
+		b.WriteString("\n")
+	}
+
 	up := m.upIfaces()
 	if len(up) > 0 {
 		b.WriteString("Network\n")
@@ -134,6 +171,25 @@ func (m Model) buildReport(now time.Time) string {
 				if link, ok := m.iwLinks[ii.Name]; ok && link.SSID != "" {
 					line += fmt.Sprintf("  ssid %q ch %d", link.SSID, link.Channel)
 				}
+			}
+			if n := ii.BadFramesTotal(); n > 0 {
+				line += fmt.Sprintf("  err/drop %d", n)
+			}
+			b.WriteString(line + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	if m.modem.Present {
+		b.WriteString("Modem\n")
+		fmt.Fprintf(&b, "  state          %s\n", m.modem.State)
+		if m.modem.Operator != "" {
+			fmt.Fprintf(&b, "  operator       %s (%s)\n", m.modem.Operator, m.modem.AccessTech)
+		}
+		if m.modem.SignalPct >= 0 {
+			line := fmt.Sprintf("  signal         %d%%", m.modem.SignalPct)
+			if m.modem.HasRSSI {
+				line += fmt.Sprintf("  %.0f dBm", m.modem.RSSIdBm)
 			}
 			b.WriteString(line + "\n")
 		}
@@ -164,10 +220,14 @@ func (m Model) buildReport(now time.Time) string {
 			ps = ps[:10]
 		}
 		b.WriteString("Top processes (CPU)\n")
-		fmt.Fprintf(&b, "  %-7s %-18s %7s %7s\n", "PID", "NAME", "CPU%", "MEM%")
+		fmt.Fprintf(&b, "  %-7s %-18s %7s %7s %12s\n", "PID", "NAME", "CPU%", "MEM%", "DISK I/O")
 		for _, pr := range ps {
-			fmt.Fprintf(&b, "  %-7d %-18s %6.1f%% %6.1f%%\n",
-				pr.PID, trunc(pr.Name, 18), pr.CPUPct, pr.MemPct)
+			io := "-"
+			if pr.IOKnown {
+				io = probe.HumanBytesPerSec(pr.IOReadBps + pr.IOWriteBps)
+			}
+			fmt.Fprintf(&b, "  %-7d %-18s %6.1f%% %6.1f%% %12s\n",
+				pr.PID, trunc(pr.Name, 18), pr.CPUPct, pr.MemPct, io)
 		}
 		b.WriteString("\n")
 	}

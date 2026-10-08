@@ -3,6 +3,7 @@ package probe
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -130,7 +131,7 @@ echo "        tx bitrate: 390.0 MBit/s VHT-MCS 8"
 `)
 	fakeWireless(t, "wlan0")
 
-	links := ReadIWLinks()
+	links := ReadIWLinks(nil)
 	l, ok := links["wlan0"]
 	if !ok {
 		t.Fatalf("no link for wlan0, got %+v", links)
@@ -149,7 +150,7 @@ func TestReadIWLinksNotConnected(t *testing.T) {
 	fakeIW(t, "#!/bin/sh\necho \"Not connected.\"\n")
 	fakeWireless(t, "wlan0")
 
-	if links := ReadIWLinks(); len(links) != 0 {
+	if links := ReadIWLinks(nil); len(links) != 0 {
 		t.Errorf("an unassociated interface produced %+v", links)
 	}
 }
@@ -164,7 +165,7 @@ echo "        SSID: OnlyOne"
 `)
 	fakeWireless(t, "wlan0", "wlan1")
 
-	links := ReadIWLinks()
+	links := ReadIWLinks(nil)
 	if _, bad := links["wlan1"]; bad {
 		t.Error("a failing iw invocation still produced a link")
 	}
@@ -178,7 +179,7 @@ func TestReadIWLinksNoWirelessInterfaces(t *testing.T) {
 	fakeIW(t, "#!/bin/sh\nexit 99\n")
 	fakeWireless(t)
 
-	if links := ReadIWLinks(); len(links) != 0 {
+	if links := ReadIWLinks(nil); len(links) != 0 {
 		t.Errorf("got %+v, want no links", links)
 	}
 }
@@ -191,7 +192,48 @@ func TestIwBinPathAbsent(t *testing.T) {
 	if got := iwBinPath(); got != "" {
 		t.Errorf("iwBinPath = %q with no iw anywhere", got)
 	}
-	if links := ReadIWLinks(); len(links) != 0 {
+	if links := ReadIWLinks(nil); len(links) != 0 {
 		t.Errorf("ReadIWLinks without iw returned %+v", links)
+	}
+}
+
+// An interface hidden by net_ignore must not cost a fork and a 2s timeout on
+// every slow tick just to have its answer discarded by the UI filter.
+func TestReadIWLinksSkipsFilteredInterfaces(t *testing.T) {
+	dir := t.TempDir()
+	wl := filepath.Join(dir, "wireless")
+	body := "Inter-| sta-|   Quality\n face | tus | link\n" +
+		" wlan0: 0000   65.  -45.  -256\n wlan1: 0000   40.  -70.  -256\n"
+	if err := os.WriteFile(wl, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A stub iw that records which interfaces it was asked about.
+	calls := filepath.Join(dir, "calls")
+	stub := filepath.Join(dir, "iw")
+	script := "#!/bin/sh\necho \"$2\" >> " + calls + "\n" +
+		"printf '%s\\n' 'Connected to aa:bb:cc:dd:ee:ff (on '\"$2\"')' '	SSID: Net'\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	origW, origI := wirelessPath, iwPaths
+	wirelessPath, iwPaths = wl, []string{stub}
+	defer func() { wirelessPath, iwPaths = origW, origI }()
+
+	links := ReadIWLinks(func(name string) bool { return name == "wlan0" })
+	if _, ok := links["wlan1"]; ok {
+		t.Error("a filtered interface was queried and returned")
+	}
+	if _, ok := links["wlan0"]; !ok {
+		t.Fatal("the kept interface was not queried")
+	}
+
+	got, err := os.ReadFile(calls)
+	if err != nil {
+		t.Fatalf("stub iw was never run: %v", err)
+	}
+	if strings.Contains(string(got), "wlan1") {
+		t.Errorf("iw was forked for a filtered interface (calls: %q)", got)
 	}
 }
