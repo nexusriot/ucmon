@@ -3,6 +3,94 @@
 Planned work and known limitations, roughly in priority order. See
 [DESIGN.md](DESIGN.md) for how the current features are built.
 
+## Shipped in 0.11.0
+
+The two "explain yourself" items: ucmon degrades gracefully in a dozen
+places, and until now every one of them looked the same from the outside.
+
+**`ucmon doctor`** (also `--doctor`) checks every source ucmon reads and
+prints it as present, absent, denied or read-only, with what it found, which
+rows go missing without it, and how to get it: thermal sensors, cpufreq
+policies and the writability of `scaling_governor`, `/proc/pressure`,
+`/proc/<pid>/io` beyond this user's own processes, the battery and its
+`*_full_design` counters, `vcgencmd`, the backlight, `iw`, `mmcli`,
+unprivileged ICMP (`net.ipv4.ping_group_range`) and the eMMC `life_time` /
+`pre_eol_info` registers. For the two writable sources it prints the exact
+udev rule, exported as `probe.GovernorUdevRule` / `probe.BacklightUdevRule`
+so the test asserts the same text the user pastes.
+
+Each check lives in the probe file that already owns the sampling — a check
+that reads the same files, in the same package, cannot drift from the
+behaviour it explains — and `internal/ui/doctor.go` only formats. The report
+needs no privileges, writes nothing and always exits 0: an absent source is a
+fact about the board, not an error. It closes with the config settings that
+suppress a reading the host could otherwise produce (`ping_enabled`,
+`modem_enabled`, `alerts_enabled`, the ignore globs), which is the half of
+"why is that empty" no capability check can see.
+
+**Unrecognised config keys are reported.** `apply` ignored anything it did not
+know, so `temp_warnn = 90` did nothing and never said so. `LoadFrom` now
+collects what `apply` refused — key plus line number, deduplicated, and only
+for lines that carry a key at all, since `[section]` headers, comments and
+malformed lines are skipped before `apply` sees them. `ucmon --check-config`
+lists them and exits non-zero so a provisioning script can gate on it; the TUI
+names them in a one-line startup notice; `doctor` repeats them in its config
+section. They stay non-fatal everywhere else by design: a config written for a
+newer ucmon has to keep working, and `--config junk.toml --once` still
+produces a report.
+
+## Shipped in 0.10.1
+
+A correctness round: five findings, all reproduced on a real host before they
+were fixed.
+
+**The exporter and the monitor were sampling each other.** `metrics_listen`
+runs the Prometheus exporter on its own goroutine beside the TUI, and both
+went through `gopsutil`'s `cpu.Percent(0, …)`, which keeps its baseline in a
+package global. Every scrape re-primed the baseline the monitor was about to
+diff against, so the frame after a scrape reported the exporter's 600 ms
+priming window instead of the second it claimed — or 0% outright, when the two
+calls landed close enough together that the busy counters had not moved.
+`probe.CPUSampler` now owns its baseline, like the net, disk and process
+samplers already did, and reads `/proc/stat` directly: two reads per tick
+rather than three, and the aggregate, per-core and time-breakdown figures all
+come out of one pair of readings. The same configuration was also a **data
+race**: `NewModel` applies the temperature thresholds to process-wide
+variables, the exporter calls it per scrape, and the renderer reads them every
+frame. `go test -race` reports it; the thresholds are now mutex-guarded.
+
+**Per-partition disk I/O was wrong, and absent on LVM.** `/proc/diskstats`
+carries a row per partition as well as per disk, but the mount→counter lookup
+stripped the partition suffix before looking anything up. Every partition of a
+device therefore reported the *whole disk's* rate — `/boot` and `/boot/efi`
+came out identical and far too large — and the names that end in a device
+index rather than a partition number were mangled into devices that do not
+exist: `/dev/dm-0` became `dm-`, `/dev/mmcblk0` became `mmcblk`. A root
+filesystem on LVM or dm-crypt reported no disk I/O at all. The exact device
+name is tried first now; the stripped base survives only as a fallback.
+
+**The alert banner picked a different alert every frame.** Active conditions
+live in a map and `summary()` took the first of the most severe ones, so a
+host with four sensors over `temp_hot` cycled the footer between their
+messages several times a second. The tie-break is now the message, which is
+also the order the Alerts tab lists them in, so the banner names the condition
+at the top of that list.
+
+**cpufreq policies sorted as text.** `policy10` and `policy11` landed between
+`policy1` and `policy2` on any board with ten or more frequency domains — one
+policy on a Pi, twenty-two on a modern laptop — in the CPU tab, the snapshot
+report and the expanded-graph cycle alike. Thermal zones already had a numeric
+sort for exactly this; the fallback sensor walk now uses it too.
+
+**The connection table misaligned after a resize.** `WindowSizeMsg` rebuilt the
+header but not the rows, which carry the same column widths, so the table sat
+crooked until the next socket walk — up to `proc_interval` later.
+
+Plus: `ucmon_filesystem_free_bytes` reported `total - used`, which includes the
+root-reserved blocks and so disagreed with the free space the Disk tab and the
+JSON snapshot show; and the `AC` row in the text report was one column short of
+the block it sits in.
+
 ## Shipped in 0.10.0
 
 A review round: six correctness/performance findings, then the whole Tier 1-3
@@ -66,11 +154,45 @@ process CPU% and disk I/O rates; first test suite (57 tests).
 
 ## Next up
 
-- **Metrics logging** — `--log <file.csv>` appending one row per fast tick for
-  later graphing. Partly superseded by the Prometheus exporter and `--json`
-  (0.10.0), so the remaining case is the host with no scraper: a plain file
-  something else rotates and plots afterwards. JSONL is the better shape now
-  that `SnapshotJSON` exists.
+- **Per-mount disk I/O on the Disk tab.** The mount→counter mapping is correct
+  as of 0.10.1, so the Disk tab can now put the read/write rate on the
+  filesystem row itself instead of listing raw block devices underneath it.
+  "Which filesystem is being written to" is the question; "which of `dm-0`,
+  `nvme0n1` and `nvme0n1p3`" is the current answer.
+- **Pin the process cursor to a PID, not a row index.** The list re-sorts by
+  CPU every `proc_interval`, and the cursor is an index into it, so the
+  selected process changes under you between refreshes — and the detail line
+  below the table follows it. htop keeps the selection on the process. The
+  same change fixes the mouse wheel on that tab: scrolling moves the viewport,
+  then the next refresh snaps it back to wherever the index-based cursor
+  landed.
+- **Group cores by cpufreq policy.** The per-core grid is a flat list, which
+  is right for a CM4's four identical cores and wrong for a big.LITTLE board,
+  where the interesting question is whether work is on the P-cores or the
+  E-cores. `affected_cpus` already says which cores share a policy, and 0.10.1
+  made the policy order numeric; the grid just has to use it.
+- **Collapse the temperature list.** A Pi exposes one or two sensors; an x86
+  host exposes twenty-odd, most of them per-core `coretemp_core_*` repeating
+  the same number. `temp_ignore` can hide them, but only after someone finds
+  out they need to. Folding a chip's per-core sensors into one row (hottest
+  core, plus the count) by default, expandable on demand, would make the tab
+  readable on the "generic Linux x86_64" target without configuration.
+- **Acknowledge a single alert.** `m` mutes the whole banner, which is the
+  only lever there is when one sensor sits permanently above `temp_hot`.
+  Acknowledging one condition — suppressed until it clears or escalates,
+  everything else still reaching the banner — is what that situation actually
+  wants, and the engine already keys conditions by a stable identity.
+- **A systemd unit in the `.deb`.** The package installs the binary and
+  nothing else, while the exporter's whole point is running unattended.
+  Shipping a disabled `ucmon-metrics.service` (plus the udev rule the governor
+  and backlight writes need) would make `--metrics` deployable with
+  `systemctl enable`.
+- **Metrics logging** — `--log <file.jsonl> --interval 10s` appending one
+  `SnapshotJSON` per tick for later graphing. Partly superseded by the
+  Prometheus exporter and `--json` (0.10.0), so the remaining case is the host
+  with no scraper: a plain file something else rotates and plots afterwards.
+  JSONL is the right shape now that `SnapshotJSON` exists, and `--once --json`
+  already produces exactly one record of it.
 - **Services tab** — failed/active systemd units via `systemctl` shell-out
   (same graceful-absence pattern as vcgencmd), with start/restart/stop behind
   the existing y/N confirm flow.
@@ -134,7 +256,8 @@ process CPU% and disk I/O rates; first test suite (57 tests).
   other node exporter. Bind it to a private address or put it behind something
   if the board is reachable from outside.
 - **Governor / backlight writes** need root or a udev rule; ucmon shows both
-  read-only otherwise (`(ro)` marker / hint line).
+  read-only otherwise (`(ro)` marker / hint line). `ucmon doctor` prints the
+  exact rule for whichever of the two this host refuses.
 - **Alert cmd** runs `/bin/sh -c` with a 10 s timeout and no output capture;
   failures are silent by design (the alert itself is already visible). There is
   no cap on concurrent hooks — a condition flapping with `alert_clear_ticks = 1`
@@ -143,6 +266,19 @@ process CPU% and disk I/O rates; first test suite (57 tests).
   surrounding quotes and an unquoted trailing `#` comment, but does not
   interpret TOML escape sequences. Write shell hooks as literal strings
   (`alert_cmd = '…'`) when they contain double quotes.
+- **A recognised key with an unparseable value is still silent.**
+  `--check-config` (0.11.0) catches a misspelled *key*; `temp_warn = hot`
+  leaves the field at its default and says nothing. Reporting the value as
+  well is the obvious next step for the same machinery.
+- **The exporter collects through a model of its own**, so the readings that
+  are scoped to a session — `session_peaks` in `/snapshot`, the ping loss
+  window — describe that one collection rather than the exporter's uptime. This is
+  deliberate: sharing state with the monitor is what made a scrape corrupt the
+  TUI's CPU readings before 0.10.1. Compute windows in Prometheus.
+- **The process cursor is a row index**, and the list re-sorts every
+  `proc_interval`, so the selection moves to whatever occupies that row next.
+  Scrolling the Processes tab with the mouse wheel is undone by the same
+  refresh, which scrolls the cursor back into view. See "Next up".
 - **Minimum terminal size** is 30×6; below that ucmon draws a one-line notice
   rather than a frame, because the chrome alone (header, footer, box border)
   costs 4 rows and an overflowing frame blanks the alt screen.

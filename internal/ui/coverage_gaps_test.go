@@ -176,7 +176,7 @@ func TestFetchCommandsReturnTheirMessage(t *testing.T) {
 		cmd  tea.Cmd
 		want any
 	}{
-		{"cpu", fetchCPUCmd(), cpuMsg{}},
+		{"cpu", fetchCPUCmd(probe.NewCPUSampler()), cpuMsg{}},
 		{"mem", fetchMemCmd(), memMsg{}},
 		{"power", fetchPowerCmd(), powerMsg{}},
 		{"psi", fetchPSICmd(), psiMsg{}},

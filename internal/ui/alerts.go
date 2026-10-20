@@ -126,15 +126,25 @@ func (e *alertEngine) update(conds map[string]alertCond, now time.Time) []alertE
 }
 
 // summary returns the most severe active condition and the active count.
+//
+// The tie-break on the message matters: active conditions live in a map, so
+// picking the first of several equally severe ones left the banner choosing a
+// different message on every frame — four hot sensors made the footer cycle
+// between them several times a second. It is also the order activeList uses,
+// so the banner names the condition the Alerts tab lists first.
 func (e *alertEngine) summary() (top alertCond, count int, any bool) {
 	if len(e.active) == 0 {
 		return alertCond{}, 0, false
 	}
 	first := true
 	for _, c := range e.active {
-		if first || c.cond.sev > top.sev {
+		switch {
+		case first:
+			top, first = c.cond, false
+		case c.cond.sev > top.sev:
 			top = c.cond
-			first = false
+		case c.cond.sev == top.sev && c.cond.msg < top.msg:
+			top = c.cond
 		}
 	}
 	return top, len(e.active), true

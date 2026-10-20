@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -78,4 +79,35 @@ func parsePSI(s string) PSIRes {
 		}
 	}
 	return r
+}
+
+// CheckPSI reports whether the kernel exposes pressure-stall information.
+// Absence is a build-time decision (CONFIG_PSI) or a boot flag, not
+// something a permission can fix, so the remedy names both.
+func CheckPSI() Capability {
+	c := Capability{
+		Name:    "pressure stall (PSI)",
+		Source:  psiBase,
+		Affects: "Memory tab pressure rows, --once pressure block, psi_warn_pct alerts",
+	}
+
+	if snap := ReadPSI(); snap.Present {
+		c.Status = CapPresent
+		c.Detail = fmt.Sprintf("cpu/memory/io readable (cpu some avg10 %.2f%%)", snap.CPU.SomeAvg10)
+		return c
+	}
+
+	st, why := pathStatus(psiBase)
+	c.Status = st
+	switch st {
+	case CapPresent:
+		c.Status = CapAbsent
+		c.Detail = "the directory exists but no resource file parses"
+	case CapDenied:
+		c.Detail = why
+	default:
+		c.Detail = why + " — kernel built without CONFIG_PSI, or booted with psi=0"
+		c.Fix = "boot with psi=1 on a kernel built with CONFIG_PSI=y (Raspberry Pi OS: add psi=1 to /boot/firmware/cmdline.txt)"
+	}
+	return c
 }

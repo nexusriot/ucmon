@@ -124,7 +124,7 @@ func (m Model) buildReport(now time.Time) string {
 		b.WriteString(line + "\n")
 	}
 	if p.ACKnown {
-		fmt.Fprintf(&b, "  AC            %s\n", boolWord(p.ACOnline, "online", "offline"))
+		fmt.Fprintf(&b, "  AC             %s\n", boolWord(p.ACOnline, "online", "offline"))
 	}
 	if p.Throttle.Available {
 		fmt.Fprintf(&b, "  throttle       raw=0x%x%s\n", p.Throttle.Raw, throttleFlags(p.Throttle))

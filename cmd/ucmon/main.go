@@ -21,9 +21,11 @@ func main() {
 	metrics := flag.String("metrics", "", "serve Prometheus metrics on this address (e.g. :9100) and exit on signal (no TUI)")
 	configPath := flag.String("config", "", "config file path (default: "+config.Path()+")")
 	startTab := flag.String("tab", "", "start tab: cpu|mem|proc|disk|net|power|gpu|alerts")
+	doctor := flag.Bool("doctor", false, "report which readings this host can produce, and why the rest are missing (no TUI)")
+	checkConfig := flag.Bool("check-config", false, "list config keys ucmon does not recognise and exit (no TUI)")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(),
-			"ucmon %s — TUI system monitor for the uConsole / Raspberry Pi\n\nusage: ucmon [flags]\n\n",
+			"ucmon %s — TUI system monitor for the uConsole / Raspberry Pi\n\nusage: ucmon [flags] [doctor]\n\n",
 			ui.Version())
 		flag.PrintDefaults()
 	}
@@ -31,6 +33,27 @@ func main() {
 
 	if *showVersion {
 		fmt.Println("ucmon " + ui.Version())
+		return
+	}
+
+	// The report is what people will ask for by name, so accept it as a
+	// subcommand as well as a flag. flag.Parse stops at the first non-flag
+	// argument, so `ucmon doctor` and `ucmon --doctor` are the same request.
+	if flag.Arg(0) == "doctor" {
+		*doctor = true
+	}
+
+	path := *configPath
+	if path == "" {
+		path = config.Path()
+	}
+
+	if *checkConfig {
+		report, ok := ui.CheckConfig(path)
+		fmt.Print(report)
+		if !ok {
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -42,6 +65,13 @@ func main() {
 	}
 	if *startTab != "" {
 		cfg.StartTab = *startTab
+	}
+
+	// Diagnostics, not monitoring: no TUI, no exporter, and exit 0 whatever
+	// the host turns out to be missing.
+	if *doctor {
+		fmt.Print(ui.Doctor(cfg, path))
+		return
 	}
 
 	if *once {

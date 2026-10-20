@@ -65,7 +65,17 @@ func ReadCPUFreq() []PolicyFreq {
 		out = append(out, pf)
 	}
 
-	sort.Slice(out, func(i, j int) bool { return out[i].Policy < out[j].Policy })
+	// Numeric, not lexicographic: a board with ten or more frequency domains
+	// (any modern big.LITTLE laptop) otherwise listed policy10 and policy11
+	// between policy1 and policy2, and the expanded-graph cycle stepped
+	// through them in that order too.
+	sort.Slice(out, func(i, j int) bool {
+		pi, pj := suffixIndex(out[i].Policy, "policy"), suffixIndex(out[j].Policy, "policy")
+		if pi != pj {
+			return pi < pj
+		}
+		return out[i].Policy < out[j].Policy
+	})
 	return out
 }
 
@@ -97,4 +107,83 @@ func SetGovernor(policy, gov string) error {
 		return err
 	}
 	return nil
+}
+
+// GovernorUdevRule grants the "cpufreq" group write access to every policy's
+// scaling_governor, which is what the CPU tab's `g` key needs from a
+// non-root user. Printed verbatim by the doctor report.
+const GovernorUdevRule = `# /etc/udev/rules.d/90-ucmon-cpufreq.rules
+ACTION=="add", SUBSYSTEM=="cpu", RUN+="/bin/sh -c 'chgrp cpufreq /sys/devices/system/cpu/cpufreq/policy*/scaling_governor && chmod g+w /sys/devices/system/cpu/cpufreq/policy*/scaling_governor'"
+
+sudo groupadd -f cpufreq && sudo usermod -aG cpufreq "$USER"   # then log out and back in
+sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=cpu`
+
+// CheckCPUFreq reports whether the board exposes cpufreq policies at all.
+func CheckCPUFreq() Capability {
+	c := Capability{
+		Name:    "cpufreq policies",
+		Source:  cpufreqBase,
+		Affects: "CPU tab frequency rows and the governor display",
+	}
+
+	if pols := ReadCPUFreq(); len(pols) > 0 {
+		names := make([]string, 0, len(pols))
+		for _, p := range pols {
+			names = append(names, p.Policy)
+		}
+		c.Status = CapPresent
+		c.Detail = fmt.Sprintf("%s: %s (governor %s)",
+			plural(len(pols), "policy", "policies"), firstN(names, 4), pols[0].Governor)
+		return c
+	}
+
+	st, why := pathStatus(cpufreqBase)
+	c.Status = st
+	switch st {
+	case CapPresent:
+		c.Status = CapAbsent
+		c.Detail = "no policy directory reports scaling_cur_freq"
+	case CapDenied:
+		c.Detail = why
+	default:
+		c.Detail = why + " — no cpufreq driver (usual in a VM or container)"
+	}
+	return c
+}
+
+// CheckGovernorWrite reports whether this process could change a governor,
+// which is the half of the CPU tab that fails with a permission error rather
+// than an empty row.
+func CheckGovernorWrite() Capability {
+	c := Capability{
+		Name:    "cpufreq governor write",
+		Source:  filepath.Join(cpufreqBase, "policy*", "scaling_governor"),
+		Affects: "the CPU tab's `g` key (cycle governor)",
+		Fix:     GovernorUdevRule,
+	}
+
+	pols := ReadCPUFreq()
+	if len(pols) == 0 {
+		c.Status = CapAbsent
+		c.Detail = "no cpufreq policy to write to"
+		c.Fix = "" // nothing to grant access to
+		return c
+	}
+
+	c.Source = filepath.Join(cpufreqBase, pols[0].Policy, "scaling_governor")
+	for _, p := range pols {
+		if !p.Writable {
+			c.Status = CapReadOnly
+			c.Source = filepath.Join(cpufreqBase, p.Policy, "scaling_governor")
+			c.Detail = fmt.Sprintf("%s is not writable by this user (governor %s)", p.Policy, p.Governor)
+			return c
+		}
+	}
+	c.Status = CapPresent
+	c.Detail = "writable by this user"
+	if len(pols[0].Available) > 0 {
+		c.Detail += "; available governors: " + firstN(pols[0].Available, 6)
+	}
+	c.Fix = ""
+	return c
 }

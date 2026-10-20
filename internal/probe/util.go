@@ -2,7 +2,21 @@ package probe
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 )
+
+// suffixIndex is the number trailing a "<prefix><n>" sysfs name, or a large
+// sentinel when there is none. Sysfs directory listings come back sorted as
+// text, which puts policy10 and thermal_zone10 between their 1 and their 2;
+// sorting on this instead keeps them in the order the hardware numbers them.
+func suffixIndex(name, prefix string) int {
+	n, err := strconv.Atoi(strings.TrimPrefix(name, prefix))
+	if err != nil {
+		return 1 << 30
+	}
+	return n
+}
 
 func HumanBytes(b uint64) string {
 	const unit = 1024

@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -161,5 +162,54 @@ func TestSetGovernorRejectsBadInput(t *testing.T) {
 		if err := SetGovernor(c.policy, c.gov); err == nil {
 			t.Errorf("SetGovernor(%q, %q) succeeded", c.policy, c.gov)
 		}
+	}
+}
+
+// A board with ten or more frequency domains — any modern big.LITTLE laptop —
+// used to list policy10 and policy11 between policy1 and policy2, because the
+// policies were sorted as text. The CPU tab, the snapshot report and the
+// expanded-graph cycle all walked them in that order.
+func TestReadCPUFreqSortsPoliciesNumerically(t *testing.T) {
+	base := t.TempDir()
+	old := cpufreqBase
+	cpufreqBase = base
+	defer func() { cpufreqBase = old }()
+
+	for _, n := range []int{0, 1, 2, 3, 9, 10, 11, 21} {
+		fakePolicy(t, base, fmt.Sprintf("policy%d", n), map[string]string{
+			"scaling_cur_freq": "1000000",
+			"scaling_governor": "powersave",
+		})
+	}
+
+	freqs := ReadCPUFreq()
+	if len(freqs) != 8 {
+		t.Fatalf("got %d policies, want 8", len(freqs))
+	}
+	want := []string{"policy0", "policy1", "policy2", "policy3", "policy9", "policy10", "policy11", "policy21"}
+	for i, w := range want {
+		if freqs[i].Policy != w {
+			t.Fatalf("policy order = %v, want %v", policyNames(freqs), want)
+		}
+	}
+}
+
+func policyNames(fs []PolicyFreq) []string {
+	out := make([]string, len(fs))
+	for i, f := range fs {
+		out[i] = f.Policy
+	}
+	return out
+}
+
+func TestSuffixIndex(t *testing.T) {
+	if suffixIndex("policy10", "policy") <= suffixIndex("policy2", "policy") {
+		t.Error("policy10 must sort after policy2")
+	}
+	if suffixIndex("policy", "policy") != 1<<30 {
+		t.Error("a name with no number must sort last")
+	}
+	if suffixIndex("thermal_zone7", "thermal_zone") != 7 {
+		t.Error("thermal_zone7")
 	}
 }

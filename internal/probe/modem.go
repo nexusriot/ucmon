@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
@@ -232,4 +233,40 @@ func firstWord(s string) string {
 		return ""
 	}
 	return f[0]
+}
+
+// CheckModemManager reports whether ModemManager can be queried. The uConsole
+// ships with and without the 4G board, so "no modem" and "no mmcli" are both
+// ordinary answers — and they need different things done about them.
+func CheckModemManager() Capability {
+	c := Capability{
+		Name:    "WWAN modem (mmcli)",
+		Source:  strings.Join(mmcliPaths, ", ") + ", $PATH",
+		Affects: "the Network tab's modem block (operator, access tech, signal)",
+	}
+
+	bin := mmcliPath()
+	if bin == "" {
+		c.Detail = "mmcli not found"
+		c.Fix = "sudo apt install modemmanager"
+		return c
+	}
+
+	c.Source = bin
+	list, ok := runMmcli(bin, "--list-modems")
+	if !ok {
+		c.Status = CapDenied
+		c.Detail = bin + " could not be queried — is ModemManager running?"
+		c.Fix = "sudo systemctl enable --now ModemManager"
+		return c
+	}
+	if _, ok := firstModemIndex(list); !ok {
+		c.Detail = "ModemManager is answering, but knows no modem"
+		return c
+	}
+
+	info := ReadModem()
+	c.Status = CapPresent
+	c.Detail = strings.TrimSpace(fmt.Sprintf("%s %s (%s)", info.Manufacturer, info.Model, info.State))
+	return c
 }

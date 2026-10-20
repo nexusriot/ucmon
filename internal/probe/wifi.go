@@ -3,8 +3,10 @@ package probe
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -217,4 +219,38 @@ func FreqToChannel(mhz int) int {
 	default:
 		return 0
 	}
+}
+
+// CheckIW reports whether the iw binary is available. /proc/net/wireless
+// gives quality and signal without it; SSID, channel and link rates do not
+// exist anywhere else, so the Network tab simply omits them.
+func CheckIW() Capability {
+	c := Capability{
+		Name:    "wireless link details (iw)",
+		Source:  strings.Join(iwPaths, ", ") + ", $PATH",
+		Affects: "SSID, channel and tx/rx rates on the Network tab",
+	}
+
+	bin := iwBinPath()
+	if bin == "" {
+		c.Detail = "iw not found"
+		c.Fix = "sudo apt install iw"
+		return c
+	}
+
+	c.Source = bin
+	ifaces := readWirelessStats()
+	if len(ifaces) == 0 {
+		c.Detail = bin + " is installed, but " + wirelessPath + " lists no wireless interface"
+		return c
+	}
+	names := make([]string, 0, len(ifaces))
+	for name := range ifaces {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	c.Status = CapPresent
+	c.Detail = fmt.Sprintf("%s, %s: %s", bin,
+		plural(len(names), "wireless interface", "wireless interfaces"), firstN(names, 4))
+	return c
 }

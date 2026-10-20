@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -178,4 +179,45 @@ func parseHexByte(s string) (int, bool) {
 		return 0, false
 	}
 	return int(v), true
+}
+
+// CheckStorageWear reports whether any device publishes wear data. Only eMMC
+// does, via the EXT_CSD life_time / pre_eol_info attributes: a plain SD card
+// (the usual uConsole and Pi boot medium) exposes nothing, which is why the
+// Disk tab's health block can be empty on a perfectly healthy board.
+func CheckStorageWear() Capability {
+	c := Capability{
+		Name:    "storage wear (eMMC life time)",
+		Source:  filepath.Join(blockBase, "mmcblk*", "device", "life_time"),
+		Affects: "the Disk tab's wear/pre-EOL rows and the card-wear alert",
+	}
+
+	devs := ReadStorageHealth()
+	var worn, named []string
+	for _, d := range devs {
+		named = append(named, d.Device+" ("+d.Kind+")")
+		if d.HasLife || d.HasEOL {
+			worn = append(worn, d.Device)
+		}
+	}
+
+	if len(worn) > 0 {
+		c.Status = CapPresent
+		c.Detail = fmt.Sprintf("%s report life_time/pre_eol_info", firstN(worn, 4))
+		return c
+	}
+
+	if len(devs) == 0 {
+		st, why := pathStatus(blockBase)
+		c.Status = st
+		if st == CapPresent {
+			c.Status = CapAbsent
+			c.Detail = "no block device under " + blockBase
+		} else {
+			c.Detail = why
+		}
+		return c
+	}
+	c.Detail = fmt.Sprintf("no device exposes wear counters: %s — normal for SD, USB, SATA and NVMe", firstN(named, 4))
+	return c
 }

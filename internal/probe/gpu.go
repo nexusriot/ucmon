@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -103,4 +104,35 @@ func parseMemMB(s string) int {
 		}
 	}
 	return 0
+}
+
+// CheckVideoCore reports whether vcgencmd is available — the single answer to
+// "why is the GPU tab empty". It is a Raspberry Pi firmware tool: a uConsole
+// (CM4) has it, a generic x86 host or a non-Broadcom SBC never will.
+func CheckVideoCore() Capability {
+	c := Capability{
+		Name:    "GPU / VideoCore (vcgencmd)",
+		Source:  strings.Join(vcgencmdPaths, ", ") + ", $PATH",
+		Affects: "the whole GPU tab (core temp/volts, clocks, memory split) and the throttling flags",
+	}
+
+	bin := vcgencmdPath()
+	if bin == "" {
+		c.Detail = "vcgencmd not found — expected on any board that is not a Raspberry Pi"
+		c.Fix = "on Raspberry Pi OS: sudo apt install raspberrypi-utils (older releases: libraspberrypi-bin)"
+		return c
+	}
+
+	c.Source = bin
+	g := SampleGPU()
+	if !g.Available {
+		c.Status = CapDenied
+		c.Detail = bin + " exists but produced no reading (not in the video group?)"
+		c.Fix = "sudo usermod -aG video \"$USER\", then log out and back in"
+		return c
+	}
+
+	c.Status = CapPresent
+	c.Detail = fmt.Sprintf("%s, core %.1f °C", plural(len(g.Clocks), "clock domain", "clock domains"), g.CoreTempC)
+	return c
 }

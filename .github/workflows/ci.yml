@@ -155,7 +155,7 @@ jobs:
           test "$(./ucmon --version)" = "ucmon $(make version)"
           # flag.PrintDefaults prints single-dash names, so match on those.
           ./ucmon --help 2>&1 | tee /dev/stderr | grep -q -- '-once'
-          for flag in -config -tab -version -json -metrics; do
+          for flag in -config -tab -version -json -metrics -doctor -check-config; do
             ./ucmon --help 2>&1 | grep -q -- "$flag"
           done
 
@@ -186,6 +186,44 @@ jobs:
           # --tab overrides start_tab; an unknown value must fall back, not fail.
           ./ucmon --config ci.toml --tab power --once >/dev/null
           ./ucmon --config ci.toml --tab nonsense --once >/dev/null
+
+      - name: doctor reports every source and still exits 0
+        run: |
+          set -eu
+          # The point of the report is that a board missing half these
+          # sources is not a failure, so the exit status must stay 0.
+          ./ucmon doctor | tee doctor.txt
+          ./ucmon --doctor >/dev/null
+          for source in "temperature sensors" "cpufreq policies" \
+                        "cpufreq governor write" "pressure stall (PSI)" \
+                        "per-process disk I/O" "battery" "GPU / VideoCore" \
+                        "backlight brightness" "wireless link details" \
+                        "WWAN modem" "unprivileged ICMP" "storage wear"; do
+            grep -qF "$source" doctor.txt || { echo "doctor omits: $source"; exit 1; }
+          done
+          # Every entry carries a verdict, and the two writable sources carry
+          # the udev rule that fixes them when they are read-only.
+          grep -qE '^\[(present|absent|denied|read-only)\]' doctor.txt
+          if grep -q '^\[read-only\]' doctor.txt; then
+            grep -q 'udev/rules.d' doctor.txt || { echo "read-only source without a udev rule"; exit 1; }
+          fi
+
+      - name: --check-config names a typo and stays non-fatal
+        run: |
+          set -eu
+          cat > typo.toml <<'EOF'
+          start_tab   = "net"
+          temp_warnn  = 90          # typo for temp_warn
+          ping_targets = "1.1.1.1"  # plural: not a key
+          EOF
+          # The flag reports and exits non-zero; the monitor keeps working.
+          ! ./ucmon --config typo.toml --check-config > check.txt
+          tee /dev/stderr < check.txt
+          grep -q 'temp_warnn' check.txt
+          grep -q 'ping_targets' check.txt
+          ./ucmon --config typo.toml --once >/dev/null
+          # A clean config reports clean.
+          ./ucmon --config ci.toml --check-config | grep -q 'no unrecognised keys'
 
       - name: --once --json is valid, machine-readable JSON
         run: |

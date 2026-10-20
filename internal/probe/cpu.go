@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,60 +45,83 @@ type TempReading struct {
 	Temp  float64
 }
 
-// lastCPUTimes holds the previous cpu.Times reading so the breakdown is a
-// share of the interval rather than of uptime. Guarded because SampleCPU runs
-// on a Bubble Tea command goroutine.
-var (
-	cpuTimesMu   sync.Mutex
-	lastCPUTimes *cpu.TimesStat
-)
-
-func SampleCPU() (CPUSnapshot, error) {
-	perCore, err := cpu.Percent(0, true)
-	if err != nil {
-		return CPUSnapshot{}, err
-	}
-
-	total, err := cpu.Percent(0, false)
-	if err != nil {
-		return CPUSnapshot{}, err
-	}
-
-	totalPct := 0.0
-	if len(total) > 0 {
-		totalPct = total[0]
-	}
-
-	temps := readTemperatures()
-
-	return CPUSnapshot{
-		PerCorePercent: perCore,
-		TotalPercent:   totalPct,
-		Breakdown:      sampleBreakdown(),
-		Temperatures:   temps,
-		Freqs:          ReadCPUFreq(),
-		TakenAt:        time.Now(),
-	}, nil
+// CPUSampler keeps the previous /proc/stat reading so utilisation and the
+// time breakdown are shares of the interval rather than of uptime.
+//
+// The state is per-sampler rather than package-level on purpose. gopsutil's
+// cpu.Percent(0, …) keeps its baseline in a package global, so two callers in
+// one process silently measure each other's intervals: with metrics_listen
+// set, every scrape re-primed the baseline the TUI was about to diff against,
+// and the next frame showed a 600 ms window — or 0% outright, when the two
+// landed close enough together — instead of the second it claimed. The net,
+// disk and process samplers already own their own state; this one now does
+// too. Reading /proc/stat directly also costs two reads per tick rather than
+// the three cpu.Percent + cpu.Times needed.
+type CPUSampler struct {
+	mu      sync.Mutex
+	lastAll *cpu.TimesStat
+	lastPer []cpu.TimesStat
 }
 
-// sampleBreakdown diffs /proc/stat's aggregate CPU line against the previous
-// reading. The first call has nothing to diff and reports Valid=false.
-func sampleBreakdown() CPUBreakdown {
-	times, err := cpu.Times(false)
-	if err != nil || len(times) == 0 {
-		return CPUBreakdown{}
-	}
-	cur := times[0]
+// NewCPUSampler returns a sampler with no baseline; its first Sample reports
+// 0% and an invalid breakdown, and every one after that is a real interval.
+func NewCPUSampler() *CPUSampler { return &CPUSampler{} }
 
-	cpuTimesMu.Lock()
-	prev := lastCPUTimes
-	lastCPUTimes = &cur
-	cpuTimesMu.Unlock()
-
-	if prev == nil {
-		return CPUBreakdown{}
+// Sample reads the CPU counters, temperatures and cpufreq policies once.
+func (s *CPUSampler) Sample() (CPUSnapshot, error) {
+	all, err := cpu.Times(false)
+	if err != nil {
+		return CPUSnapshot{}, err
 	}
-	return diffCPUTimes(*prev, cur)
+	if len(all) == 0 {
+		return CPUSnapshot{}, errors.New("no aggregate cpu line in /proc/stat")
+	}
+	per, err := cpu.Times(true)
+	if err != nil {
+		return CPUSnapshot{}, err
+	}
+	cur := all[0]
+
+	s.mu.Lock()
+	prevAll, prevPer := s.lastAll, s.lastPer
+	s.lastAll, s.lastPer = &cur, per
+	s.mu.Unlock()
+
+	snap := CPUSnapshot{
+		PerCorePercent: make([]float64, len(per)),
+		Temperatures:   readTemperatures(),
+		Freqs:          ReadCPUFreq(),
+		TakenAt:        time.Now(),
+	}
+	if prevAll != nil {
+		snap.Breakdown = diffCPUTimes(*prevAll, cur)
+		snap.TotalPercent = busyPercent(snap.Breakdown)
+	}
+	// A core coming online or going offline changes the row count; skip that
+	// one interval rather than pairing core N against a different core N.
+	if len(prevPer) == len(per) {
+		for i := range per {
+			snap.PerCorePercent[i] = busyPercent(diffCPUTimes(prevPer[i], per[i]))
+		}
+	}
+	return snap, nil
+}
+
+// busyPercent is the share of an interval that was neither idle nor blocked
+// on I/O — the definition gopsutil's cpu.Percent uses on Linux, kept the same
+// so the number on screen did not move when the sampler did.
+func busyPercent(b CPUBreakdown) float64 {
+	if !b.Valid {
+		return 0
+	}
+	v := 100 - b.Idle - b.Iowait
+	if v < 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
 }
 
 // diffCPUTimes converts two cumulative cpu.TimesStat readings into the
@@ -198,14 +222,20 @@ func readThermalZones() []TempReading {
 		return nil
 	}
 
-	var out []TempReading
+	// ReadDir sorts as text, which reads thermal_zone10 before thermal_zone2.
+	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if !strings.HasPrefix(e.Name(), "thermal_zone") {
-			continue
+		if strings.HasPrefix(e.Name(), "thermal_zone") {
+			names = append(names, e.Name())
 		}
-		zpath := filepath.Join(thermalBase, e.Name())
+	}
+	sort.Slice(names, func(i, j int) bool { return zoneIndex(names[i]) < zoneIndex(names[j]) })
 
-		label := e.Name()
+	var out []TempReading
+	for _, name := range names {
+		zpath := filepath.Join(thermalBase, name)
+
+		label := name
 		if b, err := os.ReadFile(filepath.Join(zpath, "type")); err == nil {
 			label = strings.TrimSpace(string(b))
 		}
@@ -234,7 +264,13 @@ func readThermalZones() []TempReading {
 
 // Temperature color thresholds (°C). Overridable from config via
 // SetTempThresholds; defaults match the original hard-coded values.
+//
+// Guarded because they are process-wide and written from more than one
+// goroutine: metrics_listen builds a second Model on the exporter's goroutine
+// for every scrape, and NewModel applies the thresholds, while the TUI's
+// renderer is reading them through TempColor.
 var (
+	tempMu   sync.RWMutex
 	tempWarn float64 = 50 // yellow
 	tempHot  float64 = 65 // orange
 	tempCrit float64 = 80 // red
@@ -242,6 +278,8 @@ var (
 
 // SetTempThresholds overrides the warn/hot/crit boundaries used by TempColor.
 func SetTempThresholds(warn, hot, crit float64) {
+	tempMu.Lock()
+	defer tempMu.Unlock()
 	if warn > 0 {
 		tempWarn = warn
 	}
@@ -251,6 +289,13 @@ func SetTempThresholds(warn, hot, crit float64) {
 	if crit > 0 {
 		tempCrit = crit
 	}
+}
+
+// TempThresholds reports the active warn/hot/crit boundaries.
+func TempThresholds() (warn, hot, crit float64) {
+	tempMu.RLock()
+	defer tempMu.RUnlock()
+	return tempWarn, tempHot, tempCrit
 }
 
 // TripPoints are the thermal limits the kernel itself declares for a zone,
@@ -341,13 +386,7 @@ func ReadTripPoints() (TripPoints, bool) {
 
 // zoneIndex extracts the number from "thermal_zone12" so zones sort
 // numerically rather than lexicographically (which puts zone10 before zone2).
-func zoneIndex(name string) int {
-	n, err := strconv.Atoi(strings.TrimPrefix(name, "thermal_zone"))
-	if err != nil {
-		return 1 << 30
-	}
-	return n
-}
+func zoneIndex(name string) int { return suffixIndex(name, "thermal_zone") }
 
 // TripThresholds derives warn/hot/crit colour boundaries from a zone's own
 // trip points: red at the shutdown trip, orange where throttling begins, and
@@ -374,12 +413,13 @@ func TripThresholds(tp TripPoints) (warn, hot, crit float64, ok bool) {
 }
 
 func TempColor(t float64) string {
+	warn, hot, crit := TempThresholds()
 	switch {
-	case t >= tempCrit:
+	case t >= crit:
 		return "196" // red
-	case t >= tempHot:
+	case t >= hot:
 		return "214" // orange
-	case t >= tempWarn:
+	case t >= warn:
 		return "226" // yellow
 	default:
 		return "42" // green
@@ -388,4 +428,47 @@ func TempColor(t float64) string {
 
 func FormatTemp(t float64) string {
 	return fmt.Sprintf("%.1f°C", t)
+}
+
+// CheckTempSensors reports whether any temperature sensor is readable. The
+// gopsutil hwmon walk is tried first, exactly as readTemperatures does, so a
+// host that reports sensors without /sys/class/thermal still comes out
+// present.
+func CheckTempSensors() Capability {
+	return checkTempSensors(readTemperatures())
+}
+
+// checkTempSensors is the pure half: the sensor walk is the host's answer,
+// the verdict is this function's.
+func checkTempSensors(temps []TempReading) Capability {
+	c := Capability{
+		Name:    "temperature sensors",
+		Source:  thermalBase,
+		Affects: "CPU tab temperatures, temperature alerts, trip-point calibration",
+	}
+
+	if len(temps) > 0 {
+		labels := make([]string, 0, len(temps))
+		for _, t := range temps {
+			labels = append(labels, t.Label)
+		}
+		c.Status = CapPresent
+		c.Detail = plural(len(temps), "sensor", "sensors") + ": " + firstN(labels, 4)
+		return c
+	}
+
+	st, why := pathStatus(thermalBase)
+	c.Status = st
+	switch st {
+	case CapPresent:
+		// The directory is there but exposes no usable zone — a VM, or a
+		// board whose sensors need a driver that is not loaded.
+		c.Status = CapAbsent
+		c.Detail = "no thermal zone or hwmon sensor reports a usable reading"
+	case CapDenied:
+		c.Detail = why
+	default:
+		c.Detail = why + " — no hwmon sensors either (common in a VM or container)"
+	}
+	return c
 }

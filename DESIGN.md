@@ -10,10 +10,10 @@ Built with Go using the Charmbracelet Bubble Tea TUI framework (Elm architecture
 
 ```
 ucmon/
-├── cmd/ucmon/main.go           # Entry point + CLI flags (--once/--config/--tab/--version)
+├── cmd/ucmon/main.go           # Entry point + CLI flags (--once/--json/--metrics/--doctor/--check-config/--config/--tab/--version)
 ├── internal/
 │   ├── probe/                  # Data collection layer
-│   │   ├── cpu.go              # CPU load & temperature sensors
+│   │   ├── cpu.go              # CPUSampler (interval utilisation + time breakdown), temperature sensors
 │   │   ├── cpufreq.go          # cpufreq policies: clocks + governor read/set (sysfs)
 │   │   ├── mem.go              # RAM & swap
 │   │   ├── procs.go            # ProcSampler: direct /proc walk, interval CPU%/IO, detail, signals
@@ -27,9 +27,10 @@ ucmon/
 │   │   ├── modem.go            # WWAN modem status via mmcli (ModemManager)
 │   │   ├── gpu.go              # VideoCore clocks/temp/volts/mem (vcgencmd)
 │   │   ├── backlight.go        # Display backlight read/set (/sys/class/backlight)
+│   │   ├── capability.go       # Capability type + the doctor check set (each probe owns its own check)
 │   │   └── util.go             # Formatting helpers
 │   ├── config/                 # Optional TOML-subset config loader
-│   │   ├── config.go           # Parsing, defaults, Sanitize
+│   │   ├── config.go           # Parsing, defaults, Sanitize, unrecognised-key collection
 │   │   └── ignore.go           # net/disk/temp ignore globs
 │   └── ui/                     # Presentation layer
 │       ├── model.go            # Bubble Tea model (state, Update, View)
@@ -41,6 +42,8 @@ ucmon/
 │       ├── help.go             # Key-binding help overlay (?)
 │       ├── peaks.go            # Session peak tracker
 │       ├── once.go             # RunOnce / RunOnceJSON: headless one-shot snapshot
+│       ├── doctor.go           # Formats the capability report (ucmon doctor)
+│       ├── config_check.go     # --check-config report + the startup notice
 │       ├── metrics.go          # JSON snapshot + Prometheus text exposition
 │       ├── exporter.go         # HTTP server for --metrics / metrics_listen
 │       ├── history.go          # sparkline + peak persistence across restarts
@@ -52,9 +55,11 @@ ucmon/
 │       ├── bar.go              # Horizontal bar chart renderer
 │       └── table.go            # Text table & ANSI helpers
 ├── .github/workflows/ci.yml    # test+race / lint / cross-compile / CLI smoke
+├── Makefile                    # Canonical build/packaging tooling (all four targets)
 ├── DEBIAN/control              # Debian package metadata
-├── build-deb.sh                # Debian package builder (amd64/arm64)
+├── build-deb.sh                # Legacy Debian package builder (amd64/arm64/riscv64)
 ├── build-deb-arm64.sh          # ARM64 shortcut
+├── build-deb-licheerv.sh       # riscv64 shortcut
 ├── ROADMAP.md                  # Planned features & known limitations
 └── DESIGN.md                   # This file
 ```
@@ -72,9 +77,9 @@ CI (`.github/workflows/ci.yml`) runs four jobs on every push and pull request:
 | Job | What it protects |
 |-----|------------------|
 | **test** | `gofmt` check, `go vet`, `go test -race` with a coverage profile and a summary |
-| **lint** | pinned `staticcheck` plus `golangci-lint` (`unused`, `ineffassign`, `unparam`, `unconvert`) |
+| **lint** | pinned `staticcheck` plus `golangci-lint` (`unused`, `ineffassign`, `unparam`, `unconvert`, `staticcheck`, `govet`) |
 | **cross-compile** | `make` for all four targets, asserting each binary is statically linked — the pure-Go/`CGO_ENABLED=0` stance breaks here long before anyone flashes a board |
-| **smoke** | builds and runs the CLI: `--version` matches what the Makefile derives, every flag is documented, `--once` emits every report section, the ignore lists filter it, `ping_enabled = false` is honoured, and unknown flags or unparseable configs fail or degrade cleanly |
+| **smoke** | builds and runs the CLI: `--version` matches what the Makefile derives, every flag is documented, `--once` emits every report section, the ignore lists filter it, `ping_enabled = false` is honoured, `doctor` and `--check-config` run headless, and unknown flags or unparseable configs fail or degrade cleanly |
 
 The smoke job exists because `main` is the one function unit tests cannot
 reach; it covers flag parsing, config loading and the whole headless report.
@@ -120,9 +125,33 @@ argv[0].
 where the per-call parsing overhead is irrelevant, and it carries exe, cwd,
 fd count and children for free.
 
+**CPU utilisation is sampled per instance too.** `CPUSampler` reads
+`/proc/stat` and diffs it against its own previous reading; it does not use
+`gopsutil`'s `cpu.Percent(0, …)`, which keeps its baseline in a package
+global. One global baseline means two callers in one process measure each
+other's intervals, and ucmon has two whenever `metrics_listen` is set: the
+exporter builds a model per scrape, so every scrape re-primed the baseline the
+monitor was about to diff against and the next frame reported the exporter's
+600 ms window — or 0%, when the two landed close enough together. Owning the
+state also costs two `/proc/stat` reads per tick instead of the three
+`cpu.Percent` (per-core) + `cpu.Percent` (total) + `cpu.Times` (breakdown)
+needed before, and gives the aggregate, the per-core figures and the time
+breakdown from one pair of readings. Utilisation keeps gopsutil's Linux
+definition — the share of the interval that was neither idle nor in iowait —
+so the number on screen did not move when the sampler did.
+
+The process-wide temperature thresholds behind `TempColor` are mutex-guarded
+for the same reason: `NewModel` applies them, the exporter calls it on its own
+goroutine per scrape, and the renderer reads them every frame.
+
 **Delta-based rates** (network, disk I/O) divide counter deltas by the real
 elapsed time tracked inside each sampler — never by an assumed interval,
-since the disk sampler runs on the slow cadence.
+since the disk sampler runs on the slow cadence. Mounted filesystems are
+matched to their I/O counters by their *exact* device name first:
+`/proc/diskstats` carries a row per partition as well as per disk, so
+stripping the partition suffix up front gave every partition of a device the
+whole-disk rate and left a root filesystem on LVM or dm-crypt (`/dev/dm-0`)
+with no I/O at all. The stripped base survives only as a fallback.
 
 ### Temperature thresholds
 
@@ -200,7 +229,11 @@ something about that one process), and the host table skips them: it is also
 - **CPU pressure** (PSI `some` avg10/avg60) when the kernel exposes it
 - Temperature sensor readings with color-coded values, bars, sparkline
   history, and the session-peak sensor
-- Temperature thresholds: green (<50°C), yellow (50-65°C), orange (65-80°C), red (>80°C)
+- Temperature thresholds are the calibrated `temp_warn`/`temp_hot`/`temp_crit`
+  boundaries described above — green below warn, then yellow, orange and red.
+  They are seeded from the board's own trip points unless the config names a
+  value or sets `temp_from_trip_points = false`, in which case the built-in
+  50/65/80 °C applies
 
 CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded against CPU count).
 
@@ -365,10 +398,77 @@ lazy — nothing is collected until something scrapes — and a result is reused
 for 5 seconds, so a careless 1 s scrape loop cannot drive a full `/proc` walk
 as fast as it can ask.
 
+Each scrape collects through a model of its own, so the exporter never reaches
+into the monitor's state and a scrape cannot perturb what is on screen. The
+samplers that keep a baseline are per-instance for exactly that reason. The
+consequence is that the session-scoped readings — `session_peaks` in
+`/snapshot`, and the ping loss window behind `ucmon_ping_loss_percent` —
+describe that one collection rather than the exporter's uptime; Prometheus is
+the right place to compute a window over them.
+
 `ucmon --once` (`internal/ui/once.go`) produces the same report on stdout
 without starting the TUI: it primes the delta-based samplers (CPU%, net/disk
 rates), waits ~600 ms, re-samples everything, runs one alert evaluation, and
 prints. Useful over SSH and from cron.
+
+### `ucmon doctor` — the capability report
+
+ucmon degrades gracefully in a dozen places, and every one of them looks the
+same from the outside: a row that is absent, or marked `(ro)`. `ucmon doctor`
+(also `--doctor`) is the one command that says which readings this board can
+produce and why the rest are missing — the question "why is the GPU tab empty"
+answered without reading this document.
+
+The knowledge lives where the sampling does. Each probe file owns a
+`Check…()` returning a `probe.Capability` (`internal/probe/capability.go`):
+the source consulted, a status — **present**, **absent**, **denied** or
+**read-only** — what was found or why nothing was, which rows go missing
+without it, and the remedy. `probe.Capabilities()` runs the set:
+
+| Capability | Source | Typical absence |
+|---|---|---|
+| temperature sensors | `/sys/class/thermal`, hwmon | a VM with no sensors |
+| cpufreq policies | `/sys/devices/system/cpu/cpufreq` | a VM or container |
+| cpufreq governor write | `policy*/scaling_governor` | **read-only** without root or a udev rule |
+| pressure stall (PSI) | `/proc/pressure` | kernel without `CONFIG_PSI`, or `psi=0` |
+| per-process disk I/O | `/proc/<pid>/io` | **denied** for other users without `CAP_SYS_PTRACE` |
+| battery / design capacity | `/sys/class/power_supply` | bench-supplied board; gauges with no `*_full_design` |
+| GPU / VideoCore | `vcgencmd` | any board that is not a Raspberry Pi |
+| backlight brightness | `/sys/class/backlight` | headless host; **read-only** without a udev rule |
+| wireless link details | `iw` | package not installed, or no wireless hardware |
+| WWAN modem | `mmcli` | no ModemManager, or no 4G board |
+| unprivileged ICMP | `net.ipv4.ping_group_range` | **denied** — latency falls back to TCP connect timing |
+| storage wear | `/sys/block/*/device/life_time` | a plain SD card, USB, SATA or NVMe |
+
+Splitting it this way is the point: a check that reads the same files as the
+sampler, in the same package, cannot drift from the behaviour it explains.
+`internal/ui/doctor.go` only formats — status label, source, finding, what it
+hides, how to fix it — and for the two writable sources it prints the exact
+udev rule, exported as `probe.GovernorUdevRule` and `probe.BacklightUdevRule`
+so the test asserts the same text the user pastes. The report is ANSI-free,
+needs no privileges, writes nothing, and **always exits 0**: an absent source
+is a fact about the board, not a failure.
+
+The report closes with the config settings that suppress a reading the host
+could otherwise produce (`ping_enabled`, `modem_enabled`, `alerts_enabled`,
+the ignore globs) and any unrecognised keys — the half of "why is that empty"
+that no capability check can see.
+
+### Unrecognised config keys
+
+`apply` ignored anything it did not know, so `temp_warnn = 90` did nothing and
+said nothing. `LoadFrom` now collects what `apply` refused — key plus line
+number, deduplicated, and only for lines that actually carry a key, since
+`[section]` headers, comments and malformed lines are skipped before `apply`
+ever sees them. They surface in three places: `ucmon --check-config` lists
+them and exits non-zero (a provisioning script can gate on it), `ucmon doctor`
+names them in its config section, and the TUI shows a one-line footer notice
+at startup.
+
+Unknown keys stay **non-fatal** everywhere else, deliberately: a config
+written for a newer ucmon has to keep working on an older binary, and
+`--config junk.toml --once` must still produce a report — the CI smoke job
+asserts exactly that.
 
 ### Overlays, pause, session peaks
 
@@ -431,14 +531,21 @@ hand — comments (`#`/`;`) and `[section]` headers are skipped, values may be
 quoted, and durations accept a Go duration string or a bare number of seconds.
 No third-party TOML dependency is added, preserving the pure-Go cross-compile.
 Keys: `start_tab`, `fast_interval`, `proc_interval`, `slow_interval`,
-`temp_warn`/`temp_hot`/`temp_crit`, `backlight_step`, `backlight_device`, the
-alert thresholds `alerts_enabled`, `mem_warn_pct`, `swap_warn_pct`,
-`disk_warn_pct`, `batt_low_pct`, `batt_crit_pct`, `load_warn_factor`,
-`alert_log_cap`, the alert delivery/damping keys `alert_clear_ticks`,
-`alert_bell`, `alert_cmd`, `alert_log_file` (supports `~/`), the monitor keys
-`wifi_low_dbm`, `ping_enabled`, `ping_target`, `ping_loss_warn_pct`,
-`psi_warn_pct`, and the ignore lists `net_ignore`, `disk_ignore`,
-`temp_ignore`. See the README for an annotated example.
+`temp_warn`/`temp_hot`/`temp_crit`, `temp_from_trip_points`,
+`backlight_step`, `backlight_device`, the alert thresholds `alerts_enabled`,
+`mem_warn_pct`, `swap_warn_pct`, `disk_warn_pct`, `batt_low_pct`,
+`batt_crit_pct`, `load_warn_factor`, `alert_log_cap`, the alert
+delivery/damping keys `alert_clear_ticks`, `alert_bell`, `alert_cmd`,
+`alert_log_file` (supports `~/`), the monitor keys `wifi_low_dbm`,
+`ping_enabled`, `ping_target`, `ping_loss_warn_pct`, `psi_warn_pct`,
+`modem_enabled`, the rate-based alert keys `batt_drain_warn_pct_h`,
+`disk_full_warn_hours`, `temp_rise_warn_c_per_min`, the output and limit keys
+`history_len`, `procs_cap`, `report_dir` (supports `~/`), `history_file`
+(supports `~/`), `metrics_listen`, and the ignore lists `net_ignore`,
+`disk_ignore`, `temp_ignore`. See the README for an annotated example.
+
+Keys the parser does not recognise are collected rather than dropped (see
+"Unrecognised config keys" above); they never prevent startup.
 
 `splitValue` drops a `#` comment that is not inside quotes, then removes one
 matched pair of surrounding quotes — so a value keeps quotes of its own and a
@@ -476,7 +583,7 @@ raise a WiFi alert or hold a history buffer. The default lists are empty.
 | `enter`          | Apply search / process details (tab 3) |
 | `esc`            | Cancel search / kill / close overlay |
 | `ctrl+u`         | Clear search filter       |
-| `↑` `↓` PgUp/Dn | Move cursor (procs)/scroll|
+| `↑` `↓` PgUp/Dn `home` `end` | Move cursor (procs)/scroll|
 | `s`              | Cycle process sort        |
 | `t`              | Toggle process tree view  |
 | `k` / `K`        | SIGTERM / SIGKILL (procs) |

@@ -27,14 +27,14 @@ func collectOnce(cfg config.Config) (Model, error) {
 	cfg = m.cfg
 
 	// Prime the delta-based samplers.
-	_, _ = probe.SampleCPU()
+	_, _ = m.cpuSampler.Sample()
 	_, _ = m.netSampler.Sample()
 	_, _, _ = m.diskSampler.Sample()
 	_, _ = m.procSampler.List()
 
 	time.Sleep(600 * time.Millisecond)
 
-	if snap, err := probe.SampleCPU(); err == nil {
+	if snap, err := m.cpuSampler.Sample(); err == nil {
 		snap.Temperatures = m.keepTemps(snap.Temperatures)
 		m.cpuSnap = snap
 		m.peaks.observeCPU(snap.TotalPercent, snap.Temperatures)

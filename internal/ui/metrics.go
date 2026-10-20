@@ -269,7 +269,7 @@ func (m Model) snapshotJSON(now time.Time) SnapshotJSON {
 	for _, d := range m.disks {
 		dj := diskJSON{Mount: d.MountPoint, Device: d.Device, FSType: d.FSType,
 			TotalB: d.Total, UsedB: d.Used, UsedPct: d.UsedPct}
-		if io, ok := ioByDev[baseDevice(d.Device)]; ok {
+		if io, ok := diskIOFor(ioByDev, d.Device); ok {
 			dj.ReadBps, dj.WriteBps = io.ReadBps, io.WriteBps
 		}
 		s.Disks = append(s.Disks, dj)
@@ -413,7 +413,9 @@ func (m Model) buildPrometheus() string {
 	for _, d := range m.disks {
 		lbl := fmt.Sprintf("{mount=%q,fstype=%q}", d.MountPoint, d.FSType)
 		disks = append(disks, [2]string{lbl, num(d.UsedPct)})
-		diskBytes = append(diskBytes, [2]string{lbl, num(float64(d.Total - d.Used))})
+		// d.Free, not Total-Used: the two differ by the root-reserved blocks,
+		// and this has to agree with the Disk tab and the JSON snapshot.
+		diskBytes = append(diskBytes, [2]string{lbl, num(float64(d.Free))})
 	}
 	w("filesystem_used_percent", "Filesystem utilisation.", "gauge", disks)
 	w("filesystem_free_bytes", "Filesystem free space.", "gauge", diskBytes)
@@ -510,17 +512,65 @@ func boolMetric(v bool) string {
 	return "0"
 }
 
-// baseDevice strips /dev/ and a trailing partition number so a mounted
-// partition can be matched to the block device its I/O counters use.
-func baseDevice(dev string) string {
-	d := strings.TrimPrefix(dev, "/dev/")
-	for i := len(d); i > 0; i-- {
-		if d[i-1] < '0' || d[i-1] > '9' {
-			d = d[:i]
-			break
+// diskIOFor matches a mount's device to its I/O counters.
+//
+// The exact name has to be tried first. /proc/diskstats carries a row per
+// *partition* as well as per disk, so stripping the partition suffix up front
+// gave every partition of a device the whole-disk rate — /boot and /boot/efi
+// reported identical, far-too-large figures — and mangled the names that end
+// in a device index rather than a partition number: /dev/dm-0 became "dm-",
+// /dev/mmcblk0 became "mmcblk", and a root filesystem on LVM or dm-crypt
+// reported no disk I/O at all. The stripped base stays as a fallback for the
+// kernels and setups that publish only the whole-disk row.
+func diskIOFor(ioByDev map[string]probe.DiskIOInfo, dev string) (probe.DiskIOInfo, bool) {
+	name := strings.TrimPrefix(dev, "/dev/")
+	if io, ok := ioByDev[name]; ok {
+		return io, true
+	}
+	if base := baseDevice(dev); base != name {
+		if io, ok := ioByDev[base]; ok {
+			return io, true
 		}
 	}
-	return strings.TrimSuffix(d, "p")
+	return probe.DiskIOInfo{}, false
+}
+
+// baseDevice strips /dev/ and a partition suffix, so a partition can fall
+// back to the whole disk's counters when its own row is absent. Only the two
+// shapes the kernel actually uses are stripped — "p<digits>" after a device
+// index (nvme0n1p3, mmcblk0p2) and a trailing digit run after a letter
+// (sda1) — because a blanket "drop trailing digits" turns the whole-device
+// names dm-0, mmcblk0 and nvme0n1 into devices that do not exist.
+func baseDevice(dev string) string {
+	d := strings.TrimPrefix(dev, "/dev/")
+	if i := strings.LastIndexByte(d, 'p'); i > 0 && i+1 < len(d) &&
+		isDigit(d[i-1]) && allDigits(d[i+1:]) {
+		return d[:i]
+	}
+	i := len(d)
+	for i > 0 && isDigit(d[i-1]) {
+		i--
+	}
+	if i > 0 && i < len(d) && isLetter(d[i-1]) {
+		return d[:i]
+	}
+	return d
+}
+
+func isDigit(b byte) bool { return b >= '0' && b <= '9' }
+
+func isLetter(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') }
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if !isDigit(s[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // topProcs returns the n busiest processes by CPU.

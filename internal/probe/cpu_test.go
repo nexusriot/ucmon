@@ -1,9 +1,12 @@
 package probe
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/shirou/gopsutil/v4/cpu"
 )
@@ -87,12 +90,13 @@ func TestFormatTemp(t *testing.T) {
 	}
 }
 
-// Smoke test against the real system: SampleCPU must return sane data on
-// any Linux host.
+// Smoke test against the real system: a sampler must return sane data on any
+// Linux host, and must do it from its own baseline rather than a shared one.
 func TestSampleCPUSmoke(t *testing.T) {
-	snap, err := SampleCPU()
+	s := NewCPUSampler()
+	snap, err := s.Sample()
 	if err != nil {
-		t.Fatalf("SampleCPU: %v", err)
+		t.Fatalf("Sample: %v", err)
 	}
 	if len(snap.PerCorePercent) == 0 {
 		t.Error("no per-core data")
@@ -102,6 +106,107 @@ func TestSampleCPUSmoke(t *testing.T) {
 	}
 	if snap.TotalPercent < 0 || snap.TotalPercent > 100 {
 		t.Errorf("TotalPercent = %v", snap.TotalPercent)
+	}
+	// The first sample has no baseline, so it reports 0 rather than erroring.
+	if snap.TotalPercent != 0 || snap.Breakdown.Valid {
+		t.Errorf("first sample claimed an interval: total=%v valid=%v",
+			snap.TotalPercent, snap.Breakdown.Valid)
+	}
+
+	snap2, err := s.Sample()
+	if err != nil {
+		t.Fatalf("second Sample: %v", err)
+	}
+	if !snap2.Breakdown.Valid {
+		t.Error("second sample produced no breakdown")
+	}
+	if len(snap2.PerCorePercent) != len(snap.PerCorePercent) {
+		t.Errorf("core count moved: %d -> %d", len(snap.PerCorePercent), len(snap2.PerCorePercent))
+	}
+	for i, p := range snap2.PerCorePercent {
+		if p < 0 || p > 100 {
+			t.Errorf("core %d = %v", i, p)
+		}
+	}
+}
+
+// A second sampler must not disturb the first one's baseline — that is the
+// whole point of the type. metrics_listen runs the exporter's sampler on its
+// own goroutine while the TUI's keeps ticking.
+func TestCPUSamplersAreIndependent(t *testing.T) {
+	a, b := NewCPUSampler(), NewCPUSampler()
+	if _, err := a.Sample(); err != nil {
+		t.Fatalf("a prime: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := b.Sample(); err != nil {
+			t.Fatalf("b sample: %v", err)
+		}
+	}
+	burnCPU(20 * time.Millisecond)
+	snap, err := a.Sample()
+	if err != nil {
+		t.Fatalf("a sample: %v", err)
+	}
+	if !snap.Breakdown.Valid {
+		t.Fatal("a lost its baseline to b")
+	}
+}
+
+// Concurrent samplers must be race-free: the exporter and the TUI sample at
+// the same time whenever metrics_listen is set.
+func TestCPUSamplerConcurrentUse(t *testing.T) {
+	s := NewCPUSampler()
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				if _, err := s.Sample(); err != nil {
+					t.Errorf("Sample: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// SetTempThresholds is process-wide and written from the exporter goroutine
+// (NewModel applies it per scrape) while the renderer reads it.
+func TestTempThresholdsAreRaceFree(t *testing.T) {
+	defer SetTempThresholds(50, 65, 80)
+
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			SetTempThresholds(40+float64(i%5), 60, 70)
+		}
+		close(done)
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				_ = TempColor(55)
+				_, _, _ = TempThresholds()
+			}
+		}
+	}()
+	wg.Wait()
+}
+
+func burnCPU(d time.Duration) {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
 	}
 }
 
@@ -251,5 +356,34 @@ func TestZoneIndexSortsNumerically(t *testing.T) {
 	}
 	if zoneIndex("not_a_zone") == 0 {
 		t.Error("an unparseable zone name must sort last, not first")
+	}
+}
+
+// ReadDir sorts as text, so a host with ten or more thermal zones listed
+// zone10 and zone11 between zone1 and zone2 in the fallback sensor path.
+func TestReadThermalZonesSortNumerically(t *testing.T) {
+	base := t.TempDir()
+	old := thermalBase
+	thermalBase = base
+	defer func() { thermalBase = old }()
+
+	for _, n := range []int{0, 1, 2, 10, 11} {
+		fakeZone(t, base, fmt.Sprintf("thermal_zone%d", n),
+			fmt.Sprintf("zone%d", n), fmt.Sprintf("%d000", 40+n))
+	}
+
+	got := readThermalZones()
+	want := []string{"zone0", "zone1", "zone2", "zone10", "zone11"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d zones, want %d", len(got), len(want))
+	}
+	for i, w := range want {
+		if got[i].Label != w {
+			labels := make([]string, len(got))
+			for j, r := range got {
+				labels[j] = r.Label
+			}
+			t.Fatalf("zone order = %v, want %v", labels, want)
+		}
 	}
 }

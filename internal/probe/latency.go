@@ -270,3 +270,74 @@ func parseDefaultGateway(r io.Reader) (string, error) {
 	}
 	return "", errors.New("no default route")
 }
+
+// pingGroupRangePath is a var so tests can point it at a fake sysctl file.
+var pingGroupRangePath = "/proc/sys/net/ipv4/ping_group_range"
+
+// icmpSocketProbe opens and closes one datagram ICMP socket. It is the only
+// honest test of the capability: the sysctl range decides it, but so do
+// seccomp filters and container policies that never touch the sysctl.
+func icmpSocketProbe() error {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, unix.IPPROTO_ICMP)
+	if err != nil {
+		return err
+	}
+	return unix.Close(fd)
+}
+
+// pingGroupRange parses net.ipv4.ping_group_range ("0 2147483647"), the gid
+// range the kernel lets open datagram ICMP sockets.
+func pingGroupRange() (lo, hi int64, ok bool) {
+	s, ok := sysReadStr(pingGroupRangePath)
+	if !ok {
+		return 0, 0, false
+	}
+	fields := strings.Fields(s)
+	if len(fields) != 2 {
+		return 0, 0, false
+	}
+	lo, err1 := strconv.ParseInt(fields[0], 10, 64)
+	hi, err2 := strconv.ParseInt(fields[1], 10, 64)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return lo, hi, true
+}
+
+// CheckUnprivilegedICMP reports whether the latency sampler can measure a
+// real round trip or has to fall back to TCP connect timing — which still
+// produces a number, so nothing on screen says the method changed.
+func CheckUnprivilegedICMP() Capability {
+	lo, hi, rangeOK := pingGroupRange()
+	return checkICMP(icmpSocketProbe(), lo, hi, rangeOK, os.Getgid())
+}
+
+// checkICMP is the pure half, so the verdict can be tested without the
+// kernel's cooperation.
+func checkICMP(sockErr error, lo, hi int64, rangeOK bool, gid int) Capability {
+	c := Capability{
+		Name:    "unprivileged ICMP ping",
+		Source:  pingGroupRangePath,
+		Affects: "true round-trip times on the Network tab (TCP connect timing is used instead)",
+	}
+
+	where := ""
+	if rangeOK {
+		where = fmt.Sprintf(" (ping_group_range = %d %d, gid %d)", lo, hi, gid)
+	}
+
+	if sockErr == nil {
+		c.Status = CapPresent
+		c.Detail = "datagram ICMP sockets allowed" + where
+		return c
+	}
+
+	c.Status = CapDenied
+	if !errors.Is(sockErr, unix.EACCES) && !errors.Is(sockErr, unix.EPERM) {
+		c.Status = CapAbsent
+	}
+	c.Detail = "cannot open a datagram ICMP socket: " + sockErr.Error() + where
+	c.Fix = "sudo sysctl -w net.ipv4.ping_group_range=\"0 2147483647\"\n" +
+		"echo 'net.ipv4.ping_group_range = 0 2147483647' | sudo tee /etc/sysctl.d/90-ucmon-ping.conf"
+	return c
+}

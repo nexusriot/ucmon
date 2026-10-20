@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -210,8 +211,12 @@ func absI64(v int64) int64 {
 	return v
 }
 
+// vcgencmdPaths are the absolute locations checked before PATH. A var so
+// tests can point it at a fake tree, matching iwPaths and mmcliPaths.
+var vcgencmdPaths = []string{"/usr/bin/vcgencmd", "/opt/vc/bin/vcgencmd"}
+
 func vcgencmdPath() string {
-	for _, p := range []string{"/usr/bin/vcgencmd", "/opt/vc/bin/vcgencmd"} {
+	for _, p := range vcgencmdPaths {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
@@ -261,4 +266,66 @@ func readThrottle() ThrottleInfo {
 		ThrottledOccurred:     raw&(1<<18) != 0,
 		SoftTempLimitOccurred: raw&(1<<19) != 0,
 	}
+}
+
+// CheckBattery reports whether a battery is exposed at all. A uConsole has
+// one; a Pi on a bench supply has none, and the Power tab says so rather than
+// showing an empty gauge.
+func CheckBattery() Capability {
+	c := Capability{
+		Name:    "battery",
+		Source:  powerSupplyBase,
+		Affects: "Power tab battery gauge, time-to-empty, battery alerts",
+	}
+
+	bat, acKnown, _ := readPowerSupply()
+	if bat.Present {
+		c.Status = CapPresent
+		c.Detail = fmt.Sprintf("%s: %d%%, %s", bat.Name, bat.Capacity, strings.ToLower(bat.Status))
+		return c
+	}
+
+	st, why := pathStatus(powerSupplyBase)
+	c.Status = st
+	switch st {
+	case CapPresent:
+		c.Status = CapAbsent
+		if acKnown {
+			c.Detail = "mains supply only — no battery on this host"
+		} else {
+			c.Detail = "no power supply of type Battery"
+		}
+	case CapDenied:
+		c.Detail = why
+	default:
+		c.Detail = why
+	}
+	return c
+}
+
+// CheckBatteryHealth reports whether the design-capacity counters that pack
+// health is derived from exist. Many embedded fuel gauges — the uConsole's
+// included — publish capacity and status but no *_full_design, so the health
+// percentage is simply absent rather than wrong.
+func CheckBatteryHealth() Capability {
+	c := Capability{
+		Name:    "battery design capacity",
+		Source:  filepath.Join(powerSupplyBase, "<battery>", "{energy,charge}_full_design"),
+		Affects: "the Power tab's battery health %",
+	}
+
+	bat, _, _ := readPowerSupply()
+	if !bat.Present {
+		c.Detail = "no battery on this host"
+		return c
+	}
+
+	c.Source = filepath.Join(powerSupplyBase, bat.Name, "{energy,charge}_full_design")
+	if bat.HealthPct > 0 {
+		c.Status = CapPresent
+		c.Detail = fmt.Sprintf("health %.0f%% of design capacity", bat.HealthPct)
+		return c
+	}
+	c.Detail = "the gauge publishes no *_full_design counter (common on embedded packs)"
+	return c
 }

@@ -15,7 +15,7 @@ import (
 	"github.com/nexusriot/ucmon/internal/probe"
 )
 
-const version = "0.10.0"
+const version = "0.11.0"
 
 // Version reports the ucmon release for the --version flag.
 func Version() string { return version }
@@ -217,12 +217,13 @@ type Model struct {
 	showHelp bool // ?: key-binding overlay
 	peaks    sessionPeaks
 
-	cpuSnap   probe.CPUSnapshot
-	cpuHist   []float64 // total CPU history
-	tempHist  map[string][]float64
-	coreHists [][]float64
-	freqHist  map[string][]float64 // cpufreq MHz per policy
-	psi       probe.PSISnapshot
+	cpuSampler *probe.CPUSampler
+	cpuSnap    probe.CPUSnapshot
+	cpuHist    []float64 // total CPU history
+	tempHist   map[string][]float64
+	coreHists  [][]float64
+	freqHist   map[string][]float64 // cpufreq MHz per policy
+	psi        probe.PSISnapshot
 
 	memSnap  probe.MemSnapshot
 	memHist  []float64 // RAM used %
@@ -334,7 +335,7 @@ func NewModel(cfg config.Config) Model {
 		latSampler = probe.NewLatencySampler(cfg.PingTarget)
 	}
 
-	return Model{
+	m := Model{
 		cfg:          cfg,
 		fastInterval: cfg.FastInterval,
 		procEvery:    procEvery,
@@ -343,6 +344,7 @@ func NewModel(cfg config.Config) Model {
 		peaks:        newSessionPeaks(),
 		tempHist:     map[string][]float64{},
 		freqHist:     map[string][]float64{},
+		cpuSampler:   probe.NewCPUSampler(),
 		diskSampler:  probe.NewDiskSampler(),
 		netSampler:   probe.NewNetSampler(),
 		procSampler:  probe.NewProcSampler(),
@@ -361,6 +363,13 @@ func NewModel(cfg config.Config) Model {
 		trends:       newTrendTracker(),
 		started:      time.Now(),
 	}
+
+	// A misspelled key is indistinguishable from one that had no effect, so
+	// say so once at startup; the notice expires like any other.
+	if n := unknownKeysNotice(cfg); n != "" {
+		m.notice.set(warnStyle.Render(n))
+	}
+	return m
 }
 
 // calibrateTemps seeds the temperature thresholds from the board's own
@@ -393,7 +402,7 @@ func calibrateTemps(cfg *config.Config) {
 // landed in practice.
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{
-		fetchCPUCmd(),
+		fetchCPUCmd(m.cpuSampler),
 		fetchMemCmd(),
 		m.fetchProcsCmd(),
 		m.fetchDiskCmd(),
@@ -431,9 +440,9 @@ func fetchPowerCmd() tea.Cmd {
 	}
 }
 
-func fetchCPUCmd() tea.Cmd {
+func fetchCPUCmd(s *probe.CPUSampler) tea.Cmd {
 	return func() tea.Msg {
-		snap, err := probe.SampleCPU()
+		snap, err := s.Sample()
 		if err != nil {
 			return errMsg{err}
 		}
@@ -714,6 +723,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.netHeader = m.buildNetHeader()
 		m.refreshProcs()
 		m.refreshAlerts()
+		// The rows carry the same column widths as the header, so rebuilding
+		// one without the other left the connection table misaligned until
+		// the next socket walk — up to proc_interval after the resize.
+		m.netText = m.renderNetText()
 		m.netVP.SetContent(hardClipLinesToWidth(m.netText, m.netVP.Width))
 		return m, nil
 
@@ -726,7 +739,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.tickCount++
 			cmds = []tea.Cmd{
-				fetchCPUCmd(),
+				fetchCPUCmd(m.cpuSampler),
 				fetchMemCmd(),
 				fetchPSICmd(),
 				tickEvery(m.fastInterval),
@@ -2692,7 +2705,7 @@ func (m *Model) cycleGovernor() tea.Cmd {
 		}
 	}
 	m.setNotice(okStyle.Render("governor → " + next))
-	return fetchCPUCmd()
+	return fetchCPUCmd(m.cpuSampler)
 }
 
 // adjustBacklight nudges screen brightness by delta percent and refreshes the

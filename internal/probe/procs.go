@@ -493,3 +493,47 @@ func ClampNice(n int) int {
 func SetNice(pid int32, nice int) error {
 	return syscall.Setpriority(syscall.PRIO_PROCESS, int(pid), ClampNice(nice))
 }
+
+// CheckProcIO reports whether per-process I/O counters are readable beyond
+// this user's own processes. /proc/<pid>/io is 0400 and owned by the process
+// owner, so without CAP_SYS_PTRACE (or root) the Processes tab can show disk
+// I/O for the user's own processes and nothing else — and a system that is
+// visibly writing shows a column of dashes.
+func CheckProcIO() Capability {
+	c := Capability{
+		Name:    "per-process disk I/O",
+		Source:  filepath.Join(procBase, "<pid>", "io"),
+		Affects: "the Processes tab I/O columns and the process detail view",
+		Fix: "run ucmon as root, or grant the binary the capability:\n" +
+			"sudo setcap cap_sys_ptrace+ep $(command -v ucmon)",
+	}
+
+	selfDir := filepath.Join(procBase, strconv.Itoa(os.Getpid()))
+	if _, _, ok := readProcIO(selfDir); !ok {
+		st, why := pathStatus(filepath.Join(selfDir, "io"))
+		switch st {
+		case CapDenied:
+			c.Status = CapDenied
+			c.Detail = why + " — even this process's own counters are refused"
+		default:
+			c.Status = CapAbsent
+			c.Detail = why + " — kernel built without CONFIG_TASK_IO_ACCOUNTING"
+			c.Fix = "" // no capability brings back a counter the kernel never keeps
+		}
+		return c
+	}
+
+	// pid 1 belongs to root on any booted system, so it is the cheapest
+	// probe for "can we see other users' processes".
+	other := filepath.Join(procBase, "1")
+	if _, _, ok := readProcIO(other); !ok {
+		c.Status = CapDenied
+		c.Detail = "own processes only; " + filepath.Join(other, "io") + " is unreadable without CAP_SYS_PTRACE"
+		return c
+	}
+
+	c.Status = CapPresent
+	c.Detail = "readable for every process"
+	c.Fix = ""
+	return c
+}

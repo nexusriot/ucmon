@@ -91,6 +91,28 @@ type Config struct {
 	ReportDir     string // where "w" writes snapshot reports
 	HistoryFile   string // persist sparkline history here ("" = off)
 	MetricsListen string // Prometheus exporter address, e.g. ":9100" ("" = off)
+
+	// Unknown lists the keys the file set that apply() does not recognise —
+	// a typo, or a key from a newer ucmon. They are never fatal (a config
+	// written for a later release has to keep working), but silence made a
+	// misspelled key indistinguishable from one that had no effect.
+	Unknown []UnknownKey
+}
+
+// UnknownKey is one unrecognised setting and the line it was written on.
+type UnknownKey struct {
+	Key  string
+	Line int
+}
+
+// UnknownKeyNames lists the unrecognised keys in the order they appeared,
+// for a one-line notice.
+func (c Config) UnknownKeyNames() []string {
+	out := make([]string, 0, len(c.Unknown))
+	for _, u := range c.Unknown {
+		out = append(out, u.Key)
+	}
+	return out
 }
 
 // Default returns the built-in configuration used when no file is present.
@@ -162,8 +184,10 @@ func LoadFrom(path string) Config {
 	}
 	defer f.Close()
 
+	seen := map[string]bool{}
 	sc := bufio.NewScanner(f)
-	for sc.Scan() {
+	for n := 0; sc.Scan(); {
+		n++
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
@@ -176,7 +200,17 @@ func LoadFrom(path string) Config {
 			continue
 		}
 		key := strings.ToLower(strings.TrimSpace(line[:eq]))
-		apply(&cfg, key, splitValue(line[eq+1:]))
+		if apply(&cfg, key, splitValue(line[eq+1:])) {
+			continue
+		}
+		// A line with nothing before the "=" is malformed, not a key, and
+		// naming it "" in a report would explain nothing. Repeats are
+		// recorded once, at the line that first introduced them.
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		cfg.Unknown = append(cfg.Unknown, UnknownKey{Key: key, Line: n})
 	}
 	return cfg
 }
@@ -217,7 +251,10 @@ scan:
 	return val
 }
 
-func apply(cfg *Config, key, val string) {
+// apply sets the field key names, and reports whether the key was one it
+// knows. Everything LoadFrom could not place comes back false, so an
+// unrecognised key can be named rather than silently dropped.
+func apply(cfg *Config, key, val string) bool {
 	switch key {
 	case "start_tab", "starttab", "tab":
 		cfg.StartTab = strings.ToLower(val)
@@ -346,7 +383,10 @@ func apply(cfg *Config, key, val string) {
 		cfg.HistoryFile = expandHome(val)
 	case "metrics_listen", "metricslisten", "metrics":
 		cfg.MetricsListen = val
+	default:
+		return false
 	}
+	return true
 }
 
 // expandHome resolves a leading "~/" against the user's home directory.

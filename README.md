@@ -19,6 +19,7 @@ Built in Go with the [Bubble Tea](https://github.com/charmbracelet/bubbletea) fr
 - **Persistent history** — set `history_file` and the sparklines and session peaks survive a restart
 - **Snapshot export** — press `w` on any tab to write a plain-text report of all current readings to `~/ucmon-report-<timestamp>.txt`
 - **Pause** (`space`) freezes sampling to inspect readings; **help overlay** (`?`) lists every key
+- **Capability report** — `ucmon doctor` lists every source ucmon reads (PSI, `vcgencmd`, `iw`, `mmcli`, unprivileged ICMP, `/proc/<pid>/io`, eMMC wear counters, the battery's design capacity, the writable governor and backlight files) as present / absent / denied / read-only, says which rows go missing without each one, and prints the exact udev rule for the two writable ones. `ucmon --check-config` does the same for config keys ucmon does not recognise
 - **Headless mode** — `ucmon --once` prints the full snapshot report to stdout and exits (for SSH sessions and cron); `--once --json` emits the same readings as JSON for scripts
 - **Prometheus exporter** — `ucmon --metrics :9100` serves `/metrics` and `/snapshot` without a TUI, or `metrics_listen` runs one alongside the monitor. Sampling is lazy and rate-limited, so a tight scrape loop cannot peg a CM4
 - **Ignore lists** — `net_ignore` / `disk_ignore` / `temp_ignore` hide noisy names (container veths, snap loop mounts, per-core `coretemp` sensors) from their tab, the `--once` report and the alert engine alike; comma-separated globs where `*` spans `/`, so `/snap/*` covers a whole subtree
@@ -41,18 +42,42 @@ binaries, and a smoke job that drives the real CLI. See
 ## Command line
 
 ```
-ucmon [flags]
+ucmon [flags] [doctor]
   --once            print one snapshot report to stdout and exit (no TUI)
   --json            with --once, print the snapshot as JSON instead of text
   --metrics <addr>  serve Prometheus metrics on this address (e.g. :9100), no TUI
+  --doctor          report what this host can measure and why the rest is
+                    missing, then exit (no TUI); `ucmon doctor` does the same
+  --check-config    list the config keys ucmon does not recognise and exit
   --config <path>   use an explicit config file
   --tab <name>      start tab: cpu|mem|proc|disk|net|power|gpu|alerts
   --version         print the version and exit
 ```
 
+`ucmon doctor` answers "why is the GPU tab empty" without a trip through the
+source: it checks every source ucmon reads — thermal sensors, cpufreq, PSI,
+`/proc/<pid>/io`, the battery and its design-capacity counters, `vcgencmd`,
+the backlight, `iw`, `mmcli`, unprivileged ICMP and eMMC wear counters —
+and prints each one as present, absent, denied or read-only, with what it
+found, which rows go missing without it, and how to get it. For the two
+writable sources (cpufreq `scaling_governor` and backlight `brightness`) that
+remedy is the exact udev rule, ready to paste. It needs no privileges, writes
+nothing, and always exits 0: an absent source is a fact about the board, not
+an error. The report ends with the config settings that suppress a reading the
+host could otherwise produce (`ping_enabled`, `modem_enabled`, the ignore
+globs).
+
+`ucmon --check-config` names the keys in your config file that ucmon does not
+recognise, with their line numbers, and exits non-zero when it finds any, so a
+packaging or provisioning script can gate on it. The monitor itself never
+fails on one: a config written for a newer ucmon has to keep working, so
+unknown keys are ignored at startup — with a one-line notice in the footer
+naming them.
+
 The exporter serves `/metrics` (Prometheus text format), `/snapshot` (the JSON
 report) and `/healthz`. It re-samples at most once every 5 seconds however
-often it is scraped.
+often it is scraped, and collects through a model of its own, so running it
+alongside the TUI (`metrics_listen`) never perturbs what is on screen.
 
 ## Configuration
 
@@ -126,11 +151,15 @@ procs_cap      = 200     # process rows rendered
 ```
 
 Intervals accept a Go duration (`"500ms"`, `"2s"`) or a bare number of seconds.
-Unknown keys, comments (`#`), and `[section]` headers are ignored.
+Comments (`#`), and `[section]` headers are ignored. Unknown keys are ignored
+too — never fatal, so a file written for a newer release still starts — but
+ucmon names them in a startup notice, and `ucmon --check-config` lists them
+with their line numbers.
 
 > Changing backlight brightness or the cpufreq governor writes to sysfs, which
 > usually requires root or a udev rule granting your user write access. ucmon
-> shows the values read-only otherwise.
+> shows the values read-only otherwise, and `ucmon doctor` prints the udev
+> rule for whichever of the two this host refuses.
 >
 > The latency monitor uses unprivileged ICMP datagram sockets (enabled by
 > default on Raspberry Pi OS via `net.ipv4.ping_group_range`); where those are
@@ -190,6 +219,7 @@ make help               # list all targets
 | `esc`              | Cancel search / kill / close overlay |
 | `ctrl+u`           | Clear search filter          |
 | `↑` `↓` PgUp/PgDn  | Move cursor (procs) / scroll |
+| `home` / `end`     | First / last process row     |
 | `s`                | Cycle process sort (CPU/MEM/I-O/PID/NAME) |
 | `t`                | Toggle process tree / flat view |
 | `k` / `K`          | SIGTERM / SIGKILL selected process (confirm with `y`) |

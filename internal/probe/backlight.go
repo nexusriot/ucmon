@@ -135,3 +135,49 @@ func writable(path string) bool {
 	_ = f.Close()
 	return true
 }
+
+// BacklightUdevRule grants the "video" group write access to every
+// backlight's brightness file, which is what the GPU tab's +/- keys need
+// from a non-root user. Printed verbatim by the doctor report.
+const BacklightUdevRule = `# /etc/udev/rules.d/90-ucmon-backlight.rules
+ACTION=="add", SUBSYSTEM=="backlight", RUN+="/bin/chgrp video /sys/class/backlight/%k/brightness", RUN+="/bin/chmod g+w /sys/class/backlight/%k/brightness"
+
+sudo usermod -aG video "$USER"   # then log out and back in
+sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=backlight`
+
+// CheckBacklightWrite reports whether the panel brightness can be read and
+// changed. Read-only is the interesting case: the GPU tab shows the level and
+// refuses the +/- keys, which looks like a broken key rather than a
+// permission.
+func CheckBacklightWrite(override string) Capability {
+	c := Capability{
+		Name:    "backlight brightness",
+		Source:  backlightBase,
+		Affects: "the GPU tab's +/- keys (and the brightness row)",
+	}
+
+	bl := ReadBacklight(override)
+	if !bl.Present {
+		st, why := pathStatus(backlightBase)
+		c.Status = st
+		switch st {
+		case CapPresent:
+			c.Status = CapAbsent
+			c.Detail = "no device under " + backlightBase + " reports brightness/max_brightness"
+		default:
+			c.Detail = why + " — headless host, or a panel with no sysfs backlight"
+		}
+		return c
+	}
+
+	c.Source = filepath.Join(backlightBase, bl.Device, "brightness")
+	if !bl.Writable {
+		c.Status = CapReadOnly
+		c.Detail = fmt.Sprintf("%s reads %d%% but is not writable by this user", bl.Device, bl.Percent)
+		c.Fix = BacklightUdevRule
+		return c
+	}
+	c.Status = CapPresent
+	c.Detail = fmt.Sprintf("%s at %d%% (%d/%d), writable", bl.Device, bl.Percent, bl.Brightness, bl.Max)
+	return c
+}
