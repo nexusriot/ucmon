@@ -145,12 +145,16 @@ func TestCPUSamplersAreIndependent(t *testing.T) {
 	if _, err := a.Sample(); err != nil {
 		t.Fatalf("a prime: %v", err)
 	}
+	// The burn goes before b's reads, not after: it has to separate a's two
+	// samples without also separating b's last one from a's. Burning
+	// afterwards hands a shared baseline the same wide interval, and the test
+	// sails through the very regression it names.
+	burnCPU(20 * time.Millisecond)
 	for i := 0; i < 5; i++ {
 		if _, err := b.Sample(); err != nil {
 			t.Fatalf("b sample: %v", err)
 		}
 	}
-	burnCPU(20 * time.Millisecond)
 	snap, err := a.Sample()
 	if err != nil {
 		t.Fatalf("a sample: %v", err)

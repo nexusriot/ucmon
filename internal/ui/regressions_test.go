@@ -250,6 +250,14 @@ func TestExporterAndModelRunConcurrently(t *testing.T) {
 	wg.Wait()
 }
 
+// burnCPU spins for d so the interval under test spans at least one USER_HZ
+// tick. probe has its own copy; a test helper is not worth exporting for.
+func burnCPU(d time.Duration) {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+	}
+}
+
 // Two samplers must not consume each other's baseline: with metrics_listen
 // set, every scrape used to re-prime the shared gopsutil baseline the TUI was
 // about to diff against, so the next frame measured the exporter's 600 ms
@@ -262,6 +270,13 @@ func TestCPUSamplersDoNotShareABaseline(t *testing.T) {
 	if _, err := tui.cpuSampler.Sample(); err != nil {
 		t.Fatalf("prime: %v", err)
 	}
+	// /proc/stat counts in USER_HZ ticks, so the window has to be wider than
+	// a tick or the diff is zero whatever the samplers do — that is what fails
+	// on a CI runner, where Sample() has no thermal zones or cpufreq policies
+	// to read and so returns far inside one. Burn it here rather than after
+	// the loop: the exporter's reads then stay back to back right before the
+	// TUI's, so only an unshared baseline reaches 20ms back for its interval.
+	burnCPU(20 * time.Millisecond)
 	for i := 0; i < 4; i++ {
 		if _, err := exporter.Sample(); err != nil {
 			t.Fatalf("exporter sample: %v", err)
