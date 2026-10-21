@@ -46,12 +46,8 @@ func (e *Exporter) snapshot() (*Model, error) {
 		return e.model, e.err
 	}
 
-	m, err := collectOnce(e.cfg)
+	m := collectOnce(e.cfg)
 	e.lastAt = time.Now()
-	if err != nil {
-		e.err = err
-		return nil, err
-	}
 	e.model, e.err = &m, nil
 	return e.model, nil
 }

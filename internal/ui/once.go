@@ -12,16 +12,13 @@ import (
 // probes (CPU%, network and disk throughput) are primed, then re-sampled
 // after a short window so the report shows real rates instead of zeros.
 func RunOnce(cfg config.Config) (string, error) {
-	m, err := collectOnce(cfg)
-	if err != nil {
-		return "", err
-	}
-	return m.buildReport(time.Now()), nil
+	return collectOnce(cfg).buildReport(time.Now()), nil
 }
 
 // collectOnce primes the delta-based samplers, waits a short window, then
-// reads everything once.
-func collectOnce(cfg config.Config) (Model, error) {
+// reads everything once. Every probe is best-effort — an absent source is a
+// hidden row, not a failure — so there is nothing here for it to report.
+func collectOnce(cfg config.Config) Model {
 	cfg.Sanitize()
 	m := NewModel(cfg) // NewModel sanitizes, calibrates and applies thresholds
 	cfg = m.cfg
@@ -83,16 +80,12 @@ func collectOnce(cfg config.Config) (Model, error) {
 	}
 	m.recordTrend(time.Now())
 
-	return m, nil
+	return m
 }
 
 // RunOnceJSON is RunOnce in the machine-readable shape, for scripts and cron
 // jobs that would otherwise have to re-parse the text report's layout every
 // time the layout changes.
 func RunOnceJSON(cfg config.Config) (string, error) {
-	m, err := collectOnce(cfg)
-	if err != nil {
-		return "", err
-	}
-	return m.buildJSONReport(time.Now())
+	return collectOnce(cfg).buildJSONReport(time.Now())
 }

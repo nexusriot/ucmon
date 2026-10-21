@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/nexusriot/ucmon/internal/config"
 	"github.com/nexusriot/ucmon/internal/probe"
@@ -79,8 +80,11 @@ func TestPauseFreezesSamplingButNotAlerting(t *testing.T) {
 	cfg.AlertsEnabled = true
 	m := sizedModel(t, cfg, 100, 30)
 
-	// A condition that is unambiguously firing.
-	m.cpuSnap.Temperatures = []probe.TempReading{{Label: "cpu_thermal", Temp: cfg.TempCrit + 10}}
+	// A condition that is unambiguously firing. The threshold has to come
+	// from the model's own config: NewModel calibrates it from the board's
+	// thermal trip points, so cfg's default 80 is not what alerting compares
+	// against on a host that publishes a higher critical trip.
+	m.cpuSnap.Temperatures = []probe.TempReading{{Label: "cpu_thermal", Temp: m.cfg.TempCrit + 10}}
 
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace})
 	m = next.(Model)
@@ -196,6 +200,12 @@ func assertFitsFrame(t *testing.T, m Model, w, h int) {
 	lines := strings.Split(m.View(), "\n")
 	if len(lines) > h {
 		t.Errorf("view is %d lines, terminal is %d", len(lines), h)
+	}
+	for i, ln := range lines {
+		// lipgloss.Width, not len: every line carries ANSI colour codes.
+		if got := lipgloss.Width(ln); got > w {
+			t.Errorf("line %d is %d columns, terminal is %d: %q", i, got, w, ln)
+		}
 	}
 }
 

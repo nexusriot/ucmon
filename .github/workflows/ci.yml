@@ -72,9 +72,12 @@ jobs:
           cache: true
 
       # Pinned rather than @latest: a new check landing upstream should be an
-      # intentional upgrade, not a red build on an untouched commit.
+      # intentional upgrade, not a red build on an untouched commit. v0.6.1 is
+      # the newest release that builds under the go.mod toolchain — v0.7.0
+      # requires Go >= 1.25, which GOTOOLCHAIN=local will not fetch — so this
+      # moves when the `go` directive in go.mod moves, not before.
       - name: Install staticcheck
-        run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+        run: go install honnef.co/go/tools/cmd/staticcheck@v0.6.1
 
       - name: staticcheck
         run: |

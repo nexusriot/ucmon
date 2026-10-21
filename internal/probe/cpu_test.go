@@ -113,6 +113,13 @@ func TestSampleCPUSmoke(t *testing.T) {
 			snap.TotalPercent, snap.Breakdown.Valid)
 	}
 
+	// /proc/stat counts in 10ms USER_HZ ticks, so two back-to-back reads
+	// usually land inside the same tick and diff to nothing. This host hides
+	// that because Sample() spends longer than a tick reading thermal zones
+	// and cpufreq policies; a CI runner has neither and returns instantly.
+	// Burn a window wider than one tick so the interval is always real.
+	burnCPU(20 * time.Millisecond)
+
 	snap2, err := s.Sample()
 	if err != nil {
 		t.Fatalf("second Sample: %v", err)
