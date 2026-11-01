@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 	"github.com/nexusriot/ucmon/internal/probe"
 )
 
-const version = "0.11.0"
+const version = "0.12.0"
 
 // Version reports the ucmon release for the --version flag.
 func Version() string { return version }
@@ -124,9 +125,10 @@ func (s procSort) String() string {
 
 // killPrompt holds the pending kill confirmation.
 type killPrompt struct {
-	pid  int32
-	name string
-	hard bool // true = SIGKILL, false = SIGTERM
+	pid   int32
+	start uint64 // with pid, the process's identity; see probe.KillProcess
+	name  string
+	hard  bool // true = SIGKILL, false = SIGTERM
 }
 
 func (k killPrompt) signal() string {
@@ -196,7 +198,13 @@ type healthMsg struct {
 	storage []probe.StorageHealth
 	modem   probe.ModemInfo
 }
-type errMsg struct{ error }
+
+// errMsg is a failed fetch. kind names the round so its in-flight guard
+// clears on failure too; otherwise one error would stop that probe for good.
+type errMsg struct {
+	error
+	kind fetchKind
+}
 
 func tickEvery(d time.Duration) tea.Cmd {
 	return tea.Tick(d, func(t time.Time) tea.Msg { return tickMsg(t) })
@@ -225,9 +233,15 @@ type Model struct {
 	freqHist   map[string][]float64 // cpufreq MHz per policy
 	psi        probe.PSISnapshot
 
-	memSnap  probe.MemSnapshot
-	memHist  []float64 // RAM used %
-	swapHist []float64 // swap used %
+	memSnap probe.MemSnapshot
+	oom     oomTracker
+	kmsg    *probe.KmsgWatcher // nil unless FollowKernelLog opened it
+	klog    kernelLog
+	// hiddenDisks are the disks whose every mount disk_ignore hides.
+	hiddenDisks map[string]bool
+	now         time.Time // the latest tick: what event alerts expire against
+	memHist     []float64 // RAM used %
+	swapHist    []float64 // swap used %
 
 	powerSnap probe.PowerSnapshot
 	battHist  []float64 // battery capacity %
@@ -424,7 +438,7 @@ func fetchMemCmd() tea.Cmd {
 	return func() tea.Msg {
 		snap, err := probe.SampleMem()
 		if err != nil {
-			return errMsg{err}
+			return errMsg{err, fetchMem}
 		}
 		return memMsg(snap)
 	}
@@ -434,7 +448,7 @@ func fetchPowerCmd() tea.Cmd {
 	return func() tea.Msg {
 		snap, err := probe.SamplePower()
 		if err != nil {
-			return errMsg{err}
+			return errMsg{err, fetchPower}
 		}
 		return powerMsg(snap)
 	}
@@ -444,7 +458,7 @@ func fetchCPUCmd(s *probe.CPUSampler) tea.Cmd {
 	return func() tea.Msg {
 		snap, err := s.Sample()
 		if err != nil {
-			return errMsg{err}
+			return errMsg{err, fetchCPU}
 		}
 		return cpuMsg(snap)
 	}
@@ -465,7 +479,7 @@ func (m Model) fetchDiskCmd() tea.Cmd {
 	return func() tea.Msg {
 		disks, ios, err := sampler.Sample()
 		if err != nil {
-			return errMsg{err}
+			return errMsg{err, fetchDisk}
 		}
 		return diskMsg{disks, ios}
 	}
@@ -492,7 +506,7 @@ func fetchNetCmd(s *probe.NetSampler) tea.Cmd {
 	return func() tea.Msg {
 		snap, err := s.Sample()
 		if err != nil {
-			return errMsg{err}
+			return errMsg{err, fetchNet}
 		}
 		return netMsg(snap)
 	}
@@ -721,7 +735,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.alertsVP.Height = max(1, bodyH-2)
 
 		m.netHeader = m.buildNetHeader()
-		m.refreshProcs()
+		m.refreshProcsFollow()
 		m.refreshAlerts()
 		// The rows carry the same column widths as the header, so rebuilding
 		// one without the other left the connection table misaligned until
@@ -732,17 +746,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		var cmds []tea.Cmd
+		m.now = time.Time(msg)
 		if m.paused {
-			// Fetch nothing: every snapshot freezes where it stands. The
-			// heartbeat keeps running so the frame still redraws.
+			// Freeze every reading where it stands. The heartbeat keeps
+			// running so the frame still redraws, and the event streams keep
+			// flowing: an OOM kill or a kernel I/O error during a pause is
+			// still an alert, and the log ring must not wrap unread.
 			cmds = []tea.Cmd{tickEvery(m.fastInterval)}
+			cmds = m.queue(cmds, fetchMem, fetchOOMCountCmd)
+			if m.kmsg != nil {
+				w := m.kmsg
+				cmds = m.queue(cmds, fetchKmsg, func() tea.Cmd { return fetchKmsgCmd(w) })
+			}
 		} else {
 			m.tickCount++
-			cmds = []tea.Cmd{
-				fetchCPUCmd(m.cpuSampler),
-				fetchMemCmd(),
-				fetchPSICmd(),
-				tickEvery(m.fastInterval),
+			cmds = []tea.Cmd{tickEvery(m.fastInterval)}
+			cmds = m.queue(cmds, fetchCPU, func() tea.Cmd { return fetchCPUCmd(m.cpuSampler) })
+			cmds = m.queue(cmds, fetchMem, fetchMemCmd)
+			cmds = m.queue(cmds, fetchPSI, fetchPSICmd)
+			cmds = m.queue(cmds, fetchNet, func() tea.Cmd { return fetchNetCmd(m.netSampler) })
+			if m.kmsg != nil {
+				w := m.kmsg
+				cmds = m.queue(cmds, fetchKmsg, func() tea.Cmd { return fetchKmsgCmd(w) })
 			}
 			if m.tickCount%m.procEvery == 0 {
 				cmds = m.queue(cmds, fetchProcs, m.fetchProcsCmd)
@@ -751,16 +776,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// host — strictly more work than the process walk beside it,
 				// so it needs the same guard rather than a bare dispatch.
 				cmds = m.queue(cmds, fetchConns, fetchConnsCmdFn)
-				if m.detail != nil {
-					cmds = append(cmds, fetchProcDetailCmd(m.detail.pid))
+				if m.detail != nil && !m.detail.gone {
+					pid := m.detail.pid
+					cmds = m.queue(cmds, fetchDetail, func() tea.Cmd { return fetchProcDetailCmd(pid) })
 				}
 			}
 			if m.tickCount%m.slowEvery == 0 {
-				cmds = append(cmds, m.fetchDiskCmd(), fetchNetCmd(m.netSampler), fetchPowerCmd())
+				cmds = m.queue(cmds, fetchDisk, m.fetchDiskCmd)
+				cmds = m.queue(cmds, fetchPower, fetchPowerCmd)
 				cmds = m.queue(cmds, fetchSys, m.fetchSysCmd)
-				cmds = append(cmds, m.fetchHealthCmd())
-			} else {
-				cmds = append(cmds, fetchNetCmd(m.netSampler))
+				cmds = m.queue(cmds, fetchHealth, m.fetchHealthCmd)
 			}
 		}
 
@@ -779,6 +804,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case cpuMsg:
+		m.done(fetchCPU)
 		m.cpuSnap = probe.CPUSnapshot(msg)
 		m.cpuSnap.Temperatures = m.keepTemps(m.cpuSnap.Temperatures)
 		m.err = nil
@@ -811,6 +837,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case memMsg:
+		m.done(fetchMem)
 		m.memSnap = probe.MemSnapshot(msg)
 		m.memHist = append(m.memHist, m.memSnap.UsedPct)
 		m.memHist = probe.ClampHistory(m.memHist, m.histLen())
@@ -819,9 +846,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.swapHist = probe.ClampHistory(m.swapHist, m.histLen())
 		}
 		m.peaks.observeMem(m.memSnap.UsedPct)
+		if m.memSnap.OOMKillsOK {
+			m.oom.observe(m.memSnap.OOMKills, m.memSnap.TakenAt, m.eventWindow())
+		}
 		return m, nil
 
 	case powerMsg:
+		m.done(fetchPower)
 		m.powerSnap = probe.PowerSnapshot(msg)
 		bat := m.powerSnap.Battery
 		if bat.Present && bat.Capacity >= 0 {
@@ -843,6 +874,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case psiMsg:
+		m.done(fetchPSI)
 		m.psi = probe.PSISnapshot(msg)
 		return m, nil
 
@@ -864,9 +896,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case procDetailMsg:
-		if m.detail != nil && msg.err == nil && msg.d.PID == m.detail.pid {
-			m.detail.d = msg.d
-			m.detail.loaded = true
+		m.done(fetchDetail)
+		if m.detail != nil && msg.pid == m.detail.pid {
+			m.detail.apply(msg)
 		}
 		return m, nil
 
@@ -877,15 +909,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.procs = msg.procs
-		m.refreshProcs()
+		m.refreshProcsFollow()
 		return m, nil
 
 	case diskMsg:
+		m.done(fetchDisk)
+		m.hiddenDisks = m.hiddenDisksOf(msg.disks)
 		m.disks = m.keepDisks(msg.disks)
 		m.diskIOs = msg.ios
 		return m, nil
 
 	case netMsg:
+		m.done(fetchNet)
 		m.netSnap = probe.NetSnapshot(msg)
 		m.netSnap.Ifaces = m.keepIfaces(m.netSnap.Ifaces)
 		present := make(map[string]bool, len(m.netSnap.Ifaces))
@@ -922,6 +957,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case healthMsg:
+		m.done(fetchHealth)
 		m.storage = msg.storage
 		hadModem := m.modem.Present
 		m.modem = msg.modem
@@ -930,7 +966,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case kmsgMsg:
+		m.handleKmsg(msg)
+		return m, nil
+
+	case errorNoticeMsg:
+		m.setNotice(errStyle.Render(msg.err.Error()))
+		return m, nil
+
+	case oomCountMsg:
+		m.done(fetchMem)
+		if msg.ok {
+			m.oom.observe(msg.n, msg.at, m.eventWindow())
+		}
+		return m, nil
+
 	case errMsg:
+		m.done(msg.kind)
 		m.err = msg.error
 		return m, nil
 
@@ -943,7 +995,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.procsKill = nil
 				notice := okStyle.Render(
 					fmt.Sprintf("sent %s to %s (%d)", kp.signal(), kp.name, kp.pid))
-				if err := probe.KillProcess(kp.pid, kp.hard); err != nil {
+				if err := probe.KillProcess(kp.pid, kp.start, kp.hard); err != nil {
 					notice = errStyle.Render(
 						fmt.Sprintf("%s %d failed: %v", kp.signal(), kp.pid, err))
 				}
@@ -1105,7 +1157,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.activeTab == tabProc {
 				m.procsSel += max(1, m.procsVP.Height)
 				if m.procsSel > len(m.procsView)-1 {
-					m.procsSel = len(m.procsView) - 1
+					m.procsSel = max(0, len(m.procsView)-1)
 				}
 				m.rerenderProcs()
 				return m, nil
@@ -1143,7 +1195,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "K":
 			if m.activeTab == tabProc {
 				if p, ok := m.selectedProc(); ok {
-					m.procsKill = &killPrompt{pid: p.PID, name: p.Name, hard: true}
+					m.procsKill = &killPrompt{pid: p.PID, start: p.StartTime, name: p.Name, hard: true}
 				}
 				return m, nil
 			}
@@ -1213,7 +1265,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.activeTab == tabProc {
 				if p, ok := m.selectedProc(); ok {
-					m.procsKill = &killPrompt{pid: p.PID, name: p.Name, hard: false}
+					m.procsKill = &killPrompt{pid: p.PID, start: p.StartTime, name: p.Name, hard: false}
 				}
 				return m, nil
 			}
@@ -1594,7 +1646,27 @@ func (m Model) viewAlerts() string {
 	return m.box(content)
 }
 
+// viewCPU draws the CPU tab, compacting it only as far as the frame needs.
+// On a 16-core x86 host the full layout (a row per cpufreq policy, the core
+// grid with sparklines) ran past 40 rows and the box clipped the
+// temperatures — the half of the tab its name promises — without a trace.
 func (m Model) viewCPU() string {
+	var out string
+	for level := range cpuCompactLevels {
+		out = m.cpuBody(level)
+		if strings.Count(out, "\n") <= m.bodyHeight() {
+			break
+		}
+	}
+	return m.box(out)
+}
+
+// cpuCompactLevels: 0 everything; 1 the frequency rows folded into one
+// line; 2 also the per-core grid without sparklines, packed denser; 3 also
+// the temperatures ahead of the per-core grid, so what is clipped is cores.
+const cpuCompactLevels = 4
+
+func (m Model) cpuBody(level int) string {
 	w := m.boxWidth()
 
 	var b strings.Builder
@@ -1607,7 +1679,7 @@ func (m Model) viewCPU() string {
 
 	if m.cpuSnap.TakenAt.IsZero() {
 		b.WriteString("Collecting CPU data…\n")
-		return m.box(b.String())
+		return b.String()
 	}
 
 	b.WriteString(fmt.Sprintf("Time: %s\n\n", m.cpuSnap.TakenAt.Format("2006-01-02 15:04:05")))
@@ -1645,7 +1717,9 @@ func (m Model) viewCPU() string {
 	}
 
 	// cpufreq: current clock, limits, and governor per policy
-	if len(m.cpuSnap.Freqs) > 0 {
+	if len(m.cpuSnap.Freqs) > 1 && level >= 1 {
+		b.WriteString(titleStyle.Render("Frequency") + " " + freqSummary(m.cpuSnap.Freqs) + "\n\n")
+	} else if len(m.cpuSnap.Freqs) > 0 {
 		b.WriteString(titleStyle.Render("Frequency") + " " + subtleStyle.Render("(g cycles governor)") + "\n")
 		for _, f := range m.cpuSnap.Freqs {
 			gov := f.Governor
@@ -1675,78 +1749,133 @@ func (m Model) viewCPU() string {
 		b.WriteString(titleStyle.Render("Pressure") + " " + psi + "\n\n")
 	}
 
-	// Per-core (multi-column layout for many cores)
-	if len(m.cpuSnap.PerCorePercent) > 0 {
-		b.WriteString(titleStyle.Render("Per Core") + "\n")
-		nCores := len(m.cpuSnap.PerCorePercent)
+	perCore := func() {
+		// Per-core (multi-column layout for many cores)
+		if len(m.cpuSnap.PerCorePercent) > 0 {
+			b.WriteString(titleStyle.Render("Per Core") + "\n")
+			nCores := len(m.cpuSnap.PerCorePercent)
 
-		labelW := 8 // "Core XX "
-		if nCores >= 100 {
-			labelW = 10
-		}
-
-		// Each column: "  " + label + bar + " " + spark
-		sparkW := min(16, chartW/4)
-		coreBarW := min(24, chartW/3)
-		colW := 2 + labelW + coreBarW + 1 + sparkW
-
-		cols := max(1, w/colW)
-		// Cap at 4 columns max for readability
-		if cols > 4 {
-			cols = 4
-		}
-
-		rows := (nCores + cols - 1) / cols
-
-		for r := 0; r < rows; r++ {
-			var line strings.Builder
-			for c := 0; c < cols; c++ {
-				i := c*rows + r
-				if i >= nCores {
-					break
-				}
-				pct := m.cpuSnap.PerCorePercent[i]
-				label := fmt.Sprintf("Core %-*d", labelW-5, i)
-				bar := RenderBarWithLabel("", pct, coreBarW)
-				spark := ""
-				if i < len(m.coreHists) {
-					spark = SparkPct(m.coreHists[i], sparkW)
-				}
-				line.WriteString(fmt.Sprintf("  %-*s%s %s", labelW, label, bar, spark))
+			labelW := 8 // "Core XX "
+			if nCores >= 100 {
+				labelW = 10
 			}
-			b.WriteString(line.String() + "\n")
+
+			// Each column: "  " + label + bar + " " + spark
+			sparkW := min(16, chartW/4)
+			coreBarW := min(24, chartW/3)
+			if level >= 2 {
+				sparkW, coreBarW = 0, min(16, chartW/4)
+			}
+			colW := 2 + labelW + coreBarW + 1 + sparkW
+
+			cols := max(1, w/colW)
+			// Cap at 4 columns max for readability
+			if cols > 4 {
+				cols = 4
+			}
+
+			rows := (nCores + cols - 1) / cols
+
+			for r := 0; r < rows; r++ {
+				var line strings.Builder
+				for c := 0; c < cols; c++ {
+					i := c*rows + r
+					if i >= nCores {
+						break
+					}
+					pct := m.cpuSnap.PerCorePercent[i]
+					label := fmt.Sprintf("Core %-*d", labelW-5, i)
+					bar := RenderBarWithLabel("", pct, coreBarW)
+					spark := ""
+					if i < len(m.coreHists) && sparkW > 0 {
+						spark = SparkPct(m.coreHists[i], sparkW)
+					}
+					line.WriteString(fmt.Sprintf("  %-*s%s %s", labelW, label, bar, spark))
+				}
+				b.WriteString(line.String() + "\n")
+			}
+			b.WriteString("\n")
 		}
+	}
+	temperatures := func() {
+		if len(m.cpuSnap.Temperatures) > 0 {
+			tempPeak := ""
+			if s := m.peaks.tempSummary(); s != "" {
+				tempPeak = "  " + subtleStyle.Render("session peak "+s)
+			}
+			b.WriteString(titleStyle.Render("Temperatures") + tempPeak + "\n")
+			tempChartW := min(30, chartW/2)
+			for _, t := range m.cpuSnap.Temperatures {
+				color := probe.TempColor(t.Temp)
+				tStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
+				label := trunc(t.Label, 20)
+				tempBar := RenderBar(t.Temp, tempChartW, color)
+				spark := ""
+				if hist, ok := m.tempHist[t.Label]; ok {
+					spark = Spark(hist, min(20, chartW/3))
+				}
+				b.WriteString(fmt.Sprintf("  %-20s %s %s %s\n",
+					label,
+					tStyle.Render(probe.FormatTemp(t.Temp)),
+					tempBar,
+					spark,
+				))
+			}
+		} else {
+			b.WriteString(subtleStyle.Render("No temperature sensors detected") + "\n")
+		}
+	}
+	if level >= 3 {
+		temperatures()
 		b.WriteString("\n")
+		perCore()
+	} else {
+		perCore()
+		temperatures()
 	}
 
-	if len(m.cpuSnap.Temperatures) > 0 {
-		tempPeak := ""
-		if s := m.peaks.tempSummary(); s != "" {
-			tempPeak = "  " + subtleStyle.Render("session peak "+s)
+	return b.String()
+}
+
+// connPID renders a socket's owner. 0 means the owner could not be read
+// (another user's socket without privileges): PID 0 is the kernel's idle
+// task, so printing it would name the wrong process.
+func connPID(pid int32) string {
+	if pid <= 0 {
+		return "-"
+	}
+	return strconv.Itoa(int(pid))
+}
+
+// freqSummary folds every cpufreq policy into one line: the spread of the
+// current clocks, and the limits and governors when they agree.
+func freqSummary(fs []probe.PolicyFreq) string {
+	lo, hi := fs[0].CurMHz, fs[0].CurMHz
+	limits, govs := map[string]bool{}, map[string]bool{}
+	ro := false
+	for _, f := range fs {
+		lo, hi = min(lo, f.CurMHz), max(hi, f.CurMHz)
+		limits[fmt.Sprintf("%.0f–%.0f", f.MinMHz, f.MaxMHz)] = true
+		govs[f.Governor] = true
+		ro = ro || !f.Writable
+	}
+	out := fmt.Sprintf("%d policies  ", len(fs)) + okStyle.Render(fmt.Sprintf("%.0f–%.0f MHz", lo, hi))
+	if len(limits) == 1 {
+		for l := range limits {
+			out += "  " + subtleStyle.Render("("+l+")")
 		}
-		b.WriteString(titleStyle.Render("Temperatures") + tempPeak + "\n")
-		tempChartW := min(30, chartW/2)
-		for _, t := range m.cpuSnap.Temperatures {
-			color := probe.TempColor(t.Temp)
-			tStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
-			label := trunc(t.Label, 20)
-			tempBar := RenderBar(t.Temp, tempChartW, color)
-			spark := ""
-			if hist, ok := m.tempHist[t.Label]; ok {
-				spark = Spark(hist, min(20, chartW/3))
-			}
-			b.WriteString(fmt.Sprintf("  %-20s %s %s %s\n",
-				label,
-				tStyle.Render(probe.FormatTemp(t.Temp)),
-				tempBar,
-				spark,
-			))
+	}
+	if len(govs) == 1 {
+		for g := range govs {
+			out += "  " + titleStyle.Render(g)
 		}
 	} else {
-		b.WriteString(subtleStyle.Render("No temperature sensors detected") + "\n")
+		out += "  " + subtleStyle.Render(fmt.Sprintf("%d governors", len(govs)))
 	}
-
-	return m.box(b.String())
+	if ro {
+		out += subtleStyle.Render(" (ro)")
+	}
+	return out + "  " + subtleStyle.Render("(g cycles governor)")
 }
 
 func (m Model) viewMem() string {
@@ -1780,7 +1909,20 @@ func (m Model) viewMem() string {
 	b.WriteString(fmt.Sprintf("  %-12s %s\n", "Available", okStyle.Render(probe.HumanBytes(s.Available))))
 	b.WriteString(fmt.Sprintf("  %-12s %s\n", "Free", probe.HumanBytes(s.Free)))
 	b.WriteString(fmt.Sprintf("  %-12s %s\n", "Cached", probe.HumanBytes(s.Cached)))
-	b.WriteString(fmt.Sprintf("  %-12s %s\n\n", "Buffers", probe.HumanBytes(s.Buffers)))
+	b.WriteString(fmt.Sprintf("  %-12s %s\n", "Buffers", probe.HumanBytes(s.Buffers)))
+	if s.OOMKillsOK {
+		oom := fmt.Sprintf("%d since boot", s.OOMKills)
+		if m.oom.session > 0 {
+			oom += errStyle.Render(fmt.Sprintf(" · %d this session", m.oom.session))
+		}
+		b.WriteString(fmt.Sprintf("  %-12s %s\n", "OOM kills", oom))
+		if n := len(m.oom.victims); n > 0 {
+			v := m.oom.victims[n-1]
+			b.WriteString(fmt.Sprintf("  %-12s %s\n", "last killed",
+				errStyle.Render(fmt.Sprintf("%s (pid %d) at %s", v.comm, v.pid, v.at.Format("15:04:05")))))
+		}
+	}
+	b.WriteString("\n")
 
 	b.WriteString(titleStyle.Render("Swap"))
 	if s.SwapTotal == 0 {
@@ -1932,19 +2074,30 @@ func (m Model) computeProcsView() []probe.ProcInfo {
 
 // sortProcSlice orders ps in place by the active process sort mode.
 func (m Model) sortProcSlice(ps []probe.ProcInfo) {
+	// Ties (most rows sit at 0.0% CPU) fall back to numeric PID; left to
+	// the /proc listing they came out in text order, PID 114 after 1139.
 	sort.SliceStable(ps, func(i, j int) bool {
+		a, b := ps[i], ps[j]
 		switch m.procsSort {
 		case sortMem:
-			return ps[i].MemPct > ps[j].MemPct
+			if a.MemPct != b.MemPct {
+				return a.MemPct > b.MemPct
+			}
 		case sortIO:
-			return ps[i].IOReadBps+ps[i].IOWriteBps > ps[j].IOReadBps+ps[j].IOWriteBps
-		case sortPID:
-			return ps[i].PID < ps[j].PID
+			if ai, bi := a.IOReadBps+a.IOWriteBps, b.IOReadBps+b.IOWriteBps; ai != bi {
+				return ai > bi
+			}
 		case sortName:
-			return strings.ToLower(ps[i].Name) < strings.ToLower(ps[j].Name)
+			if an, bn := strings.ToLower(a.Name), strings.ToLower(b.Name); an != bn {
+				return an < bn
+			}
+		case sortPID:
 		default:
-			return ps[i].CPUPct > ps[j].CPUPct
+			if a.CPUPct != b.CPUPct {
+				return a.CPUPct > b.CPUPct
+			}
 		}
+		return a.PID < b.PID
 	})
 }
 
@@ -2008,12 +2161,38 @@ func (m Model) computeProcsTree() ([]probe.ProcInfo, []string) {
 
 // refreshProcs recomputes the view, clamps the cursor, and re-renders.
 func (m *Model) refreshProcs() {
+	m.recomputeProcs()
+	m.renderProcs()
+}
+
+// refreshProcsFollow is refreshProcs for new data: the list re-sorts on every
+// sample, so a cursor that stayed on its row index would silently slide onto
+// a different process — and k/K/enter would act on that one. Keep it on the
+// same PID instead; only a process that is gone falls back to the clamp.
+func (m *Model) refreshProcsFollow() {
+	sel, had := m.selectedProc()
+	m.recomputeProcs()
+	if had {
+		for i, p := range m.procsView {
+			if p.PID == sel.PID {
+				m.procsSel = i
+				break
+			}
+		}
+	}
+	m.renderProcs()
+}
+
+func (m *Model) recomputeProcs() {
 	if m.procsTree && m.procsQuery == "" {
 		m.procsView, m.procsPrefix = m.computeProcsTree()
 	} else {
 		m.procsView = m.computeProcsView()
 		m.procsPrefix = nil
 	}
+}
+
+func (m *Model) renderProcs() {
 	if m.procsSel >= len(m.procsView) {
 		m.procsSel = len(m.procsView) - 1
 	}
@@ -2151,16 +2330,35 @@ func (m Model) viewDisk() string {
 		dev := trunc(d.Device, colDev)
 		mount := trunc(d.MountPoint, colMount)
 		bar := RenderBarWithLabel("", d.UsedPct, barW)
+		// The row fills the box on a narrow panel, so a marker after the
+		// bar would be clipped: "ro" goes in the FS column where it fits,
+		// and a remount gets its own line below the table.
+		fs := d.FSType
+		if d.ReadOnly && len(fs)+3 <= colFS {
+			fs += " ro"
+		}
 
 		b.WriteString(fmt.Sprintf("%s  %s  %s  %s  %s  %s  %s\n",
 			padRight(dev, colDev),
 			padRight(mount, colMount),
-			padRight(d.FSType, colFS),
+			padRight(fs, colFS),
 			padRight(probe.HumanBytes(d.Total), colTotal),
 			padRight(probe.HumanBytes(d.Used), colUsed),
 			padRight(probe.HumanBytes(d.Free), colFree),
 			bar,
 		))
+	}
+
+	for _, d := range m.disks {
+		if d.RemountedRO {
+			b.WriteString("\n" + errStyle.Render(fmt.Sprintf(
+				"⚠ %s (%s) REMOUNTED READ-ONLY — the kernel hit I/O errors; back up now",
+				d.MountPoint, d.Device)))
+			b.WriteString("\n")
+		}
+	}
+	if s := m.klog.ioSummary(); s != "" {
+		b.WriteString("\n" + errStyle.Render("⚠ "+s) + "\n")
 	}
 
 	if len(m.storage) > 0 {
@@ -2474,7 +2672,7 @@ func (m Model) renderNetText() string {
 			localS,
 			remoteS,
 			padRight(c.Status, colStatus),
-			padRight(fmt.Sprintf("%d", c.PID), colPID),
+			padRight(connPID(c.PID), colPID),
 			procS,
 		))
 	}
@@ -2629,6 +2827,11 @@ func (m Model) viewPower() string {
 		b.WriteString("  " + flag(t.ThrottledNow, t.ThrottledOccurred, "Throttled") + "\n")
 		b.WriteString("  " + flag(t.SoftTempLimitNow, t.SoftTempLimitOccurred, "Soft temp limit") + "\n")
 	}
+	// The kernel catches dips shorter than vcgencmd's sampling, and on
+	// boards without vcgencmd it is the only under-voltage source there is.
+	if s := m.klog.underVoltageSummary(); s != "" {
+		b.WriteString(warnStyle.Render("⚠ "+s) + "\n")
+	}
 
 	return m.box(b.String())
 }
@@ -2705,7 +2908,13 @@ func (m *Model) cycleGovernor() tea.Cmd {
 		}
 	}
 	m.setNotice(okStyle.Render("governor → " + next))
-	return fetchCPUCmd(m.cpuSampler)
+	// Show the new governor now rather than sampling the CPU off-cadence: a
+	// few-millisecond sample is a noisy 0%/100% that landed in the history,
+	// the session peak and the alert conditions.
+	for i := range m.cpuSnap.Freqs {
+		m.cpuSnap.Freqs[i].Governor = next
+	}
+	return nil
 }
 
 // adjustBacklight nudges screen brightness by delta percent and refreshes the

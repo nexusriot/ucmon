@@ -102,7 +102,8 @@ func TestPauseFreezesSamplingButNotAlerting(t *testing.T) {
 	msgs := collectMsgs(cmd)
 	for _, msg := range msgs {
 		switch msg.(type) {
-		case tickMsg:
+		case tickMsg, oomCountMsg, kmsgMsg:
+			// The heartbeat, and the event streams that keep flowing.
 		default:
 			t.Errorf("a paused tick dispatched a fetch: %T", msg)
 		}

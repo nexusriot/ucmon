@@ -97,11 +97,39 @@ func (m Model) saveHistory() error {
 
 	// Write-then-rename: a half-written file would be silently discarded on
 	// the next start, which looks exactly like the history never being saved.
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	// The temp file is unique (two instances exiting together must not rename
+	// each other's half-written file into place) and synced before the
+	// rename: on an SD card a power cut after the rename but before writeback
+	// otherwise leaves an empty file where the history was.
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	defer func() { _ = os.Remove(tmp) }() // a no-op once renamed
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Chmod(0o644); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = d.Sync() // make the rename itself durable
+		_ = d.Close()
+	}
+	return nil
 }
 
 // loadHistory restores the ring buffers from a previous session. A missing,
@@ -189,3 +217,7 @@ func (m *Model) Restore() {
 
 // Save persists the sparkline history on exit.
 func (m Model) Save() error { return m.saveHistory() }
+
+// Ran reports whether the program got as far as its first tick. A run that
+// failed before that has nothing new to save.
+func (m Model) Ran() bool { return !m.now.IsZero() }

@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"testing"
@@ -46,14 +47,14 @@ func TestSuspendAndResumeProcess(t *testing.T) {
 	child := spawnChild(t)
 	pid := int32(child.Process.Pid)
 
-	if err := SuspendProcess(pid); err != nil {
+	if err := SuspendProcess(pid, 0); err != nil {
 		t.Fatalf("SuspendProcess: %v", err)
 	}
 	if got := waitForStatus(t, pid, "stop"); got != "stop" {
 		t.Errorf("status after SIGSTOP = %q, want stop", got)
 	}
 
-	if err := ResumeProcess(pid); err != nil {
+	if err := ResumeProcess(pid, 0); err != nil {
 		t.Fatalf("ResumeProcess: %v", err)
 	}
 	if got := waitForStatus(t, pid, "sleep", "idle", "running"); got == "stop" {
@@ -66,7 +67,7 @@ func TestKillProcessTerminates(t *testing.T) {
 		child := spawnChild(t)
 		pid := int32(child.Process.Pid)
 
-		if err := KillProcess(pid, hard); err != nil {
+		if err := KillProcess(pid, 0, hard); err != nil {
 			t.Fatalf("KillProcess(hard=%v): %v", hard, err)
 		}
 		if _, err := child.Process.Wait(); err != nil {
@@ -79,13 +80,13 @@ func TestKillProcessTerminates(t *testing.T) {
 // clean error rather than a signal sent to something else.
 func TestProcOpsRejectImpossiblePID(t *testing.T) {
 	const gone = int32(0x7FFFFFFE)
-	if err := KillProcess(gone, false); err == nil {
+	if err := KillProcess(gone, 0, false); err == nil {
 		t.Error("KillProcess on a nonexistent pid succeeded")
 	}
-	if err := SuspendProcess(gone); err == nil {
+	if err := SuspendProcess(gone, 0); err == nil {
 		t.Error("SuspendProcess on a nonexistent pid succeeded")
 	}
-	if err := ResumeProcess(gone); err == nil {
+	if err := ResumeProcess(gone, 0); err == nil {
 		t.Error("ResumeProcess on a nonexistent pid succeeded")
 	}
 	if _, err := GetProcDetail(gone); err == nil {
@@ -104,7 +105,7 @@ func TestGetNiceIsRealNiceness(t *testing.T) {
 	}
 
 	target := ClampNice(start + 3)
-	if err := SetNice(self, target); err != nil {
+	if err := SetNice(self, 0, target); err != nil {
 		t.Fatalf("SetNice(%d): %v", target, err)
 	}
 	if got := getNice(self); got != target {
@@ -195,5 +196,42 @@ func TestListConnectionsShape(t *testing.T) {
 		if c.Proto == "" {
 			t.Errorf("unlabelled proto in %+v", c)
 		}
+	}
+}
+
+// A PID recycled for a different process (start time differs) must be
+// refused, not signalled: the prompt or detail view that captured the PID
+// may have sat on screen for minutes.
+func TestProcOpsRefuseRecycledPID(t *testing.T) {
+	child := spawnChild(t)
+	pid := int32(child.Process.Pid)
+	start, err := ProcStartTime(pid)
+	if err != nil || start == 0 {
+		t.Fatalf("ProcStartTime = %d, %v", start, err)
+	}
+	stale := start - 1 // "the process we picked started at a different time"
+
+	if err := KillProcess(pid, stale, true); !errors.Is(err, ErrProcGone) {
+		t.Errorf("KillProcess with stale start: err = %v, want ErrProcGone", err)
+	}
+	if err := SuspendProcess(pid, stale); !errors.Is(err, ErrProcGone) {
+		t.Errorf("SuspendProcess with stale start: err = %v, want ErrProcGone", err)
+	}
+	if err := SetNice(pid, stale, 5); !errors.Is(err, ErrProcGone) {
+		t.Errorf("SetNice with stale start: err = %v, want ErrProcGone", err)
+	}
+	if got := waitForStatus(t, pid, "sleep"); got != "sleep" {
+		t.Errorf("child status = %q after refused ops, want sleep (untouched)", got)
+	}
+
+	// The right identity goes through.
+	if err := KillProcess(pid, start, true); err != nil {
+		t.Fatalf("KillProcess with matching start: %v", err)
+	}
+	if _, err := child.Process.Wait(); err != nil {
+		t.Errorf("child did not reap: %v", err)
+	}
+	if err := KillProcess(pid, start, true); !errors.Is(err, ErrProcGone) {
+		t.Errorf("KillProcess on a reaped pid: err = %v, want ErrProcGone", err)
 	}
 }

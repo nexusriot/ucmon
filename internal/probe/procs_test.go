@@ -3,6 +3,7 @@ package probe
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -311,6 +312,50 @@ func TestSamplerRecoversTruncatedName(t *testing.T) {
 	}
 	if procs[0].PPID != 1 {
 		t.Errorf("PPID = %d, want 1", procs[0].PPID)
+	}
+}
+
+// A script whose name the kernel truncated keeps that name rather than
+// becoming its interpreter, and a name or command line carrying terminal
+// escapes reaches the UI defanged.
+func TestSamplerNamesScriptsAndStripsEscapes(t *testing.T) {
+	root := t.TempDir()
+	write := func(pid, stat, cmdline string) {
+		t.Helper()
+		dir := filepath.Join(root, pid)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(stat), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "cmdline"), []byte(cmdline), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("10", "10 (networkd-dispat) S 1 10 10 0 -1 0 0 0 0 0 1 1 0 0 20 0 1 0 500 1000 64 0 x",
+		"/usr/bin/python3\x00/usr/bin/networkd-dispatcher\x00")
+	write("11", "11 (\x1b]52;c;aGk=\x07) S 1 11 11 0 -1 0 0 0 0 0 1 1 0 0 20 0 1 0 500 1000 64 0 x",
+		"sleep\x00\x1b[2J\x1b[Hfake\x00")
+
+	orig := procBase
+	procBase = root
+	defer func() { procBase = orig }()
+	procs, err := NewProcSampler().List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPID := map[int32]ProcInfo{}
+	for _, p := range procs {
+		byPID[p.PID] = p
+	}
+	if got := byPID[10].Name; got != "networkd-dispat" {
+		t.Errorf("script row named %q, want its truncated comm, not the interpreter", got)
+	}
+	for _, s := range []string{byPID[11].Name, byPID[11].CmdLine} {
+		if strings.ContainsRune(s, 0x1b) || strings.ContainsRune(s, 0x07) {
+			t.Errorf("escape bytes survived: %q", s)
+		}
 	}
 }
 

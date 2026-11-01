@@ -144,7 +144,7 @@ func parseModem(s string) ModemInfo {
 		case "failed reason":
 			m.FailedReason = val
 		case "operator name":
-			m.Operator = val
+			m.Operator = Printable(val)
 		case "operator id", "operator code":
 			m.OperatorCode = val
 		case "access tech", "access technology", "current":

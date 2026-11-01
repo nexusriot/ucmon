@@ -59,6 +59,8 @@ func Capabilities(backlightDevice string) []Capability {
 		CheckCPUFreq(),
 		CheckGovernorWrite(),
 		CheckPSI(),
+		CheckOOMKills(),
+		CheckKernelLog(),
 		CheckProcIO(),
 		CheckBattery(),
 		CheckBatteryHealth(),

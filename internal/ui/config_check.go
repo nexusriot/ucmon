@@ -23,13 +23,16 @@ func CheckConfig(path string) (string, bool) {
 	}
 
 	fmt.Fprintf(&b, "config: %s\n", path)
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			b.WriteString("  not present — built-in defaults apply\n")
-			return b.String(), true
-		}
-		fmt.Fprintf(&b, "  unreadable: %v — built-in defaults apply\n", err)
+	if _, err := os.Stat(path); err != nil && os.IsNotExist(err) {
+		b.WriteString("  not present — built-in defaults apply\n")
 		return b.String(), true
+	}
+	// A file that exists but cannot be read (mode 000, a directory) is not
+	// "no unrecognised keys": the monitor would silently run on defaults, so
+	// a provisioning check must fail.
+	if _, err := os.ReadFile(path); err != nil {
+		fmt.Fprintf(&b, "  unreadable: %v — ucmon would run on built-in defaults\n", err)
+		return b.String(), false
 	}
 
 	cfg := config.LoadFrom(path)

@@ -2,6 +2,8 @@ package ui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -306,5 +308,50 @@ func TestDisabledProbeIsNotBehind(t *testing.T) {
 	}
 	if m.behindSkips[fetchLatency] != 0 {
 		t.Errorf("skips recorded for a disabled probe: %d", m.behindSkips[fetchLatency])
+	}
+}
+
+// The "cheap" fetches are guarded too: a hung NFS statfs or a stalled hwmon
+// read used to stack one more blocked goroutine per tick. A failure reply
+// must still lower its own guard, or that probe would stop for good.
+func TestEveryScheduledFetchIsGuarded(t *testing.T) {
+	m := testModel()
+	m.procEvery, m.slowEvery = 1, 1
+	m.procs = []probe.ProcInfo{{PID: 1, Name: "init"}}
+	m.refreshProcs()
+	m.detail = &procDetailState{pid: 1}
+	kmsg := filepath.Join(t.TempDir(), "kmsg")
+	if err := os.WriteFile(kmsg, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := probe.OpenKmsgAt(kmsg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	m.kmsg = w
+
+	m, _ = press(t, m, tickMsg(time.Now()))
+	guarded := []fetchKind{fetchCPU, fetchMem, fetchPSI, fetchNet, fetchDisk, fetchPower, fetchHealth, fetchDetail, fetchKmsg}
+	for _, k := range guarded {
+		if !m.inFlight[k] {
+			t.Errorf("%s: guard not raised by the tick", k)
+		}
+	}
+
+	m, _ = press(t, m, tickMsg(time.Now()))
+	for _, k := range guarded {
+		if m.behindSkips[k] != 1 {
+			t.Errorf("%s: second tick dispatched again (skips=%d)", k, m.behindSkips[k])
+		}
+	}
+
+	m, _ = press(t, m, errMsg{fmt.Errorf("statfs: stale NFS handle"), fetchDisk})
+	if m.inFlight[fetchDisk] {
+		t.Error("a failed disk fetch left its guard raised")
+	}
+	m, _ = press(t, m, memMsg{})
+	if m.inFlight[fetchMem] {
+		t.Error("a mem reply did not lower its guard")
 	}
 }

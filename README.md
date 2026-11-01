@@ -7,19 +7,20 @@ Built in Go with the [Bubble Tea](https://github.com/charmbracelet/bubbletea) fr
 ## Features
 
 - **CPU & Temperature** — total and per-core usage with bar charts and sparkline history; a **time breakdown** (user/sys/nice/iowait/irq/steal) that separates "saturating the cores" from "blocked on the SD card"; color-coded thermal sensor readings with thresholds **calibrated from the kernel's own thermal trip points**; load-average summary; **cpufreq clocks and governor** per policy (current/min/max MHz with sparkline, `g` cycles the governor — performance vs battery on demand); CPU pressure (PSI)
-- **Memory** — RAM total/used/free/available/cached/buffers and swap, with bars, sparkline history, and memory pressure (PSI)
-- **Processes** — searchable list (matches name, PID, user, **and command line**) with a movable cursor, sortable by CPU / MEM / **DISK I/O** / PID / NAME, a parent/child tree view, and SIGTERM/SIGKILL with confirmation. CPU% and the **per-process disk I/O rate** are measured **since the previous refresh** (htop-style); the walk reads `/proc` directly, which is ~7× faster than the gopsutil accessor path it replaced. `enter` opens a **detail view**: threads, open fds, memory breakdown, per-process disk I/O, sockets, start time — with **renice (`+`/`-`)** and **SIGSTOP/SIGCONT** controls
-- **Disk** — partition usage with color-coded bars, per-device read/write rates, I/O pressure (PSI), and **SD/eMMC wear**: life-time bands, pre-EOL reserve state and read-only lockout from `/sys/block/*/device`. Card death is the characteristic failure of these boards and the one reading nothing else hints at
+- **Memory** — RAM total/used/free/available/cached/buffers and swap, with bars, sparkline history, and memory pressure (PSI); **OOM kills** since boot and this session, from the kernel's `oom_kill` counter, and the last victim by name when the kernel log is readable
+- **Processes** — searchable list (matches name, PID, user, **and command line**) with a movable cursor, sortable by CPU / MEM / **DISK I/O** / PID / NAME, a parent/child tree view, and SIGTERM/SIGKILL with confirmation. The cursor stays on the selected process when a refresh re-orders the list (`s` and `t` jump back to the top), and every signal or renice checks the process's start time first (through a pidfd where the kernel allows), so it can never land on an unrelated process that inherited a recycled PID. CPU% and the **per-process disk I/O rate** are measured **since the previous refresh** (htop-style); the walk reads `/proc` directly, which is ~7× faster than the gopsutil accessor path it replaced. `enter` opens a **detail view**: threads, open fds, memory breakdown, per-process disk I/O, sockets, start time — with **renice (`+`/`-`)** and **SIGSTOP/SIGCONT** controls
+- **Disk** — partition usage with color-coded bars, per-device read/write rates, I/O pressure (PSI), and **SD/eMMC wear**: life-time bands, pre-EOL reserve state and read-only lockout from `/sys/block/*/device`, plus **read-only remount detection**: a filesystem `/etc/fstab` (or an earlier sample) says is read-write but the kernel has locked read-only — `errors=remount-ro` after I/O errors, which plain SD cards show long before anything else does. Card death is the characteristic failure of these boards and the one reading nothing else hints at
 - **Network** — interface throughput with sparklines and a searchable connection table (protocol incl. TCP6/UDP6, addresses, status, PID, process — inet only, so Unix sockets no longer pad it out) with per-interface **error and drop counters**, a **state filter** (`f`: all → LISTEN → ESTABLISHED) and per-state counts; **WiFi link quality / signal dBm** (from `/proc/net/wireless`) plus **SSID, channel, and bitrates** via `iw` when available; **connectivity monitor** pinging the default gateway (and an optional external target) with RTT sparkline and packet-loss tracking — unprivileged ICMP with a TCP-connect fallback; **4G/LTE modem status** (operator, registration, access technology, RSSI) via `mmcli` when `modem_enabled` is set
 - **Power & System Health** — battery charge/status/time-left/**pack health** (uConsole/Pi via `/sys/class/power_supply`), power-draw sparkline, 1/5/15-min load average, and Raspberry Pi throttle / under-voltage flags via `vcgencmd`
 - **GPU / VideoCore** — Raspberry Pi / uConsole SoC core temp, voltage, clock domains (arm/core/v3d/…) and CPU↔GPU memory split via `vcgencmd`, plus **display backlight readout and `+`/`-` control** (`/sys/class/backlight`)
-- **Alerts** — configurable thresholds (temperature, RAM/swap, disk, battery, load, live Pi throttle flags, **weak WiFi signal, packet loss, PSI pressure, storage wear, modem registration**) raise edge-triggered alerts with **flap damping**, plus **predictive alerts on the rate of change** — battery drain %/h with a time-to-empty, filesystem fill with a time-to-full, and temperature climb with a time-to-critical. Alerting keeps running while sampling is paused. A severity-colored banner shows the top alert on every tab; the Alerts tab keeps a timestamped log. Optional **terminal bell** on criticals, an **`alert_cmd` shell hook** (gets `UCMON_ALERT_STATE/SEV/MSG`), and an **on-disk alert log**
+- **Alerts** — configurable thresholds (temperature, RAM/swap, disk, battery, load, live Pi throttle flags, **weak WiFi signal, packet loss, PSI pressure, storage wear, read-only remounts, OOM kills, modem registration**, and from the **kernel log**: storage I/O errors, under-voltage, the OOM killer's victim) raise edge-triggered alerts with **flap damping**, plus **predictive alerts on the rate of change** — battery drain %/h with a time-to-empty, filesystem fill with a time-to-full, and temperature climb with a time-to-critical. Alerting keeps running while sampling is paused. A severity-colored banner shows the top alert on every tab; the Alerts tab keeps a timestamped log. Optional **terminal bell** on criticals, an **`alert_cmd` shell hook** (gets `UCMON_ALERT_STATE/SEV/MSG`), and an **on-disk alert log**
+- **Kernel log alerts** — the TUI follows `/dev/kmsg` from startup: storage I/O errors (block layer, MMC, ext4/FAT/btrfs/XFS) raise a critical naming the filesystems on the device — usually well before the card goes read-only — and under-voltage a warning, catching dips too short for vcgencmd and working on boards without it. A flood of lines is one alert counting up. Needs `kernel.dmesg_restrict=0` or `CAP_SYSLOG`; `ucmon doctor` says whether this host allows it
 - **Session peaks** — max CPU/temperature/load/memory and minimum battery since start, shown inline and in reports; `Z` resets them
 - **Expanded graphs** — `z` blows one metric up to a full-screen braille chart with a real value axis and min/max/avg, stepping between every series the tab offers. Sparklines of bounded readings (CPU, memory, battery) are drawn on a fixed 0–100 axis, so a core pinned at 100% no longer looks like one sitting idle
-- **Persistent history** — set `history_file` and the sparklines and session peaks survive a restart
-- **Snapshot export** — press `w` on any tab to write a plain-text report of all current readings to `~/ucmon-report-<timestamp>.txt`
-- **Pause** (`space`) freezes sampling to inspect readings; **help overlay** (`?`) lists every key
-- **Capability report** — `ucmon doctor` lists every source ucmon reads (PSI, `vcgencmd`, `iw`, `mmcli`, unprivileged ICMP, `/proc/<pid>/io`, eMMC wear counters, the battery's design capacity, the writable governor and backlight files) as present / absent / denied / read-only, says which rows go missing without each one, and prints the exact udev rule for the two writable ones. `ucmon --check-config` does the same for config keys ucmon does not recognise
+- **Persistent history** — set `history_file` and the sparklines and session peaks survive a restart. It is saved however the session ends: quit, SIGTERM/SIGINT, or the terminal closing (SIGHUP from a closed window or a dropped SSH session)
+- **Snapshot export** — press `w` on any tab to write a plain-text report of all current readings to `ucmon-report-<timestamp>.txt` in `report_dir` (default: your home directory)
+- **Pause** (`space`) freezes sampling to inspect readings — alerts, the kernel log and the OOM counter keep running; **help overlay** (`?`) lists every key
+- **Capability report** — `ucmon doctor` lists every source ucmon reads (PSI, the OOM-kill counter, the kernel log, `vcgencmd`, `iw`, `mmcli`, unprivileged ICMP, `/proc/<pid>/io`, eMMC wear counters, the battery's design capacity, the writable governor and backlight files) as present / absent / denied / read-only, says which rows go missing without each one, and prints the exact udev rule for the two writable ones. `ucmon --check-config` does the same for config keys ucmon does not recognise
 - **Headless mode** — `ucmon --once` prints the full snapshot report to stdout and exits (for SSH sessions and cron); `--once --json` emits the same readings as JSON for scripts
 - **Prometheus exporter** — `ucmon --metrics :9100` serves `/metrics` and `/snapshot` without a TUI, or `metrics_listen` runs one alongside the monitor. Sampling is lazy and rate-limited, so a tight scrape loop cannot peg a CM4
 - **Ignore lists** — `net_ignore` / `disk_ignore` / `temp_ignore` hide noisy names (container veths, snap loop mounts, per-core `coretemp` sensors) from their tab, the `--once` report and the alert engine alike; comma-separated globs where `*` spans `/`, so `/snap/*` covers a whole subtree
@@ -32,11 +33,27 @@ make test-race    # go test -race with a coverage profile
 make fmt-check    # fail if anything needs gofmt
 make vet
 make              # cross-compile every target into dist/
+make e2e          # hermetic end-to-end suite in Docker
 ```
+
+`make e2e` builds the real binary into a digest-pinned image and runs
+[`e2e/`](e2e) inside a sealed container: no network, read-only root, an
+unprivileged user, and real kernel mounts that a fixture `/etc/fstab`
+describes. It covers the CLI contract, read-only remount detection, the
+exporter (validated with `promtool`, standalone and alongside the TUI) and
+the TUI on a real pseudo-terminal: tab cycling, resizes, the search → `K` →
+confirm kill flow, the detail panel's SIGSTOP/SIGCONT/renice checked against
+`/proc`, a real OOM kill raising its alert (under a cgroup memory limit),
+kernel-log records fed through a FIFO bound over `/dev/kmsg`,
+snapshot reports, the `alert_cmd` hook and alert log, and history
+being saved however the session ends (quit, SIGTERM, SIGINT, hangup). The
+signal tests then rerun with `pidfd_open` blocked by seccomp (EPERM and
+ENOSYS) to cover the fallback path. Pass test flags through the script, e.g.
+`e2e/run.sh -test.run TUI`; that runs only the default-profile pass.
 
 CI runs the same checks on every push, plus pinned `staticcheck` /
 `golangci-lint`, a statically-linked assertion on all four cross-compiled
-binaries, and a smoke job that drives the real CLI. See
+binaries, a smoke job that drives the real CLI, and the e2e suite. See
 [DESIGN.md](DESIGN.md#architecture) for the job breakdown.
 
 ## Command line
@@ -57,7 +74,8 @@ ucmon [flags] [doctor]
 `ucmon doctor` answers "why is the GPU tab empty" without a trip through the
 source: it checks every source ucmon reads — thermal sensors, cpufreq, PSI,
 `/proc/<pid>/io`, the battery and its design-capacity counters, `vcgencmd`,
-the backlight, `iw`, `mmcli`, unprivileged ICMP and eMMC wear counters —
+the OOM-kill counter, the kernel log, the backlight, `iw`, `mmcli`,
+unprivileged ICMP and eMMC wear counters —
 and prints each one as present, absent, denied or read-only, with what it
 found, which rows go missing without it, and how to get it. For the two
 writable sources (cpufreq `scaling_governor` and backlight `brightness`) that
@@ -77,7 +95,12 @@ naming them.
 The exporter serves `/metrics` (Prometheus text format), `/snapshot` (the JSON
 report) and `/healthz`. It re-samples at most once every 5 seconds however
 often it is scraped, and collects through a model of its own, so running it
-alongside the TUI (`metrics_listen`) never perturbs what is on screen.
+alongside the TUI (`metrics_listen`) never perturbs what is on screen. If a
+collection hangs (a dead NFS mount), scrapes are answered from the previous
+snapshot within 8 seconds, and `ucmon_snapshot_age_seconds` says how old it
+is. A bare port binds every interface with no authentication, and
+`/snapshot` lists processes and mounts: use `127.0.0.1:9100` unless the
+network is trusted.
 
 ## Configuration
 
@@ -106,7 +129,7 @@ backlight_step   = 10      # percent change per +/- keypress
 alerts_enabled   = true    # master switch for the Alerts tab + banner
 mem_warn_pct     = 90      # RAM used % that raises a warning
 swap_warn_pct    = 50      # swap used % that raises a warning
-disk_warn_pct    = 90      # filesystem used % that raises a warning (squashfs skipped)
+disk_warn_pct    = 90      # filesystem used % that raises a warning (read-only images skipped)
 batt_low_pct     = 15      # discharging battery % — warning
 batt_crit_pct    = 5       # discharging battery % — critical
 load_warn_factor = 2.0     # load1 ≥ factor × cores raises a warning
@@ -131,6 +154,14 @@ ping_enabled     = true    # ping the default gateway on the proc interval
 batt_drain_warn_pct_h    = 25   # discharging faster than this %/hour warns
 disk_full_warn_hours     = 6    # warn when a filesystem is this many hours from full
 temp_rise_warn_c_per_min = 3    # warn when a sensor climbs this fast
+
+# Event alerts: an OOM kill, or the kernel logging under-voltage or storage
+# I/O errors. Each stays up this many minutes after it was last seen; 0
+# turns event alerts off.
+event_alert_minutes = 10
+# Follow the kernel log for those events. Needs dmesg_restrict off, or
+# CAP_SYSLOG; `ucmon doctor` says whether this host allows it.
+kernel_log_enabled  = true
 
 # Temperature thresholds are seeded from the kernel's own thermal trip points
 # unless temp_warn/temp_hot/temp_crit are set above. The built-in 50/65/80
@@ -209,7 +240,7 @@ make help               # list all targets
 | `space`            | Pause / resume sampling (alerts keep running) |
 | `z`                | Expand a metric to a full-screen graph |
 | `Z`                | Reset session peaks          |
-| `w`                | Write snapshot report to `~/ucmon-report-*.txt` |
+| `w`                | Write snapshot report (`ucmon-report-*.txt` in `report_dir`, default `~`) |
 | `g`                | Cycle cpufreq governor (CPU tab) |
 | `+` / `-`          | Adjust backlight (GPU tab)    |
 | `m`                | Mute / unmute alert banner (Alerts tab) |
@@ -227,9 +258,11 @@ make help               # list all targets
 | `f`                | Cycle connection state filter (network tab) |
 | `ctrl+c`           | Quit                         |
 
-In the process detail view: `+`/`-` renice, `p` SIGSTOP, `c` SIGCONT, `k`/`K` kill, `esc` close.
+In the process detail view: `+`/`-` renice, `p` SIGSTOP, `c` SIGCONT, `k`/`K` kill, `esc`/`q`/`enter` close. If the process exits while the view is open, it freezes on the last readings and says so; only the close keys work.
 
-In the expanded graph (`z`): `←`/`→` (or `j`/`k`) step between metrics, `z`/`esc` closes.
+In the expanded graph (`z`): `←`/`→` (or `j`/`k`) step between metrics, `z`/`esc`/`q` closes.
+
+`q` only closes overlays; `ctrl+c` quits.
 
 ## Refresh Intervals
 
@@ -238,6 +271,7 @@ In the expanded graph (`z`): `←`/`→` (or `j`/`k`) step between metrics, `z`/
 | CPU / temps / cpufreq / PSI | 1s |
 | Memory / swap   | 1s       |
 | Network I/O     | 1s       |
+| Kernel log      | 1s       |
 | Processes       | 3s       |
 | Connections     | 3s       |
 | Ping targets    | 3s       |
@@ -250,6 +284,8 @@ In the expanded graph (`z`): `←`/`→` (or `j`/`k`) step between metrics, `z`/
 
 - ClockworkPi uConsole (ARM64, Raspberry Pi CM4)
 - Raspberry Pi 3 / 4 / 5 (ARM64)
+- Raspberry Pi Zero 2 W (32-bit Pi OS, ARMv7 / `armhf`)
+- Sipeed LicheeRV Nano (riscv64)
 - Generic Linux x86_64
 
 ## Design

@@ -22,34 +22,72 @@ const exporterMinInterval = 5 * time.Second
 // collected until something scrapes, and a result is reused for
 // exporterMinInterval so a tight scrape loop cannot peg a small board.
 type Exporter struct {
-	cfg config.Config
+	cfg     config.Config
+	collect func(config.Config) Model // collectOnce; a var for tests
+	wait    time.Duration             // how long a scrape waits on a collection
 
-	mu     sync.Mutex
-	model  *Model
-	lastAt time.Time
-	err    error
+	mu      sync.Mutex
+	model   *Model
+	lastAt  time.Time
+	running chan struct{} // non-nil while a collection is in flight
 }
+
+// exporterWait is how long a scrape waits for a collection before serving
+// the previous one: under Prometheus's default 10s scrape timeout.
+const exporterWait = 8 * time.Second
+
+// errNoSnapshot is a scrape that came before any collection finished.
+var errNoSnapshot = errors.New("no snapshot yet: the first collection is still running")
 
 // NewExporter builds an exporter for cfg.
 func NewExporter(cfg config.Config) *Exporter {
 	cfg.Sanitize()
-	return &Exporter{cfg: cfg}
+	return &Exporter{cfg: cfg, collect: collectOnce, wait: exporterWait}
 }
 
 // snapshot returns a model holding readings no older than exporterMinInterval,
-// collecting a fresh set when the cached one has expired.
-func (e *Exporter) snapshot() (*Model, error) {
+// starting a fresh collection when the cached one has expired.
+//
+// The collection runs outside the lock and at most one at a time. A scrape
+// waits for it until the request is cancelled or e.wait passes, then serves
+// the previous snapshot: a probe stuck in the kernel (statfs on a dead NFS
+// mount, a wedged vcgencmd) costs one goroutine, instead of holding the lock
+// and hanging every scrape after it, forever.
+func (e *Exporter) snapshot(ctx context.Context) (*Model, time.Time, error) {
+	e.mu.Lock()
+	if e.model != nil && time.Since(e.lastAt) < exporterMinInterval {
+		m, at := e.model, e.lastAt
+		e.mu.Unlock()
+		return m, at, nil
+	}
+	if e.running == nil {
+		done := make(chan struct{})
+		e.running = done
+		go func() {
+			m := e.collect(e.cfg)
+			e.mu.Lock()
+			e.model, e.lastAt, e.running = &m, time.Now(), nil
+			e.mu.Unlock()
+			close(done)
+		}()
+	}
+	done := e.running
+	e.mu.Unlock()
+
+	timer := time.NewTimer(e.wait)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return nil, time.Time{}, ctx.Err()
+	case <-timer.C:
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-
-	if e.model != nil && time.Since(e.lastAt) < exporterMinInterval {
-		return e.model, e.err
+	if e.model == nil {
+		return nil, time.Time{}, errNoSnapshot
 	}
-
-	m := collectOnce(e.cfg)
-	e.lastAt = time.Now()
-	e.model, e.err = &m, nil
-	return e.model, nil
+	return e.model, e.lastAt, nil
 }
 
 // Handler is the exporter's HTTP routing: /metrics for Prometheus, /snapshot
@@ -58,19 +96,22 @@ func (e *Exporter) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		m, err := e.snapshot()
+		m, at, err := e.snapshot(r.Context())
 		if err != nil {
-			http.Error(w, "ucmon: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "ucmon: "+err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		fmt.Fprint(w, m.buildPrometheus())
+		// A stale snapshot is served rather than none; say how stale.
+		_, _ = fmt.Fprintf(w, "# HELP ucmon_snapshot_age_seconds Age of the readings served, in seconds.\n"+
+			"# TYPE ucmon_snapshot_age_seconds gauge\nucmon_snapshot_age_seconds %.3f\n", time.Since(at).Seconds())
 	})
 
 	mux.HandleFunc("/snapshot", func(w http.ResponseWriter, r *http.Request) {
-		m, err := e.snapshot()
+		m, _, err := e.snapshot(r.Context())
 		if err != nil {
-			http.Error(w, "ucmon: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "ucmon: "+err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 		body, err := m.buildJSONReport(time.Now())

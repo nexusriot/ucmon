@@ -15,7 +15,8 @@ ucmon/
 │   ├── probe/                  # Data collection layer
 │   │   ├── cpu.go              # CPUSampler (interval utilisation + time breakdown), temperature sensors
 │   │   ├── cpufreq.go          # cpufreq policies: clocks + governor read/set (sysfs)
-│   │   ├── mem.go              # RAM & swap
+│   │   ├── mem.go              # RAM & swap, the OOM-kill counter (/proc/vmstat)
+│   │   ├── kmsg.go             # Kernel log follower + classifier (/dev/kmsg)
 │   │   ├── procs.go            # ProcSampler: direct /proc walk, interval CPU%/IO, detail, signals
 │   │   ├── disk.go             # Disk usage & I/O counters
 │   │   ├── net.go              # Network interfaces & connections (TCP6/UDP6 aware)
@@ -48,13 +49,21 @@ ucmon/
 │       ├── exporter.go         # HTTP server for --metrics / metrics_listen
 │       ├── history.go          # sparkline + peak persistence across restarts
 │       ├── trend.go            # rate-of-change tracking behind predictive alerts
+│       ├── oom.go              # OOM-kill counter → per-kill alerts, victim names
+│       ├── kernlog.go          # kernel-log events → alerts and tab tallies
 │       ├── zoom.go             # full-screen braille graph for one metric (z)
 │       ├── export.go           # Plain-text snapshot report writer
 │       ├── styles.go           # Lipgloss style definitions
 │       ├── spark.go            # Unicode sparkline chart renderer
 │       ├── bar.go              # Horizontal bar chart renderer
 │       └── table.go            # Text table & ANSI helpers
-├── .github/workflows/ci.yml    # test+race / lint / cross-compile / CLI smoke
+├── e2e/                        # Hermetic end-to-end suite (Docker; `make e2e`)
+│   ├── Dockerfile              # digest-pinned build + runtime image, promtool
+│   ├── run.sh                  # builds the image, runs it sealed
+│   ├── e2e_test.go             # scenarios (build tag `e2e`)
+│   ├── pty_test.go             # pure-Go pseudo-terminal driver for the TUI
+│   └── testdata/               # fixture fstab; seccomp profiles that refuse pidfd
+├── .github/workflows/ci.yml    # test+race / lint / cross-compile / CLI smoke / e2e
 ├── Makefile                    # Canonical build/packaging tooling (all four targets)
 ├── DEBIAN/control              # Debian package metadata
 ├── build-deb.sh                # Legacy Debian package builder (amd64/arm64/riscv64)
@@ -67,22 +76,53 @@ ucmon/
 Unit tests live beside each package (`*_test.go`); probes that read sysfs or
 procfs take their base path from a package-level var so tests can point them
 at fake trees under `t.TempDir()`, and probes that shell out take their binary
-path the same way (`iwPaths`) or are intercepted with a stub on `PATH`
-(`vcgencmd`). Destructive helpers are exercised against a child process the
+locations the same way (`iwPaths`, `vcgencmdPaths`, `mmcliPaths`), with a
+stub on `PATH` for the fallback lookup. Destructive helpers are exercised against a child process the
 test spawns itself, so SIGSTOP/SIGCONT/SIGTERM/SIGKILL and renice are covered
 without touching anything else on the machine.
 
-CI (`.github/workflows/ci.yml`) runs four jobs on every push and pull request:
+CI (`.github/workflows/ci.yml`) runs five jobs on every push and pull request:
 
 | Job | What it protects |
 |-----|------------------|
 | **test** | `gofmt` check, `go vet`, `go test -race` with a coverage profile and a summary |
 | **lint** | pinned `staticcheck` plus `golangci-lint` (`unused`, `ineffassign`, `unparam`, `unconvert`, `staticcheck`, `govet`) |
 | **cross-compile** | `make` for all four targets, asserting each binary is statically linked — the pure-Go/`CGO_ENABLED=0` stance breaks here long before anyone flashes a board |
-| **smoke** | builds and runs the CLI: `--version` matches what the Makefile derives, every flag is documented, `--once` emits every report section, the ignore lists filter it, `ping_enabled = false` is honoured, `doctor` and `--check-config` run headless, and unknown flags or unparseable configs fail or degrade cleanly |
+| **smoke** | builds and runs the CLI: `--version` matches what the Makefile derives, every flag is documented, `--once` emits every report section and `--once --json` is valid JSON, the ignore lists filter it, `ping_enabled = false` is honoured, `--tab` overrides the config, `doctor` and `--check-config` run headless, `--metrics` serves `/metrics`, `/snapshot` and a 404 for unknown paths, and unknown flags, unparseable configs or an occupied metrics port fail or degrade cleanly |
+| **e2e** | `make e2e`: the real binary in a sealed container (below) |
 
 The smoke job exists because `main` is the one function unit tests cannot
 reach; it covers flag parsing, config loading and the whole headless report.
+
+The **e2e** suite goes further, and is hermetic where smoke runs against
+whatever the runner happens to be. `e2e/run.sh` builds a static binary into a
+digest-pinned image and starts it with `--network none`, a read-only root,
+`--cap-drop ALL`, an unprivileged user, a 512 MB memory limit with no swap
+(so a test can provoke a real OOM kill without touching the host), a FIFO
+from the host bound over `/dev/kmsg` (tests write kernel records into it; the
+host's real log stays out of reach) and three real volume mounts — one
+read-only against a fixture `/etc/fstab` that declares it read-write, one
+read-only by design, one read-write — so the remount detection is checked
+against the kernel's own mount table rather than fixtures. The TUI runs on a
+pseudo-terminal opened with `x/sys/unix` (no new dependency) that answers the
+OSC 11 / DSR queries termenv sends at startup, as a real emulator does;
+without the replies every start stalls on termenv's 5 s timeout, and a test
+asserts the first frame arrives promptly so that cannot creep back. `/metrics`
+is validated with `promtool`, failing on anything but a short allowlist of
+deliberate naming lints. `TestSandboxIsSealed` fails the run if the sandbox
+flags are dropped, and the package refuses to run outside the container.
+
+Docker's default seccomp profile allows `pidfd_open`, so the main pass only
+exercises the race-free pidfd path for signals. `run.sh` then reruns the
+signal tests under `testdata/seccomp-pidfd-{eperm,enosys}.json`, which refuse
+it the way old kernels (ENOSYS) and older Docker or systemd's
+`SystemCallFilter=` (EPERM) do, and `TestPidfdMode` checks each pass really
+got the path it claims.
+
+What stays host-dependent is the readings themselves: `/proc` and `/sys`
+belong to the host kernel, so tests assert on what the container controls
+(mounts, config, processes it spawns) and never on CPU, memory or sensor
+values.
 
 ## Design Decisions
 
@@ -237,10 +277,21 @@ something about that one process), and the host table skips them: it is also
 
 CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded against CPU count).
 
+The tab compacts itself only as far as the frame needs: a 16-core x86 host
+with a sensor per core ran 60 rows, and the box clipped the temperatures at
+the bottom without a trace. In order, it folds the per-policy frequency rows
+into one summary line (`16 policies 4200–4601 MHz (800–5100) powersave`),
+drops the per-core sparklines to pack the core grid into more columns, and
+finally puts the temperatures ahead of the core grid. A four-core board
+keeps the full layout.
+
 ### Tab 2: Memory
 
 - RAM: total / used / free / available / cached / buffers, with a color-coded usage bar, sparkline history, and session peak
 - Memory pressure (PSI some + full)
+- Last OOM victim by name and PID, when the kernel log is followed
+- OOM kills: the kernel's `oom_kill` counter from `/proc/vmstat` (Linux 4.13+,
+  cgroup-limit kills included), since boot and since ucmon started
 - Swap: total / used / free with bar and sparkline (or "not configured")
 - Refreshed every 1 second
 
@@ -259,15 +310,25 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
 - Tree view toggle via `t`: renders a parent/child process tree (built from
   PPID) with `├─`/`└─` branch glyphs; siblings ordered by the active sort.
   Falls back to the flat list while a search filter is active.
+- The cursor follows its PID, not its row: when a refresh re-orders the list,
+  the selection stays on the same process. A user's `s` or `t` jumps to the top
 - Detail line shows the selected process's full command line
 - `enter` opens the **detail overlay**: user, status, start time/uptime, nice,
   threads, open fds, children, RSS/VMS/swap, per-process disk I/O totals,
   exe/cwd, wrapped cmdline, and its sockets. Keys inside: `+`/`-` renice
-  (negative needs root), `p`/`c` SIGSTOP/SIGCONT, `k`/`K` kill, `esc` close.
-  Refreshes on the proc tick while open.
-- `k` (SIGTERM) / `K` (SIGKILL) open a `y/N` confirmation; the signal is sent
-  via `probe.KillProcess` (gopsutil `Terminate`/`Kill`) and a status line reports
-  the result
+  (negative needs root), `p`/`c` SIGSTOP/SIGCONT, `k`/`K` kill, `esc`/`q`/`enter`
+  close. Refreshes on the proc tick while open. If the process exits, or its PID
+  is reused (a different start time), the overlay freezes on its last data with
+  "process exited — esc to close" and ignores every action key.
+- `k` (SIGTERM) / `K` (SIGKILL) open a `y/N` confirmation (`y`/`Y`/`enter`
+  confirm, any other key cancels). `probe.KillProcess` pins the process with a
+  pidfd, confirms its start time (field 22 of `/proc/<pid>/stat`) still matches
+  the row's, and signals through `pidfd_send_signal`, so a PID recycled since
+  the list was drawn is refused (`ErrProcGone`) rather than signalled. Where
+  seccomp or an old kernel refuses `pidfd_open` (EPERM/ENOSYS) it falls back to
+  check-then-kill. SIGSTOP/SIGCONT take the same path; renice checks the start
+  time and then calls `setpriority`, which has no pidfd form. A status line
+  reports the result
 - Search/filter matches name, PID, user, and command line; refreshed every 3 seconds
 
 ### Tab 4: Disk Usage
@@ -282,6 +343,17 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
   state (normal/warning/urgent) and the read-only lockout a controller sets
   when a card is finished. Graded harsher than filesystem usage: a full
   filesystem is an inconvenience, a worn-out card is an unbootable device
+- **Kernel I/O errors**: the session tally per device from the kernel log
+  (`kernel I/O errors this session: mmcblk0 12 (last 18:20:01)`)
+- **Read-only state**: the FS column gets an ` ro` suffix, and a **remount**
+  gets its own red line under the table. A mount is flagged as remounted when
+  it is read-only now while `/etc/fstab` declares it read-write, or this
+  sampler saw the same device read-write earlier: the kernel's
+  `errors=remount-ro` reaction to I/O errors, usually the first visible sign of
+  a dying SD card. The live state comes from `/proc/self/mounts`, because
+  mountinfo's per-mount flags (what gopsutil reports) still say `rw` after a
+  superblock remount. Read-only image formats (squashfs, iso9660, erofs, udf,
+  cramfs) are never flagged
 
 ### Tab 5: Network
 
@@ -317,6 +389,7 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
 - Battery: charge %, charging status, voltage, instantaneous watts, estimated time to empty/full, technology, **pack health** (energy/charge `full` vs `full_design`) — read directly from `/sys/class/power_supply` (works with the uConsole axp20x driver and standard laptop batteries); AC/USB mains presence; session-minimum charge; signed power-draw sparkline (negative = discharging)
 - Load average: 1/5/15-minute, color-coded against CPU count, with sparkline history and session peak
 - Raspberry Pi throttle / under-voltage: parses `vcgencmd get_throttled`, showing both current and since-boot flags for under-voltage, ARM frequency capping, throttling, and soft temperature limit. Gracefully reports unavailable when `vcgencmd` is absent (non-Pi hosts)
+- Kernel-reported under-voltage: a session tally from the kernel log, which catches dips between vcgencmd samples and works without vcgencmd
 - Refreshed on the slow interval
 
 ### Tab 7: GPU / VideoCore & Display
@@ -338,19 +411,73 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
   Conditions are keyed by a stable identity (e.g. `temp:cpu_thermal`,
   `disk:/`) so a sustained problem logs once on raise and once on clear rather
   than every tick; a rise in severity (warn → crit) is logged as a new event,
-  a de-escalation is tracked silently.
+  a de-escalation is damped like a clear (held at the higher severity for
+  `alert_clear_ticks` updates, still showing what was raised) and then
+  logged as an event at the lower severity, so a reading wobbling across the
+  crit line cannot re-raise CRIT on every crossing, and the hook and the log
+  know the state the eventual clear refers to.
 - **Flap damping**: a condition must stay absent for `alert_clear_ticks`
   consecutive updates (default 3) before it clears, so a value oscillating
   around its threshold cannot spam raise/clear pairs — it simply stays active
   until it settles.
 - Monitored conditions: CPU/SoC temperature (reusing `temp_hot`/`temp_crit`),
-  RAM and swap usage, per-filesystem usage (squashfs skipped to avoid loop-mount
-  noise), discharging battery level (low/critical), live Pi throttle and
+  RAM and swap usage, per-filesystem usage (read-only image formats — squashfs,
+  iso9660, erofs, udf, cramfs — skipped: they are packed to 100% by design),
+  read-only remounts (`diskro:<mount>`, critical), storage wear (`storage:`),
+  modem not registered (with `modem_enabled`), discharging battery level (low/critical), live Pi throttle and
   under-voltage flags (current bits only — the latched "occurred" bits would
   pin the banner on forever), load average vs core count, weak WiFi signal
   (`wifi_low_dbm`), packet loss to a ping target (`ping_loss_warn_pct`, once
-  the loss window has ≥ 10 samples), and PSI pressure (`psi_warn_pct` against
-  each resource's some-avg10).
+  the loss window has ≥ 10 samples), PSI pressure (`psi_warn_pct` against
+  each resource's some-avg10), OOM kills, and kernel-log events.
+- **OOM kills** are events, not levels, so they are handled differently
+  (`internal/ui/oom.go`). The first `oom_kill` reading is a baseline — kills
+  from before ucmon started are history — and every later increase becomes a
+  critical condition keyed by the counter value (`oom:<n>`) that stays up for
+  `event_alert_minutes` (default 10, 0 = off). A key per kill means a second
+  kill while the first is still shown raises again (bell, `alert_cmd`, log
+  line) instead of silently rewording the first. The counter cannot say
+  which process died; when the kernel log is followed, the OOM killer's own
+  line names it ("killed chromium (pid 4242)"), matched to the kill by time,
+  and otherwise the message points at `dmesg`. Each victim goes to the one
+  kill nearest it in time, and a kill takes at most as many names as it has
+  victims, so two kills seconds apart are named apart. Without the counter
+  (kernels before 4.13) the log line raises the alert itself. Windows run
+  against the latest tick, and the counter is still read while sampling is
+  paused, so a kill during a pause is an alert dated when it happened.
+  `--once` and the exporter
+  sample too briefly to see a kill happen; the exporter publishes the counter
+  as `ucmon_oom_kills_total` instead, for Prometheus to take `increase()` of.
+- **Kernel-log events** (`internal/probe/kmsg.go`, `internal/ui/kernlog.go`):
+  the TUI follows `/dev/kmsg` from startup (`kernel_log_enabled`, default on)
+  and classifies three kinds of line: **under-voltage** (`Undervoltage
+  detected!` / `Under-voltage detected!`, warning — the kernel catches dips
+  shorter than vcgencmd's sampling, and is the only source on boards without
+  vcgencmd), **storage I/O errors** (block-layer `I/O error, dev …`, `Buffer
+  I/O error`, `mmcblk0: error -110`, `mmc0: Timeout…`, and ext4/FAT/btrfs/XFS
+  errors; critical — usually minutes to hours before ext4 remounts read-only),
+  and **OOM-killer reports** (which name the counter's victims; the pre-5.1
+  bare `Killed process` line too). Storage errors are keyed by the whole disk
+  (`kio:mmcblk0`), so one failing card logging as `mmc0`, `mmcblk0` and
+  `mmcblk0p2` is one alert counting up, kept for `event_alert_minutes` after
+  the last line; the message names the filesystems on it. An MMC host is
+  resolved to its card through sysfs, and a host with no block device (on a
+  Pi, `mmc1` is the SDIO WiFi) is not storage at all. Ignored: loop, optical,
+  RAM and network block devices (a corrupt snap is not a dying card), disks
+  whose every mount `disk_ignore` hides, ext4's daily restatement of an old
+  error (`error count since last fsck`), and records user space wrote into
+  the log (facility > 0). Events are dated by the record's own timestamp, so
+  a backlog read late keeps the time it happened. That timestamp comes from
+  the scheduler clock, which NTP does not slew: it tracks
+  `CLOCK_MONOTONIC_RAW`, not `CLOCK_MONOTONIC` — on a host up for three days
+  the two were 8 s apart, enough to date an OOM kill wrongly and miss the
+  log line that names its victim. The log is read
+  non-blocking each fast tick, paused or not (at most 2000 records a round),
+  skips what was already in the ring at startup, resumes after a wrap
+  (`EPIPE`), gives up with one notice after five failed reads in a row, and is
+  opened only by the TUI — `--once` and the exporter's per-scrape models live
+  too briefly to see an event. Reading it needs `kernel.dmesg_restrict=0` or
+  `CAP_SYSLOG`; where neither holds the alerts stay off and `doctor` says why.
 - **Predictive conditions** (`internal/ui/trend.go`): a level threshold cannot
   tell a pack discharging over eight hours from one dumping in twenty minutes,
   and by the time a 16 GB card reads 90% full there may be minutes left. The
@@ -358,20 +485,38 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
   this moving, and when does it hit the wall" — battery drain %/h with a
   time-to-empty, filesystem fill with a time-to-full, temperature climb with a
   time-to-critical. A rate needs a 45 s baseline before it is trusted, so a
-  one-tick wobble cannot set a slope.
+  one-tick wobble cannot set a slope. The battery uses a ten-minute window
+  with a five-minute minimum: capacity is an integer, and over two minutes a
+  single 1% step reads as a steep slope. Temperatures use a three-minute
+  window with a 90 s minimum, and the climb alert takes the smaller of the
+  slopes across the window and across its recent half: a CPU warms ten
+  degrees in the first half-minute of any load and then levels off, which is
+  steep across the window but flat recently — measured on a 16-core desktop,
+  where every burst raised eight "rising toward 120 °C" warnings. A climb
+  only warns when critical is at most ten minutes away at that rate, and a
+  chip's sensors share one alert (`temprise:coretemp`, naming the fastest
+  core and how many more are rising).
 - **Storage wear**: a card at 90% of its rated write endurance looks perfect in
   every throughput and usage reading right up to the day it goes read-only,
   which makes it the one condition nothing else in ucmon could hint at.
 - **Pause does not stop alerting.** `space` freezes the readings, which is what
   it is for; silencing the bell, the hook and the log at the same time would
   disarm the monitor at exactly the moment someone stopped it to look at
-  something worrying.
+  something worrying. The event streams (the kernel log, the OOM counter)
+  keep being read, since an event missed during a pause is gone.
+- **Trends** compare readings on the wall clock: Go's monotonic clock stops
+  during suspend, which made a battery that drained overnight read as dumping
+  15% in five minutes on wake. A gap longer than a series' window starts it
+  over, and series not seen for a window are dropped.
 - **Delivery**: `alertEngine.update` returns the events recorded per tick;
   the model then runs the configured side effects — a terminal bell on a new
   critical (`alert_bell`, suppressed while muted), an `alert_cmd` shell hook
-  (run async with `UCMON_ALERT_STATE`/`SEV`/`MSG` in the environment, 10 s
-  timeout), and an append-only on-disk log (`alert_log_file`,
-  `2026-07-25 12:30:00 RAISE CRIT …` lines).
+  (`UCMON_ALERT_STATE`/`SEV`/`MSG` in the environment), and an append-only
+  on-disk log (`alert_log_file`, `2026-07-25 12:30:00 RAISE CRIT …` lines).
+  Hooks run one at a time, in event order, from a queue of 64 (overflow is
+  dropped with a notice rather than blocking the UI), so a slow webhook can
+  never see a CLEAR before its RAISE. Each runs in a process group of its own
+  and its 10 s timeout kills the whole group, children included.
 - A severity-colored **banner** shows the most severe active alert in the
   footer of *every* tab (errors still take precedence; transient notices show
   briefly above it). The Alerts tab itself lists active conditions and a
@@ -383,20 +528,36 @@ CPU tab also shows a one-line load-average summary (1/5/15-min, color-coded agai
 `internal/ui/export.go` writes a plain-text dump of all current readings — CPU
 and temps, cpufreq, PSI, memory, power/throttle (incl. battery health), disks,
 network interfaces (incl. SSID), latency/loss, top-10 processes by CPU, session
-peaks, and the active/recent alerts — to `~/ucmon-report-<timestamp>.txt`. A
+peaks, storage health, the modem, and the active/recent alerts — to
+`ucmon-report-<timestamp>.txt` in `report_dir` (default: the home directory);
+disks carry `[ro]` or `[REMOUNTED READ-ONLY]` markers. A
 transient footer notice reports the path written. The report is ANSI-free and
 reuses the same `probe` formatting helpers as the live views.
 
 `--once --json` (`internal/ui/metrics.go`) emits the same readings as a JSON
 document instead, because parsing the text report in a script means
-re-deriving its layout every time the layout changes.
+re-deriving its layout every time the layout changes. Each disk carries
+`read_only` and `remounted_ro`, and the exporter publishes them as the
+`ucmon_filesystem_readonly` and `ucmon_filesystem_remounted_readonly` gauges.
+`memory.oom_kills` (JSON) and `ucmon_oom_kills_total` (a counter) carry the
+kernel's OOM-kill count where it exists.
 
 `ucmon --metrics :9100` (`internal/ui/exporter.go`) serves `/metrics` in the
 Prometheus text exposition format, `/snapshot` as JSON and `/healthz`, with no
 TUI; `metrics_listen` runs the same server alongside the monitor. Sampling is
 lazy — nothing is collected until something scrapes — and a result is reused
 for 5 seconds, so a careless 1 s scrape loop cannot drive a full `/proc` walk
-as fast as it can ask.
+as fast as it can ask. At most one collection runs, outside the lock; a
+scrape waits for it up to 8 s (under Prometheus's default 10 s timeout) or
+until the client gives up, then serves the previous snapshot, so a probe
+stuck in the kernel (statfs on a dead NFS mount) costs one goroutine instead
+of every scrape after it. `ucmon_snapshot_age_seconds` says how old the
+readings are. Label values are escaped the exposition format's way (only
+`\`, `"` and newline; invalid UTF-8 becomes U+FFFD) — Go's `%q` writes `\t`
+and `\x01` escapes the parser rejects, failing the whole scrape over one odd
+mount path. When the exporter runs beside the TUI and fails (port in use),
+the error shows as a footer notice and is printed again after the TUI exits;
+stderr itself is hidden behind the alternate screen.
 
 Each scrape collects through a model of its own, so the exporter never reaches
 into the monitor's state and a scrape cannot perturb what is on screen. The
@@ -431,6 +592,8 @@ without it, and the remedy. `probe.Capabilities()` runs the set:
 | cpufreq policies | `/sys/devices/system/cpu/cpufreq` | a VM or container |
 | cpufreq governor write | `policy*/scaling_governor` | **read-only** without root or a udev rule |
 | pressure stall (PSI) | `/proc/pressure` | kernel without `CONFIG_PSI`, or `psi=0` |
+| OOM-kill counter | `/proc/vmstat` (`oom_kill`) | kernel older than 4.13 |
+| kernel log | `/dev/kmsg` | **denied** with `kernel.dmesg_restrict=1` and no `CAP_SYSLOG`; absent in a container |
 | per-process disk I/O | `/proc/<pid>/io` | **denied** for other users without `CAP_SYS_PTRACE` |
 | battery / design capacity | `/sys/class/power_supply` | bench-supplied board; gauges with no `*_full_design` |
 | GPU / VideoCore | `vcgencmd` | any board that is not a Raspberry Pi |
@@ -473,17 +636,37 @@ asserts exactly that.
 ### Overlays, pause, session peaks
 
 - `z` opens an **expanded graph** of one metric: a full-frame braille chart
-  with a value axis, min/max/avg and `←`/`→` to step through every series the
-  tab offers. `Z` resets the session peaks and the trend history together.
+  with a value axis, min/max/avg; `←`/`→`, `↑`/`↓`, `j`/`k` or
+  `tab`/`shift+tab` step through every series the tab offers, `z`/`esc`/`q`/
+  `enter` close it, and `space` and `w` still work underneath. `Z` resets the session peaks and the trend history together.
 - `history_file` persists the sparkline ring buffers and session peaks across
-  restarts (`internal/ui/history.go`), written atomically and ignored when
-  stale, foreign-format or unparseable — replaying yesterday's shape next to
+  restarts (`internal/ui/history.go`), written on exit to a unique temp file
+  that is fsynced before the rename (a power cut on an SD card otherwise
+  leaves an empty file), ignored
+  when stale (over 6 h), foreign-format or unparseable. Exit means any ending:
+  quit, SIGINT/SIGTERM, or SIGHUP — a closed window or a dropped SSH session,
+  which `main` turns into a quit because its default action would kill the
+  process before the save (unless SIGHUP is inherited ignored, as under
+  `nohup`); history is saved even when Bubble Tea returns an error because the
+  terminal vanished, but not by a run that failed before its first tick,
+  which would only re-date the restored history as fresh — replaying
+  yesterday's shape next to
   this minute's reading would be a lie told convincingly.
-- `?` opens a **help overlay** listing every key binding (two-column layout on
-  wide-but-short screens like the uConsole); any of `?`/`esc`/`q` closes it.
-- `space` **pauses** sampling: the tick loop keeps running but issues no fetch
-  commands, freezing every reading (the header shows `⏸ PAUSED`). In-flight
-  results still land.
+- `?` opens a **help overlay** listing every key binding; any of
+  `?`/`esc`/`q`/`enter` closes it. On wide-but-short screens like the
+  uConsole it uses two columns, split between whole sections where the
+  taller column is shortest; each section's key column is as wide as its
+  longest key, and a description that does not fit wraps instead of being
+  cut off.
+- `space` **pauses** sampling: the tick loop keeps running but issues no
+  sampling fetches, freezing every reading (the header shows `⏸ PAUSED`). The
+  kernel log and the OOM counter are still read. In-flight results still land.
+- Strings other people choose — process names and command lines, the user,
+  exe and cwd in the detail view, the connected SSID, the modem's operator —
+  pass through `probe.Printable`, which turns control characters (ESC among
+  them) into `?`. Any local user can name a process `\e]52;c;…\a`; drawn
+  verbatim, that is an escape sequence run by the terminal of whoever is
+  watching — a clipboard write, a retitle, cursor moves that repaint rows.
 - `internal/ui/peaks.go` tracks session peaks (max CPU%, hottest sensor, max
   load1, max RAM%, min battery%) fed from the same messages that update the
   histories; they render inline on the relevant tabs and in reports.
@@ -504,12 +687,15 @@ Three configurable cadences drive all sampling (defaults shown). The base
 
 | Data                            | Setting         | Default |
 |---------------------------------|-----------------|---------|
-| CPU / cpufreq / PSI / memory / network I/O | `fast_interval` | 1s |
+| CPU / cpufreq / PSI / memory / network I/O / kernel log | `fast_interval` | 1s |
 | Processes / connections / ping  | `proc_interval` | 3s      |
-| Disk / battery / GPU / SoC / iw | `slow_interval` | 5s      |
+| Disk / battery / GPU / SoC / iw / storage wear / modem | `slow_interval` | 5s |
 
-The four slow rounds — the `/proc` walk, the socket walk, the vcgencmd + `iw`
-shell-outs, and the ping round — carry an in-flight guard. The socket walk
+Every scheduled fetch carries an in-flight guard (`fetchKind`,
+`internal/ui/behind.go`): the slow rounds — the `/proc` walk, the socket walk,
+the vcgencmd + `iw` shell-outs, the ping round — and the cheap ones too, since
+a hung NFS `statfs` or a stalled hwmon read would otherwise stack a goroutine
+per tick. An error reply clears its guard like a result does. The socket walk
 needs one most of all: `gnet.Connections` readlinks every `/proc/<pid>/fd`
 entry on the host, which is strictly more work than the process walk beside
 it, and it used to be dispatched bare. A refresh a *keypress* asked for goes
@@ -539,7 +725,8 @@ delivery/damping keys `alert_clear_ticks`, `alert_bell`, `alert_cmd`,
 `alert_log_file` (supports `~/`), the monitor keys `wifi_low_dbm`,
 `ping_enabled`, `ping_target`, `ping_loss_warn_pct`, `psi_warn_pct`,
 `modem_enabled`, the rate-based alert keys `batt_drain_warn_pct_h`,
-`disk_full_warn_hours`, `temp_rise_warn_c_per_min`, the output and limit keys
+`disk_full_warn_hours`, `temp_rise_warn_c_per_min`, the event alert key
+`event_alert_minutes`, `kernel_log_enabled`, the output and limit keys
 `history_len`, `procs_cap`, `report_dir` (supports `~/`), `history_file`
 (supports `~/`), `metrics_listen`, and the ignore lists `net_ignore`,
 `disk_ignore`, `temp_ignore`. See the README for an annotated example.
@@ -550,9 +737,11 @@ Keys the parser does not recognise are collected rather than dropped (see
 `splitValue` drops a `#` comment that is not inside quotes, then removes one
 matched pair of surrounding quotes — so a value keeps quotes of its own and a
 shell hook can be written as a TOML literal string. Escape sequences are not
-interpreted. `Sanitize` then clamps the intervals, restores out-of-range alert
-percentages to their defaults (an out-of-range threshold would otherwise fire
-forever or never), and enforces `temp_warn ≤ temp_hot ≤ temp_crit` by pushing
+interpreted. Thresholds must be finite (`NaN`/`Inf` are rejected as
+unparseable). `Sanitize` then clamps the intervals, restores out-of-range
+RAM/swap/disk percentages to their defaults (an out-of-range threshold would
+otherwise fire forever or never), clamps the other thresholds and limits into
+range, and enforces `temp_warn ≤ temp_hot ≤ temp_crit` by pushing
 the lower tiers down, so explicitly lowering `temp_crit` keeps the value asked
 for. `internal/config/readme_test.go` parses the README's own example block and
 asserts every documented key is recognised and every value loses its comment
@@ -586,13 +775,14 @@ raise a WiFi alert or hold a history buffer. The default lists are empty.
 | `↑` `↓` PgUp/Dn `home` `end` | Move cursor (procs)/scroll|
 | `s`              | Cycle process sort        |
 | `t`              | Toggle process tree view  |
-| `k` / `K`        | SIGTERM / SIGKILL (procs) |
+| `k` / `K`        | SIGTERM / SIGKILL (procs; `y`/`enter` confirms) |
 | `j` / `k`        | Select interface (net)    |
 | `f`              | Connection state filter (net) |
 | `ctrl+c`         | Quit                      |
 
 Process detail overlay: `+`/`-` renice, `p`/`c` SIGSTOP/SIGCONT, `k`/`K` kill,
-`esc`/`q`/`enter` close.
+`esc`/`q`/`enter` close. Expanded graph: `←`/`→` (or `j`/`k`) step, `z`/`esc`/`q`
+close. `q` only closes overlays; `ctrl+c` quits.
 
 ## Build & Packaging
 
@@ -612,8 +802,9 @@ make deb-licheerv       # riscv64
 
 Legacy single-arch wrappers remain for parity (`./build-deb.sh [amd64|arm64|riscv64]`,
 plus `build-deb-arm64.sh` / `build-deb-licheerv.sh` shortcuts); they now derive the
-version from source as well. Every build is pure Go (`CGO_ENABLED=0`), so all
-architectures cross-compile from one machine. Each `.deb` installs the binary to
+version from source as well. Every Makefile build is pure Go (`CGO_ENABLED=0`),
+so all architectures cross-compile from one machine (the legacy script's
+native-arch build uses plain `go build`). Each `.deb` installs the binary to
 `/usr/bin/ucmon`.
 
 ## Target Platforms
@@ -629,7 +820,7 @@ architectures cross-compile from one machine. Each `.deb` installs the binary to
 - `github.com/charmbracelet/bubbles` - UI components (viewport, textinput)
 - `github.com/charmbracelet/lipgloss` - Terminal styling
 - `github.com/shirou/gopsutil/v4` - System metrics collection
-- `golang.org/x/sys/unix` - Unprivileged ICMP datagram sockets, uid lookups
+- `golang.org/x/sys/unix` - Unprivileged ICMP sockets, pidfd signalling, getpriority, owner-uid stat, non-blocking `/dev/kmsg` reads, the e2e pty driver
 - `github.com/tklauser/go-sysconf` - USER_HZ for the `/proc/<pid>/stat` columns
 
 Optional external tools, degraded gracefully when absent: `vcgencmd`

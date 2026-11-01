@@ -169,7 +169,7 @@ func parseIWLink(s string) IWLink {
 		case strings.HasPrefix(line, "Connected to "):
 			l.Present = true
 		case strings.HasPrefix(line, "SSID:"):
-			l.SSID = strings.TrimSpace(strings.TrimPrefix(line, "SSID:"))
+			l.SSID = Printable(strings.TrimSpace(strings.TrimPrefix(line, "SSID:")))
 		case strings.HasPrefix(line, "freq:"):
 			v := strings.TrimSpace(strings.TrimPrefix(line, "freq:"))
 			if f, err := strconv.ParseFloat(v, 64); err == nil { // newer iw prints "5180.0"

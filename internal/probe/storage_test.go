@@ -32,6 +32,12 @@ func TestReadStorageHealthEMMC(t *testing.T) {
 		"mmcblk0/device/pre_eol_info": "0x02\n",
 		"loop0/size":                  "1234\n",
 		"zram0/size":                  "1234\n",
+		// eMMC hardware partitions: force_ro boot areas share the card's
+		// device/ link and must not read as a dead, read-only card.
+		"mmcblk0boot0/ro":          "1\n",
+		"mmcblk0boot0/device/type": "MMC\n",
+		"mmcblk0boot1/ro":          "1\n",
+		"mmcblk0rpmb/size":         "8192\n",
 	})
 
 	orig := blockBase
@@ -40,7 +46,7 @@ func TestReadStorageHealthEMMC(t *testing.T) {
 
 	hs := ReadStorageHealth()
 	if len(hs) != 1 {
-		t.Fatalf("got %d devices, want 1 (loop/zram must be skipped): %+v", len(hs), hs)
+		t.Fatalf("got %d devices, want 1 (loop/zram/boot/rpmb must be skipped): %+v", len(hs), hs)
 	}
 	h := hs[0]
 

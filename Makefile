@@ -11,6 +11,7 @@
 #   make deb-uconsole     # single .deb (same pattern for each platform)
 #   make install          # build native + install to $(PREFIX)/bin (sudo)
 #   make run              # build & run natively
+#   make e2e              # hermetic end-to-end suite in Docker
 #   make clean
 
 BIN     := ucmon
@@ -20,6 +21,9 @@ PREFIX  ?= /usr/local
 
 # Keep the .deb version in lockstep with the embedded UI version string.
 VERSION := $(shell sed -nE 's/.*const version = "([^"]+)".*/\1/p' internal/ui/model.go)
+ifeq ($(VERSION),)
+$(error could not read the version from internal/ui/model.go)
+endif
 
 GO      ?= go
 GOFLAGS :=
@@ -36,7 +40,7 @@ licheerv_triple := linux riscv64 .  riscv64
 PLATFORMS := amd64 uconsole pizero2w licheerv
 
 .PHONY: all build $(PLATFORMS) deb $(addprefix deb-,$(PLATFORMS)) \
-        install uninstall run fmt fmt-check vet test test-race clean version help
+        install uninstall run fmt fmt-check vet test test-race e2e clean version help
 
 all: build
 
@@ -70,6 +74,7 @@ deb-$(1): $(1) ## Build .deb for $(1)
 	     -e 's/^Architecture:.*/Architecture: $(DEBARCH)/' \
 	     DEBIAN/control > $(STAGE)/DEBIAN/control
 	@install -m 0755 $(DIST)/$(BINFILE) $(STAGE)/usr/bin/$(BIN)
+	@sed -i "s/^Installed-Size:.*/Installed-Size: $$$$(du -sk $(STAGE)/usr | cut -f1)/" $(STAGE)/DEBIAN/control
 	@dpkg-deb --build --root-owner-group $(STAGE) $(DIST)/$(BIN)_$(VERSION)_$(DEBARCH).deb >/dev/null
 	@echo "   -> $(DIST)/$(BIN)_$(VERSION)_$(DEBARCH).deb"
 endef
@@ -87,14 +92,15 @@ run: ## Build and run natively
 	$(BUILDENV) $(GO) run $(PKG)
 
 fmt: ## gofmt -w
-	gofmt -w internal cmd
+	gofmt -w internal cmd e2e
 
 fmt-check: ## Fail if anything needs gofmt (used by CI)
-	@out=$$(gofmt -l internal cmd); \
+	@out=$$(gofmt -l internal cmd e2e); \
 	if [ -n "$$out" ]; then echo "not gofmt'd:"; echo "$$out"; exit 1; fi
 
-vet: ## go vet
+vet: ## go vet (the e2e package too: its build tag hides it from ./...)
 	$(GO) vet ./...
+	$(GO) vet -tags e2e ./e2e
 
 test: ## go test
 	$(GO) test ./...
@@ -102,6 +108,9 @@ test: ## go test
 test-race: ## go test -race with a coverage profile
 	$(GO) test -race -covermode=atomic -coverprofile=coverage.out ./...
 	@$(GO) tool cover -func=coverage.out | tail -1
+
+e2e: ## Hermetic end-to-end suite: the real binary in a sealed container (needs Docker)
+	e2e/run.sh
 
 version: ## Print the version derived from the source
 	@echo $(VERSION)

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -289,5 +290,79 @@ func TestCPUSamplersDoNotShareABaseline(t *testing.T) {
 	}
 	if !snap.Breakdown.Valid {
 		t.Error("the TUI's sampler lost its baseline to the exporter's")
+	}
+}
+
+// The CPU-sorted list re-sorts on every sample. The cursor must stay on the
+// process the user picked, not on its row index, or K/enter hit whatever
+// process slid into that row.
+func TestProcCursorFollowsPIDAcrossResort(t *testing.T) {
+	m := testModel()
+	m.activeTab = tabProc
+	m.procsSort = sortCPU
+	m, _ = press(t, m, procMsg{procs: []probe.ProcInfo{
+		{PID: 10, Name: "ffmpeg", CPUPct: 90},
+		{PID: 20, Name: "sshd", CPUPct: 50},
+		{PID: 30, Name: "bash", CPUPct: 10},
+	}})
+	m.procsSel = 1 // sshd
+	m, _ = press(t, m, procMsg{procs: []probe.ProcInfo{
+		{PID: 10, Name: "ffmpeg", CPUPct: 1},
+		{PID: 20, Name: "sshd", CPUPct: 0.5}, // now last
+		{PID: 30, Name: "bash", CPUPct: 80},
+	}})
+	if p, ok := m.selectedProc(); !ok || p.PID != 20 {
+		t.Fatalf("cursor on %+v after resort, want PID 20", p)
+	}
+
+	// A selected process that exits falls back to a clamped index.
+	m, _ = press(t, m, procMsg{procs: []probe.ProcInfo{{PID: 10, Name: "ffmpeg"}}})
+	if m.procsSel != 0 {
+		t.Fatalf("procsSel = %d after selected PID vanished, want 0", m.procsSel)
+	}
+}
+
+// The detail overlay holds only a PID and can stay open indefinitely. When
+// that process exits — or the PID is recycled — the overlay must say so and
+// refuse to act, not swap in (and then signal) an unrelated process.
+func TestProcDetailNoticesExitAndPIDReuse(t *testing.T) {
+	open := func() Model {
+		m := testModel()
+		m.activeTab = tabProc
+		m.procs = []probe.ProcInfo{{PID: 4242, Name: "demo", StartTime: 1000}}
+		m.refreshProcs()
+		m, _ = press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+		m, _ = press(t, m, procDetailMsg{pid: 4242, d: probe.ProcDetail{PID: 4242, Name: "demo", StartTime: 1000}})
+		if !m.detail.loaded || m.detail.gone {
+			t.Fatalf("detail not loaded cleanly: %+v", m.detail)
+		}
+		return m
+	}
+
+	m := open()
+	m, _ = press(t, m, procDetailMsg{pid: 4242, err: errors.New("process does not exist")})
+	if !m.detail.gone || !strings.Contains(m.View(), "process exited") {
+		t.Error("a failed refresh did not mark the process exited")
+	}
+	m, _ = press(t, m, key('K'))
+	if m.procsKill != nil {
+		t.Error("K on an exited process opened a kill prompt")
+	}
+
+	m = open()
+	m, _ = press(t, m, procDetailMsg{pid: 4242, d: probe.ProcDetail{PID: 4242, Name: "imposter", StartTime: 2000}})
+	if !m.detail.gone {
+		t.Fatal("a recycled PID was not detected")
+	}
+	if m.detail.d.Name != "demo" {
+		t.Errorf("recycled PID's data swapped in: name %q", m.detail.d.Name)
+	}
+
+	// The list-level prompt carries the identity too.
+	m = open()
+	m, _ = press(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	m, _ = press(t, m, key('K'))
+	if m.procsKill == nil || m.procsKill.start != 1000 {
+		t.Fatalf("kill prompt = %+v, want start 1000", m.procsKill)
 	}
 }

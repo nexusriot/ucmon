@@ -65,3 +65,17 @@ func TestCounterRate(t *testing.T) {
 		}
 	}
 }
+
+func TestPrintable(t *testing.T) {
+	for in, want := range map[string]string{
+		"sshd: vlad@pts/0":            "sshd: vlad@pts/0",
+		"\x1b]52;c;aGk=\x07sleep":     "?]52;c;aGk=?sleep",
+		"a\tb\nc\x7f\u0085d":          "a?b?c??d",
+		"ünïcødé — fine":              "ünïcødé — fine",
+		"\x1b[2J\x1b[Hfake root line": "?[2J?[Hfake root line",
+	} {
+		if got := Printable(in); got != want {
+			t.Errorf("Printable(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

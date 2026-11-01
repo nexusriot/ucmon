@@ -273,3 +273,48 @@ func TestHeaderNeverWrapsWithBadges(t *testing.T) {
 		}
 	}
 }
+
+// On a 16-core host with a sensor per core the full CPU tab ran past a
+// 40-row terminal, and the box clipped the temperatures — the half of the
+// tab its name promises. The tab compacts itself instead, and on a small
+// board nothing changes.
+func TestCPUTabKeepsTemperaturesOnManyCoreHosts(t *testing.T) {
+	big := func(w, h int) Model {
+		m := testModel()
+		next, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: h})
+		m = next.(Model)
+		m.activeTab = tabCPU
+		m.cpuSnap.TakenAt = time.Now()
+		m.cpuSnap.TotalPercent = 5
+		for i := range 16 {
+			m.cpuSnap.PerCorePercent = append(m.cpuSnap.PerCorePercent, 3)
+			m.cpuSnap.Freqs = append(m.cpuSnap.Freqs, probe.PolicyFreq{
+				Policy: fmt.Sprintf("policy%d", i), CurMHz: 4500, MinMHz: 800, MaxMHz: 5100, Governor: "powersave",
+			})
+		}
+		for i := range 14 {
+			m.cpuSnap.Temperatures = append(m.cpuSnap.Temperatures, probe.TempReading{Label: fmt.Sprintf("sensor_%d", i), Temp: 50})
+		}
+		return m
+	}
+	for _, sz := range [][2]int{{120, 40}, {80, 24}, {120, 60}} {
+		v := big(sz[0], sz[1]).viewCPU()
+		if !strings.Contains(v, "Temperatures") || (sz[1] >= 40 && !strings.Contains(v, "sensor_13")) {
+			t.Errorf("%dx%d: temperatures clipped:\n%s", sz[0], sz[1], v)
+		}
+	}
+	// Room to spare: every policy keeps its own row.
+	if v := big(120, 90).viewCPU(); !strings.Contains(v, "policy15") {
+		t.Error("a tall terminal lost the per-policy rows")
+	}
+
+	// A uConsole: four cores, one policy, one sensor — the full layout.
+	m := testModel()
+	m.activeTab = tabCPU
+	m.cpuSnap = probe.CPUSnapshot{TakenAt: time.Now(), PerCorePercent: []float64{1, 2, 3, 4},
+		Freqs:        []probe.PolicyFreq{{Policy: "policy0", CurMHz: 1500, MinMHz: 600, MaxMHz: 1500, Governor: "ondemand"}},
+		Temperatures: []probe.TempReading{{Label: "cpu_thermal", Temp: 50}}}
+	if v := m.viewCPU(); !strings.Contains(v, "policy0") || !strings.Contains(v, "cpu_thermal") {
+		t.Errorf("small board lost its full layout:\n%s", v)
+	}
+}

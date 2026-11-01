@@ -3,6 +3,7 @@ package probe
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -115,5 +116,26 @@ func TestReadThrottleWithFakeVcgencmd(t *testing.T) {
 	}
 	if th.FreqCappedOccurred || th.SoftTempLimitOccurred {
 		t.Errorf("unexpected occurred flags: %+v", th)
+	}
+}
+
+// Installed but refused (not in the video group, no /dev/vchiq): every call
+// fails, and the tab must say "unavailable" rather than draw zeros, while
+// doctor reports it denied with the group fix.
+func TestVcgencmdThatFailsIsNotAvailable(t *testing.T) {
+	old := vcgencmdPaths
+	defer func() { vcgencmdPaths = old }()
+	bin := filepath.Join(t.TempDir(), "vcgencmd")
+	script := "#!/bin/sh\necho 'VCHI initialization failed' >&2\nexit 255\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	vcgencmdPaths = []string{bin}
+
+	if g := SampleGPU(); g.Available {
+		t.Errorf("SampleGPU = %+v, want unavailable", g)
+	}
+	if c := CheckVideoCore(); c.Status != CapDenied || !strings.Contains(c.Fix, "video") {
+		t.Errorf("CheckVideoCore = %+v, want denied with the video-group fix", c)
 	}
 }

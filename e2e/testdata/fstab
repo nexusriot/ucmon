@@ -1,0 +1,12 @@
+# ucmon e2e fixture: how the "board" is meant to be mounted. run.sh mounts
+# the volumes below; the tests compare that live state against this file.
+#
+# <spec>        <mount>         <type>  <options>          <dump> <pass>
+/dev/root       /               ext4    defaults,noatime   0      1
+# Declared read-write but mounted read-only: what errors=remount-ro leaves
+# behind. Must raise the critical diskro alert.
+/dev/locked     /mnt/locked     ext4    defaults           0      2
+# Read-only by design: reported as ro, never as a remount.
+/dev/meantro    /mnt/meant-ro   ext4    ro,noatime         0      2
+# Healthy and read-write.
+/dev/data       /mnt/data       ext4    defaults           0      2

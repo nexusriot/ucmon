@@ -40,9 +40,12 @@ func TestReadThermalZones(t *testing.T) {
 	fakeZone(t, base, "thermal_zone2", "broken", "junk")       // unparsable — skipped
 	fakeZone(t, base, "thermal_zone3", "insane", "999000")     // >150°C — filtered
 	fakeZone(t, base, "cooling_device0", "fan", "1")           // not a thermal_zone — ignored
+	fakeZone(t, base, "thermal_zone4", "battery", "-5000")     // below freezing: kept
+	fakeZone(t, base, "thermal_zone5", "ambient", "500")       // 0.5 °C, not 500 °C
+	fakeZone(t, base, "thermal_zone6", "disabled", "0")        // a disabled zone
 
 	zones := readThermalZones()
-	if len(zones) != 2 {
+	if len(zones) != 4 {
 		t.Fatalf("got %d zones, want 2: %+v", len(zones), zones)
 	}
 	byLabel := map[string]float64{}
@@ -54,6 +57,9 @@ func TestReadThermalZones(t *testing.T) {
 	}
 	if byLabel["gpu-thermal"] != 48.0 {
 		t.Errorf("gpu-thermal = %v, want 48.0", byLabel["gpu-thermal"])
+	}
+	if byLabel["battery"] != -5.0 || byLabel["ambient"] != 0.5 {
+		t.Errorf("battery = %v, ambient = %v; want -5 and 0.5", byLabel["battery"], byLabel["ambient"])
 	}
 }
 
@@ -396,5 +402,21 @@ func TestReadThermalZonesSortNumerically(t *testing.T) {
 			}
 			t.Fatalf("zone order = %v, want %v", labels, want)
 		}
+	}
+}
+
+func TestUniqueTempLabels(t *testing.T) {
+	got := uniqueTempLabels([]TempReading{{Label: "acpitz"}, {Label: "cpu"}, {Label: "acpitz"}})
+	if got[0].Label != "acpitz" || got[1].Label != "cpu" || got[2].Label != "acpitz#2" {
+		t.Errorf("labels = %v", got)
+	}
+	// A sensor already called "a#2" must not collide with the generated one.
+	got = uniqueTempLabels([]TempReading{{Label: "a"}, {Label: "a"}, {Label: "a#2"}})
+	seen := map[string]bool{}
+	for _, r := range got {
+		if seen[r.Label] {
+			t.Errorf("duplicate label %q in %v", r.Label, got)
+		}
+		seen[r.Label] = true
 	}
 }

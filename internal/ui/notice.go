@@ -1,6 +1,10 @@
 package ui
 
-import "time"
+import (
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
 
 // noticeTTL is how long a transient status line stays on screen. Sampling
 // re-renders at least once per fast tick, so an expired notice disappears
@@ -32,3 +36,10 @@ func (n notice) get() string {
 	}
 	return n.text
 }
+
+// errorNoticeMsg puts an error from outside the model (the exporter running
+// beside the TUI) in the footer.
+type errorNoticeMsg struct{ err error }
+
+// ErrorNotice returns a message that shows err as a footer notice.
+func ErrorNotice(err error) tea.Msg { return errorNoticeMsg{err} }

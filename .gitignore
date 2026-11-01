@@ -1,7 +1,18 @@
-build/
-
+# Build output (make, build-deb*.sh)
+/dist/
+/build/
+/ucmon
+/cmd/ucmon/ucmon
 *.deb
-cmd/ucmon/ucmon
-dist/
 
+# Test artifacts (make test-race; go test -c, e.g. the e2e binary)
 coverage.out
+*.coverprofile
+*.test
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

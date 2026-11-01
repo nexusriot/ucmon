@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -86,6 +87,12 @@ func (s StorageHealth) Severity() int {
 // Hosts whose storage exposes none (plain SD cards, most USB sticks, SATA)
 // yield entries with only identity fields, and hosts with no /sys/block
 // yield nothing — the same graceful-absence pattern as vcgencmd.
+// mmcHWPartition matches the eMMC hardware partitions (mmcblk0boot0/1,
+// mmcblk0rpmb). They share the card's device/ link, so they would repeat its
+// wear rows, and the boot ones are force_ro by default — a healthy eMMC would
+// otherwise raise a permanent "read-only, replace it" critical.
+var mmcHWPartition = regexp.MustCompile(`^mmcblk\d+(boot\d+|rpmb)$`)
+
 func ReadStorageHealth() []StorageHealth {
 	entries, err := os.ReadDir(blockBase)
 	if err != nil {
@@ -95,8 +102,12 @@ func ReadStorageHealth() []StorageHealth {
 	var out []StorageHealth
 	for _, e := range entries {
 		name := e.Name()
+		// Optical drives and raw flash are read-only by nature, so their
+		// ro flag would read as a card that locked itself.
 		if strings.HasPrefix(name, "loop") || strings.HasPrefix(name, "ram") ||
-			strings.HasPrefix(name, "dm-") || strings.HasPrefix(name, "zram") {
+			strings.HasPrefix(name, "dm-") || strings.HasPrefix(name, "zram") ||
+			strings.HasPrefix(name, "sr") || strings.HasPrefix(name, "mtdblock") ||
+			mmcHWPartition.MatchString(name) {
 			continue
 		}
 		if h, ok := readOneDevice(name); ok {

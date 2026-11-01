@@ -168,7 +168,7 @@ func TestProcDetailOverlayKeys(t *testing.T) {
 	}
 
 	// Simulate the fetch landing.
-	m, _ = press(t, m, procDetailMsg{d: probe.ProcDetail{PID: 4242, Name: "demo", Nice: 0, Threads: 3}})
+	m, _ = press(t, m, procDetailMsg{pid: 4242, d: probe.ProcDetail{PID: 4242, Name: "demo", Nice: 0, Threads: 3}})
 	if !m.detail.loaded {
 		t.Fatal("detail not marked loaded")
 	}
@@ -229,5 +229,25 @@ func TestGovernorKeyWithoutCpufreq(t *testing.T) {
 	m, _ = press(t, m, key('g'))
 	if m.notice.get() == "" {
 		t.Error("g without cpufreq policies should set a notice")
+	}
+}
+
+// A socket whose owner cannot be read has PID 0 from the probe; showing "0"
+// names the kernel's idle task, so the row says "-" instead.
+func TestConnUnknownOwnerIsNotPIDZero(t *testing.T) {
+	m := testModel()
+	m.activeTab = tabNet
+	m.conns = []probe.ConnInfo{
+		{Proto: "TCP", LocalAddr: "0.0.0.0:22", RemoteAddr: "-", Status: "LISTEN", PID: 0, Process: "-"},
+		{Proto: "TCP", LocalAddr: "0.0.0.0:8080", RemoteAddr: "-", Status: "LISTEN", PID: 4242, Process: "web"},
+	}
+	for _, line := range strings.Split(m.renderNetText(), "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 5 && f[1] == "0.0.0.0:22" && f[4] != "-" {
+			t.Errorf("unknown owner rendered as %q: %q", f[4], line)
+		}
+		if len(f) >= 5 && f[1] == "0.0.0.0:8080" && f[4] != "4242" {
+			t.Errorf("known owner rendered as %q", f[4])
+		}
 	}
 }

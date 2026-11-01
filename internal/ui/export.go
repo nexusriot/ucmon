@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nexusriot/ucmon/internal/probe"
 )
@@ -55,8 +56,12 @@ func (m Model) buildReport(now time.Time) string {
 	}
 	if len(m.cpuSnap.Temperatures) > 0 {
 		b.WriteString("  temperatures:\n")
+		w := 16
 		for _, t := range m.cpuSnap.Temperatures {
-			fmt.Fprintf(&b, "    %-16s %s\n", t.Label, probe.FormatTemp(t.Temp))
+			w = max(w, utf8.RuneCountInString(t.Label))
+		}
+		for _, t := range m.cpuSnap.Temperatures {
+			fmt.Fprintf(&b, "    %-*s %s\n", w, t.Label, probe.FormatTemp(t.Temp))
 		}
 	}
 	b.WriteString("\n")
@@ -71,6 +76,9 @@ func (m Model) buildReport(now time.Time) string {
 			probe.HumanBytes(s.SwapUsed), probe.HumanBytes(s.SwapTotal), s.SwapUsedPct)
 	} else {
 		b.WriteString("  swap           not configured\n")
+	}
+	if s.OOMKillsOK {
+		fmt.Fprintf(&b, "  OOM kills      %d since boot, %d this session\n", s.OOMKills, m.oom.session)
 	}
 	b.WriteString("\n")
 
@@ -133,9 +141,20 @@ func (m Model) buildReport(now time.Time) string {
 
 	if len(m.disks) > 0 {
 		b.WriteString("Disks\n")
+		mountW := 18
 		for _, d := range m.disks {
-			fmt.Fprintf(&b, "  %-18s %s / %s (%.1f%%) %s\n",
-				d.MountPoint, probe.HumanBytes(d.Used), probe.HumanBytes(d.Total), d.UsedPct, d.FSType)
+			mountW = max(mountW, utf8.RuneCountInString(d.MountPoint))
+		}
+		for _, d := range m.disks {
+			ro := ""
+			switch {
+			case d.RemountedRO:
+				ro = "  [REMOUNTED READ-ONLY]"
+			case d.ReadOnly:
+				ro = "  [ro]"
+			}
+			fmt.Fprintf(&b, "  %-*s %s / %s (%.1f%%) %s%s\n",
+				mountW, d.MountPoint, probe.HumanBytes(d.Used), probe.HumanBytes(d.Total), d.UsedPct, d.FSType, ro)
 		}
 		b.WriteString("\n")
 	}
@@ -163,9 +182,13 @@ func (m Model) buildReport(now time.Time) string {
 	up := m.upIfaces()
 	if len(up) > 0 {
 		b.WriteString("Network\n")
+		nameW := 10
 		for _, ii := range up {
-			line := fmt.Sprintf("  %-10s ↓ %-12s ↑ %-12s",
-				ii.Name, probe.HumanBytesPerSec(ii.RxBps), probe.HumanBytesPerSec(ii.TxBps))
+			nameW = max(nameW, utf8.RuneCountInString(ii.Name))
+		}
+		for _, ii := range up {
+			line := fmt.Sprintf("  %-*s ↓ %-12s ↑ %-12s",
+				nameW, ii.Name, probe.HumanBytesPerSec(ii.RxBps), probe.HumanBytesPerSec(ii.TxBps))
 			if ii.WiFi.Present {
 				line += fmt.Sprintf("  wifi %.0f%% %.0f dBm", ii.WiFi.QualityPct, ii.WiFi.SignalDBm)
 				if link, ok := m.iwLinks[ii.Name]; ok && link.SSID != "" {

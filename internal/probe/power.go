@@ -122,6 +122,11 @@ func readPowerSupply() (bat BatteryInfo, acKnown bool, acOnline bool) {
 			if bat.Present {
 				continue // keep the first battery
 			}
+			// A Bluetooth mouse or a game controller registers its cell
+			// as a Battery too, scoped to the device; it is not the pack.
+			if b, err := os.ReadFile(filepath.Join(dir, "scope")); err == nil && strings.TrimSpace(string(b)) == "Device" {
+				continue
+			}
 			bat.Present = true
 			bat.Name = e.Name()
 

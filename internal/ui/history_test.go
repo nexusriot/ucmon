@@ -212,3 +212,24 @@ func TestRestoreSaysSo(t *testing.T) {
 		t.Errorf("a fresh session announced a restore: %q", n)
 	}
 }
+
+// Saving leaves no temp files behind, and repeated saves do not collide.
+func TestSaveHistoryLeavesNoTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	m := testModel()
+	m.cfg.HistoryFile = filepath.Join(dir, "history.json")
+	m.cpuHist = []float64{1, 2, 3}
+	for range 3 {
+		if err := m.Save(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 || entries[0].Name() != "history.json" {
+		names := []string{}
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("directory after saves: %v", names)
+	}
+}

@@ -2,7 +2,11 @@ package ui
 
 import (
 	"fmt"
+	"math"
+	"strings"
 	"time"
+
+	"github.com/nexusriot/ucmon/internal/probe"
 )
 
 // trendWindow is how far back a rate is measured over. Long enough that a
@@ -14,6 +18,37 @@ const trendWindow = 2 * time.Minute
 // it, dividing a small change by a small interval produces a confident-looking
 // number built from noise.
 const trendMinSpan = 45 * time.Second
+
+// Battery capacity is an integer percent, so over trendWindow a single 1%
+// step already reads as 30%/h — above the default batt_drain_warn_pct_h —
+// and a healthy 10%/h discharge raised and cleared a warning on every step.
+// Its series gets a window long enough that one step stays well below that.
+const (
+	battTrendWindow  = 10 * time.Minute
+	battTrendMinSpan = 5 * time.Minute
+)
+
+// trendMaxHours caps an ETA: past it the reading is effectively flat, and
+// time.Duration overflows (to a negative value on amd64) near 2.5e6 hours.
+const trendMaxHours = 1e5
+
+// A CPU warms by ten degrees in the first half-minute of any load and then
+// levels off; over a 45 s baseline that burst reads as a climb toward
+// critical. Temperatures get a baseline long enough to see the plateau.
+const (
+	tempTrendWindow  = 3 * time.Minute
+	tempTrendMinSpan = 90 * time.Second
+)
+
+func trendSpans(key string) (window, minSpan time.Duration) {
+	switch {
+	case key == "batt":
+		return battTrendWindow, battTrendMinSpan
+	case strings.HasPrefix(key, "temp:"):
+		return tempTrendWindow, tempTrendMinSpan
+	}
+	return trendWindow, trendMinSpan
+}
 
 // trendPoint is one observation of a monotonic-ish reading.
 type trendPoint struct {
@@ -38,9 +73,22 @@ func newTrendTracker() trendTracker {
 }
 
 // observe records a reading, dropping anything older than the window.
+//
+// Times are compared on the wall clock: Go's monotonic reading stops while
+// the system is suspended, so across a night in sleep the morning's first
+// reading would sit minutes, not hours, after last night's — and a battery
+// that drained 15% overnight would read as dumping it in five minutes. A gap
+// longer than the window (a suspend, or a mount or sensor that went away and
+// came back, perhaps as something else) starts the series over.
 func (t *trendTracker) observe(key string, v float64, now time.Time) {
-	pts := append(t.series[key], trendPoint{at: now, v: v})
-	cut := now.Add(-trendWindow)
+	now = now.Round(0)
+	window, _ := trendSpans(key)
+	pts := t.series[key]
+	if n := len(pts); n > 0 && now.Sub(pts[n-1].at) > window {
+		pts = nil
+	}
+	pts = append(pts, trendPoint{at: now, v: v})
+	cut := now.Add(-window)
 	first := 0
 	for first < len(pts) && pts[first].at.Before(cut) {
 		first++
@@ -52,6 +100,19 @@ func (t *trendTracker) observe(key string, v float64, now time.Time) {
 	t.series[key] = pts[first:]
 }
 
+// evict forgets series not observed for longer than their window: the
+// filesystems and sensors that are gone (a container's overlay mounts churn
+// through dozens).
+func (t *trendTracker) evict(now time.Time) {
+	now = now.Round(0)
+	for key, pts := range t.series {
+		window, _ := trendSpans(key)
+		if n := len(pts); n == 0 || now.Sub(pts[n-1].at) > window {
+			delete(t.series, key)
+		}
+	}
+}
+
 // rate returns the change per hour across the retained window, and whether
 // the baseline is long enough to mean anything.
 func (t trendTracker) rate(key string) (perHour float64, ok bool) {
@@ -61,10 +122,39 @@ func (t trendTracker) rate(key string) (perHour float64, ok bool) {
 	}
 	first, last := pts[0], pts[len(pts)-1]
 	span := last.at.Sub(first.at)
-	if span < trendMinSpan {
+	if _, minSpan := trendSpans(key); span < minSpan {
 		return 0, false
 	}
 	return (last.v - first.v) / span.Hours(), true
+}
+
+// sustainedRate is rate, but only as fast as the reading is still moving:
+// the smaller of the slope across the window and the slope across its most
+// recent half. A warm-up burst that has levelled off has a steep window and a
+// flat recent half, and is not a climb; a failed fan is steep in both.
+func (t trendTracker) sustainedRate(key string) (perHour float64, ok bool) {
+	whole, ok := t.rate(key)
+	if !ok {
+		return 0, false
+	}
+	pts := t.series[key]
+	last := pts[len(pts)-1]
+	mid := last.at.Add(-last.at.Sub(pts[0].at) / 2)
+	// The baseline for the recent half is the latest reading at or before
+	// its start.
+	base := pts[0]
+	for _, p := range pts {
+		if p.at.After(mid) {
+			break
+		}
+		base = p
+	}
+	if span := last.at.Sub(base.at); span > 0 {
+		if recent := (last.v - base.v) / span.Hours(); math.Abs(recent) < math.Abs(whole) {
+			return recent, true
+		}
+	}
+	return whole, true
 }
 
 // etaTo returns how long until a reading moving at its current rate reaches
@@ -83,7 +173,7 @@ func (t trendTracker) etaTo(key string, current, target float64) (time.Duration,
 		return 0, false
 	}
 	hours := remaining / perHour
-	if hours <= 0 {
+	if hours <= 0 || hours > trendMaxHours {
 		return 0, false
 	}
 	return time.Duration(hours * float64(time.Hour)), true
@@ -101,11 +191,12 @@ func (m *Model) recordTrend(now time.Time) {
 	if now.IsZero() {
 		now = time.Now()
 	}
+	m.trends.evict(now)
 	if b := m.powerSnap.Battery; b.Present && b.Capacity >= 0 {
 		m.trends.observe("batt", float64(b.Capacity), now)
 	}
 	for _, d := range m.disks {
-		if d.FSType == "squashfs" {
+		if probe.ReadOnlyByDesign(d.FSType) {
 			continue
 		}
 		m.trends.observe("disk:"+d.MountPoint, d.UsedPct, now)

@@ -182,14 +182,26 @@ func icmpPing(ip string, timeout time.Duration) (time.Duration, error) {
 	binary.BigEndian.PutUint16(pkt[2:4], icmpChecksum(pkt))
 
 	start := time.Now()
-	if err := unix.Sendto(fd, pkt, 0, sa); err != nil {
-		return 0, err
+	// Socket calls with SO_RCVTIMEO are never restarted after a signal
+	// (signal(7)), and SIGWINCH/SIGCHLD/SIGURG arrive constantly here: retry
+	// EINTR instead of counting it as a lost ping.
+	for {
+		err := unix.Sendto(fd, pkt, 0, sa)
+		if err == nil {
+			break
+		}
+		if err != unix.EINTR || !time.Now().Before(start.Add(timeout)) {
+			return 0, err
+		}
 	}
 
 	buf := make([]byte, 1500)
 	deadline := start.Add(timeout)
 	for time.Now().Before(deadline) {
 		n, _, err := unix.Recvfrom(fd, buf, 0)
+		if err == unix.EINTR {
+			continue
+		}
 		if err != nil {
 			return 0, err // EAGAIN on timeout, or a hard error
 		}
@@ -260,6 +272,12 @@ func parseDefaultGateway(r io.Reader) (string, error) {
 		dest, gw, flags := fields[1], fields[2], fields[3]
 		fl, err := strconv.ParseUint(flags, 16, 32)
 		if err != nil || dest != "00000000" || fl&0x2 == 0 { // 0x2 = RTF_GATEWAY
+			continue
+		}
+		// A default route has a zero mask too: OpenVPN's split routes
+		// (0.0.0.0/1 and 128.0.0.0/1) share the zero destination, and would
+		// make the tunnel peer the "gateway".
+		if len(fields) > 7 && fields[7] != "00000000" {
 			continue
 		}
 		v, err := strconv.ParseUint(gw, 16, 32)

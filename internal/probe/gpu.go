@@ -37,18 +37,25 @@ func SampleGPU() GPUInfo {
 		return GPUInfo{}
 	}
 
-	g := GPUInfo{Available: true}
+	// Available means vcgencmd answered, not merely that it is installed:
+	// outside the video group (or without /dev/vchiq) every call fails, and
+	// the tab must say so rather than draw 0 °C, 0 V and no clocks.
+	var g GPUInfo
+	answered := func(ok bool) bool {
+		g.Available = g.Available || ok
+		return ok
+	}
 
-	if s, ok := vcgencmd(bin, "measure_temp"); ok {
+	if s, ok := vcgencmd(bin, "measure_temp"); answered(ok) {
 		// "temp=47.2'C"
 		g.CoreTempC = parseAfter(s, "temp=", "'")
 	}
-	if s, ok := vcgencmd(bin, "measure_volts", "core"); ok {
+	if s, ok := vcgencmd(bin, "measure_volts", "core"); answered(ok) {
 		// "volt=0.8625V"
 		g.CoreVolts = parseAfter(s, "volt=", "V")
 	}
 	for _, dom := range clockDomains {
-		if s, ok := vcgencmd(bin, "measure_clock", dom); ok {
+		if s, ok := vcgencmd(bin, "measure_clock", dom); answered(ok) {
 			// "frequency(48)=600000000"
 			if eq := strings.IndexByte(s, '='); eq >= 0 {
 				if hz, err := strconv.ParseFloat(strings.TrimSpace(s[eq+1:]), 64); err == nil && hz > 0 {
@@ -57,10 +64,10 @@ func SampleGPU() GPUInfo {
 			}
 		}
 	}
-	if s, ok := vcgencmd(bin, "get_mem", "arm"); ok {
+	if s, ok := vcgencmd(bin, "get_mem", "arm"); answered(ok) {
 		g.MemARMMB = parseMemMB(s) // "arm=948M"
 	}
-	if s, ok := vcgencmd(bin, "get_mem", "gpu"); ok {
+	if s, ok := vcgencmd(bin, "get_mem", "gpu"); answered(ok) {
 		g.MemGPUMB = parseMemMB(s) // "gpu=76M"
 	}
 

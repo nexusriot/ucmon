@@ -238,3 +238,21 @@ func TestNetViewRendersFilteredLongNames(t *testing.T) {
 		}
 	}
 }
+
+// Rows tied on the sort key come out in numeric PID order, not in the
+// text order of the /proc listing (which puts 114 after 1139).
+func TestProcSortTiesByNumericPID(t *testing.T) {
+	m := testModel()
+	ps := []probe.ProcInfo{{PID: 1139}, {PID: 114, CPUPct: 0}, {PID: 3007746}, {PID: 540}, {PID: 9, CPUPct: 5}}
+	m.sortProcSlice(ps)
+	var got []int32
+	for _, p := range ps {
+		got = append(got, p.PID)
+	}
+	want := []int32{9, 114, 540, 1139, 3007746}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("order = %v, want %v", got, want)
+		}
+	}
+}

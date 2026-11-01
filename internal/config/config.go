@@ -8,6 +8,8 @@ package config
 
 import (
 	"bufio"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -82,6 +84,17 @@ type Config struct {
 	DiskFullWarnHours   float64 // warn when a filesystem is this many hours from full
 	TempRiseWarnCPerMin float64 // warn when a sensor climbs this fast
 
+	// EventAlertMinutes is how long an event — an OOM kill, a kernel-log
+	// I/O error or under-voltage — keeps its alert active after it was last
+	// seen. An event has no level to fall back below, so the alert needs a
+	// window to be seen in; 0 disables event alerts.
+	EventAlertMinutes float64
+
+	// KernelLogEnabled follows /dev/kmsg for under-voltage, storage I/O
+	// errors and OOM-killer reports (needs kernel.dmesg_restrict=0 or
+	// CAP_SYSLOG; absent otherwise).
+	KernelLogEnabled bool
+
 	// Storage wear + WWAN modem polling.
 	ModemEnabled bool // poll ModemManager on the slow interval
 
@@ -147,6 +160,9 @@ func Default() Config {
 		DiskFullWarnHours:   6,
 		TempRiseWarnCPerMin: 3,
 
+		EventAlertMinutes: 10,
+		KernelLogEnabled:  true,
+
 		HistoryLen: 200,
 		ProcsCap:   200,
 	}
@@ -186,9 +202,14 @@ func LoadFrom(path string) Config {
 
 	seen := map[string]bool{}
 	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024) // a long alert_cmd line
 	for n := 0; sc.Scan(); {
 		n++
-		line := strings.TrimSpace(sc.Text())
+		text := sc.Text()
+		if n == 1 {
+			text = strings.TrimPrefix(text, "\uFEFF") // a BOM from a Windows editor
+		}
+		line := strings.TrimSpace(text)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
@@ -271,17 +292,17 @@ func apply(cfg *Config, key, val string) bool {
 			cfg.SlowInterval = d
 		}
 	case "temp_warn", "tempwarn":
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
+		if f, err := parseFinite(val); err == nil {
 			cfg.TempWarn = f
 			cfg.TempExplicit = true
 		}
 	case "temp_hot", "temphot":
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
+		if f, err := parseFinite(val); err == nil {
 			cfg.TempHot = f
 			cfg.TempExplicit = true
 		}
 	case "temp_crit", "tempcrit":
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
+		if f, err := parseFinite(val); err == nil {
 			cfg.TempCrit = f
 			cfg.TempExplicit = true
 		}
@@ -302,15 +323,15 @@ func apply(cfg *Config, key, val string) bool {
 	case "alerts_enabled", "alertsenabled", "alerts":
 		cfg.AlertsEnabled = parseBool(val, cfg.AlertsEnabled)
 	case "mem_warn_pct", "memwarnpct", "mem_warn":
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
+		if f, err := parseFinite(val); err == nil {
 			cfg.MemWarnPct = f
 		}
 	case "swap_warn_pct", "swapwarnpct", "swap_warn":
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
+		if f, err := parseFinite(val); err == nil {
 			cfg.SwapWarnPct = f
 		}
 	case "disk_warn_pct", "diskwarnpct", "disk_warn":
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
+		if f, err := parseFinite(val); err == nil {
 			cfg.DiskWarnPct = f
 		}
 	case "batt_low_pct", "battlowpct", "batt_low":
@@ -322,7 +343,7 @@ func apply(cfg *Config, key, val string) bool {
 			cfg.BattCritPct = n
 		}
 	case "load_warn_factor", "loadwarnfactor", "load_warn":
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
+		if f, err := parseFinite(val); err == nil {
 			cfg.LoadWarnFactor = f
 		}
 	case "alert_log_cap", "alertlogcap":
@@ -348,25 +369,31 @@ func apply(cfg *Config, key, val string) bool {
 	case "ping_target", "pingtarget":
 		cfg.PingTarget = val
 	case "ping_loss_warn_pct", "pinglosswarnpct", "ping_loss_warn":
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
+		if f, err := parseFinite(val); err == nil {
 			cfg.PingLossWarnPct = f
 		}
 	case "psi_warn_pct", "psiwarnpct", "psi_warn":
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
+		if f, err := parseFinite(val); err == nil {
 			cfg.PSIWarnPct = f
 		}
 	case "batt_drain_warn_pct_h", "battdrainwarnpcth", "batt_drain_warn":
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
+		if f, err := parseFinite(val); err == nil {
 			cfg.BattDrainWarnPctH = f
 		}
 	case "disk_full_warn_hours", "diskfullwarnhours", "disk_full_warn":
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
+		if f, err := parseFinite(val); err == nil {
 			cfg.DiskFullWarnHours = f
 		}
 	case "temp_rise_warn_c_per_min", "temprisewarncpermin", "temp_rise_warn":
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
+		if f, err := parseFinite(val); err == nil {
 			cfg.TempRiseWarnCPerMin = f
 		}
+	case "event_alert_minutes", "eventalertminutes", "event_alert":
+		if f, err := parseFinite(val); err == nil {
+			cfg.EventAlertMinutes = f
+		}
+	case "kernel_log_enabled", "kernellogenabled", "kernel_log":
+		cfg.KernelLogEnabled = parseBool(val, cfg.KernelLogEnabled)
 	case "modem_enabled", "modemenabled", "modem":
 		cfg.ModemEnabled = parseBool(val, cfg.ModemEnabled)
 	case "history_len", "historylen", "spark_history":
@@ -414,11 +441,19 @@ func parseBool(val string, def bool) bool {
 
 // parseInterval accepts a Go duration ("500ms", "2s") or a bare number that is
 // interpreted as seconds ("3", "1.5").
+// maxInterval bounds every interval: past an hour a monitor is not
+// monitoring, and a huge bare number would overflow time.Duration (which
+// saturates differently on arm64 and amd64).
+const maxInterval = time.Hour
+
 func parseInterval(val string) (time.Duration, bool) {
 	if d, err := time.ParseDuration(val); err == nil && d > 0 {
-		return d, true
+		return min(d, maxInterval), true
 	}
-	if f, err := strconv.ParseFloat(val, 64); err == nil && f > 0 {
+	if f, err := parseFinite(val); err == nil && f > 0 {
+		if f >= maxInterval.Seconds() {
+			return maxInterval, true
+		}
 		return time.Duration(f * float64(time.Second)), true
 	}
 	return 0, false
@@ -506,6 +541,8 @@ func (c *Config) Sanitize() {
 	if c.TempRiseWarnCPerMin < 0 {
 		c.TempRiseWarnCPerMin = 0
 	}
+	// A day is the longest an event alert can usefully stay up.
+	c.EventAlertMinutes = max(0, min(c.EventAlertMinutes, 24*60))
 
 	// History shorter than a sparkline is wide draws nothing; absurdly long
 	// costs memory per interface, sensor and core for no visible gain.
@@ -541,4 +578,15 @@ func clampPctInt(v int) int {
 		return 100
 	}
 	return v
+}
+
+// parseFinite is strconv.ParseFloat minus "nan" and "inf", which it accepts:
+// every comparison against NaN is false, so `temp_crit = nan` would silently
+// switch that alert off instead of being rejected like any other typo.
+func parseFinite(val string) (float64, error) {
+	f, err := strconv.ParseFloat(val, 64)
+	if err == nil && (math.IsNaN(f) || math.IsInf(f, 0)) {
+		return 0, fmt.Errorf("non-finite value %q", val)
+	}
+	return f, err
 }

@@ -15,6 +15,8 @@ import (
 // refreshes on the process tick while it stays open.
 type procDetailState struct {
 	pid    int32
+	start  uint64 // with pid, the process's identity (probe.ProcStartTime)
+	gone   bool   // the process exited, or its PID now names another one
 	name   string // from the list row, shown until the fetch lands
 	d      probe.ProcDetail
 	loaded bool
@@ -22,6 +24,7 @@ type procDetailState struct {
 }
 
 type procDetailMsg struct {
+	pid int32
 	d   probe.ProcDetail
 	err error
 }
@@ -29,8 +32,28 @@ type procDetailMsg struct {
 func fetchProcDetailCmd(pid int32) tea.Cmd {
 	return func() tea.Msg {
 		d, err := probe.GetProcDetail(pid)
-		return procDetailMsg{d: d, err: err}
+		return procDetailMsg{pid: pid, d: d, err: err}
 	}
+}
+
+// apply takes a fetch result for this overlay's PID. A failed fetch means
+// the process exited; a different start time means the PID was recycled.
+// Either way the overlay freezes on the last data it had and says so, rather
+// than silently showing — and then signalling — an unrelated process.
+func (st *procDetailState) apply(msg procDetailMsg) {
+	if st.gone {
+		return
+	}
+	if msg.err == nil && st.start == 0 {
+		st.start = msg.d.StartTime // opened before the start time was known
+	}
+	if msg.err != nil || (msg.d.StartTime != 0 && msg.d.StartTime != st.start) {
+		st.gone = true
+		st.notice = errStyle.Render("process exited — esc to close")
+		return
+	}
+	st.d = msg.d
+	st.loaded = true
 }
 
 // openProcDetail opens the overlay for the currently selected process.
@@ -39,7 +62,7 @@ func (m *Model) openProcDetail() tea.Cmd {
 	if !ok {
 		return nil
 	}
-	m.detail = &procDetailState{pid: p.PID, name: p.Name}
+	m.detail = &procDetailState{pid: p.PID, start: p.StartTime, name: p.Name}
 	return fetchProcDetailCmd(p.PID)
 }
 
@@ -52,32 +75,37 @@ func (m *Model) updateProcDetail(key string) tea.Cmd {
 	case "esc", "q", "enter":
 		m.detail = nil
 		return nil
+	case "ctrl+c":
+		return tea.Quit
+	}
+	if st.gone {
+		return nil // every other key acts on the process, which is gone
+	}
+	switch key {
 	case "+", "=":
 		return m.reniceDetail(1)
 	case "-", "_":
 		return m.reniceDetail(-1)
 	case "p":
-		if err := probe.SuspendProcess(st.pid); err != nil {
+		if err := probe.SuspendProcess(st.pid, st.start); err != nil {
 			st.notice = errStyle.Render("SIGSTOP failed: " + err.Error())
 		} else {
 			st.notice = warnStyle.Render(fmt.Sprintf("sent SIGSTOP to %d", st.pid))
 		}
 		return fetchProcDetailCmd(st.pid)
 	case "c":
-		if err := probe.ResumeProcess(st.pid); err != nil {
+		if err := probe.ResumeProcess(st.pid, st.start); err != nil {
 			st.notice = errStyle.Render("SIGCONT failed: " + err.Error())
 		} else {
 			st.notice = okStyle.Render(fmt.Sprintf("sent SIGCONT to %d", st.pid))
 		}
 		return fetchProcDetailCmd(st.pid)
 	case "k":
-		m.procsKill = &killPrompt{pid: st.pid, name: st.displayName(), hard: false}
+		m.procsKill = &killPrompt{pid: st.pid, start: st.start, name: st.displayName(), hard: false}
 		return nil
 	case "K":
-		m.procsKill = &killPrompt{pid: st.pid, name: st.displayName(), hard: true}
+		m.procsKill = &killPrompt{pid: st.pid, start: st.start, name: st.displayName(), hard: true}
 		return nil
-	case "ctrl+c":
-		return tea.Quit
 	}
 	return nil
 }
@@ -95,7 +123,7 @@ func (m *Model) reniceDetail(delta int) tea.Cmd {
 		return nil
 	}
 	target := probe.ClampNice(int(st.d.Nice) + delta)
-	if err := probe.SetNice(st.pid, target); err != nil {
+	if err := probe.SetNice(st.pid, st.start, target); err != nil {
 		st.notice = errStyle.Render(fmt.Sprintf("renice %d failed: %v (negative values need root)", target, err))
 		return nil
 	}

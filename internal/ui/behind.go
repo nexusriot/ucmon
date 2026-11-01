@@ -7,9 +7,11 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-// fetchKind identifies the sampling rounds slow enough to outlast their own
-// interval: the /proc walk, the socket walk, the vcgencmd + iw shell-outs,
-// and the ping round.
+// fetchKind identifies a guarded sampling round. Every scheduled fetch goes
+// through queue: the obviously slow ones (the /proc walk, the socket walk,
+// vcgencmd + iw, ping), and the cheap ones too, because "cheap" holds only
+// until a hung NFS mount wedges statfs or an I2C sensor stalls a hwmon read —
+// and then an unguarded fetch stacks one more blocked goroutine every tick.
 type fetchKind int
 
 const (
@@ -17,11 +19,38 @@ const (
 	fetchConns
 	fetchSys
 	fetchLatency
+	fetchCPU
+	fetchMem
+	fetchPSI
+	fetchNet
+	fetchDisk
+	fetchPower
+	fetchHealth
+	fetchDetail
+	fetchKmsg
 	numFetchKinds
 )
 
 func (f fetchKind) String() string {
 	switch f {
+	case fetchCPU:
+		return "cpu"
+	case fetchMem:
+		return "memory"
+	case fetchPSI:
+		return "pressure"
+	case fetchNet:
+		return "network"
+	case fetchDisk:
+		return "disk"
+	case fetchPower:
+		return "power"
+	case fetchHealth:
+		return "storage/modem"
+	case fetchDetail:
+		return "process detail"
+	case fetchKmsg:
+		return "kernel log"
 	case fetchConns:
 		return "connections"
 	case fetchSys:

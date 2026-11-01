@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -39,16 +40,16 @@ func TestTrendRateNeedsASettledBaseline(t *testing.T) {
 func TestTrendETA(t *testing.T) {
 	tr := newTrendTracker()
 	now := time.Now()
-	// 80% to 70% over a minute is 10%/min, so 70% of charge lasts 7 minutes.
+	// 80% to 30% over five minutes is 10%/min, so 30% of charge lasts 3 minutes.
 	tr.observe("batt", 80, now)
-	tr.observe("batt", 70, now.Add(60*time.Second))
+	tr.observe("batt", 30, now.Add(5*time.Minute))
 
-	eta, ok := tr.etaTo("batt", 70, 0)
+	eta, ok := tr.etaTo("batt", 30, 0)
 	if !ok {
 		t.Fatal("no ETA for a steadily draining battery")
 	}
-	if eta < 6*time.Minute+30*time.Second || eta > 7*time.Minute+30*time.Second {
-		t.Errorf("ETA = %v, want about 7 minutes", eta)
+	if eta < 2*time.Minute+30*time.Second || eta > 3*time.Minute+30*time.Second {
+		t.Errorf("ETA = %v, want about 3 minutes", eta)
 	}
 
 	// A reading moving away from the target never arrives.
@@ -112,13 +113,13 @@ func TestBatteryDrainRateAlert(t *testing.T) {
 
 	now := time.Now()
 	m.powerSnap.Battery = probe.BatteryInfo{Present: true, Capacity: 60, Status: "Discharging"}
-	m.trends.observe("batt", 80, now.Add(-2*time.Minute))
+	m.trends.observe("batt", 80, now.Add(-6*time.Minute))
 	m.trends.observe("batt", 60, now)
 
 	conds := m.currentAlertConds()
 	c, ok := conds["batt:rate"]
 	if !ok {
-		t.Fatalf("no drain alert for 10%%/min; got %v", keysOf(conds))
+		t.Fatalf("no drain alert for 200%%/h; got %v", keysOf(conds))
 	}
 	if !strings.Contains(c.msg, "empty in") {
 		t.Errorf("drain message gives no ETA: %q", c.msg)
@@ -191,7 +192,7 @@ func TestTempRiseAlert(t *testing.T) {
 	m.trends.observe("temp:cpu_thermal", 45, now.Add(-2*time.Minute))
 	m.trends.observe("temp:cpu_thermal", 60, now) // 7.5 °C/min
 
-	c, ok := m.currentAlertConds()["temprise:cpu_thermal"]
+	c, ok := m.currentAlertConds()["temprise:cpu"]
 	if !ok {
 		t.Fatal("no rise alert for a sensor climbing 7.5 C/min")
 	}
@@ -201,8 +202,71 @@ func TestTempRiseAlert(t *testing.T) {
 
 	// A sensor already over the critical threshold is the level alert's job.
 	m.cpuSnap.Temperatures = []probe.TempReading{{Label: "cpu_thermal", Temp: m.cfg.TempCrit + 5}}
-	if _, ok := m.currentAlertConds()["temprise:cpu_thermal"]; ok {
+	if _, ok := m.currentAlertConds()["temprise:cpu"]; ok {
 		t.Error("an already-critical sensor also raised a rise alert")
+	}
+}
+
+// What a 16-core desktop does under ordinary load, measured: the cores jump
+// ten degrees in half a minute and level off. That is not a failed fan, and
+// eight cores doing it together must not raise eight alerts.
+func TestTempRiseIgnoresWarmUpAndGroupsByChip(t *testing.T) {
+	cfg := config.Default()
+	cfg.TempRiseWarnCPerMin = 3
+	cfg.TempExplicit = true
+	cfg.TempCrit = 100
+	m := NewModel(cfg)
+	now := time.Now()
+
+	var temps []probe.TempReading
+	for i := range 8 {
+		label := fmt.Sprintf("coretemp_core_%d", i)
+		temps = append(temps, probe.TempReading{Label: label, Temp: 62})
+		// 52 °C, a burst to 62 within 30 s, then flat for a minute.
+		m.trends.observe("temp:"+label, 52, now.Add(-90*time.Second))
+		m.trends.observe("temp:"+label, 62, now.Add(-60*time.Second))
+		m.trends.observe("temp:"+label, 62, now)
+	}
+	m.cpuSnap.Temperatures = temps
+	for k := range m.currentAlertConds() {
+		if strings.HasPrefix(k, "temprise:") {
+			t.Errorf("a warm-up burst raised %s", k)
+		}
+	}
+
+	// A real climb on every core is one alert, naming the fastest sensor.
+	for i := range 8 {
+		label := fmt.Sprintf("coretemp_core_%d", i)
+		m.trends.series["temp:"+label] = nil
+		m.trends.observe("temp:"+label, 60, now.Add(-2*time.Minute))
+		m.trends.observe("temp:"+label, 80+float64(i), now)
+		temps[i].Temp = 80 + float64(i)
+	}
+	var rises []string
+	for k, c := range m.currentAlertConds() {
+		if strings.HasPrefix(k, "temprise:") {
+			rises = append(rises, k+" "+c.msg)
+		}
+	}
+	if len(rises) != 1 || !strings.Contains(rises[0], "temprise:coretemp coretemp_core_7") || !strings.Contains(rises[0], "+7 more coretemp sensors") {
+		t.Errorf("rise alerts = %q, want one for the chip, naming its fastest core", rises)
+	}
+}
+
+// A climb whose critical is far off is not warned about: past the horizon,
+// a straight line through a few minutes of readings is a guess.
+func TestTempRiseNeedsCriticalWithinTheHorizon(t *testing.T) {
+	cfg := config.Default()
+	cfg.TempRiseWarnCPerMin = 3
+	cfg.TempExplicit = true
+	cfg.TempCrit = 120
+	m := NewModel(cfg)
+	now := time.Now()
+	m.cpuSnap.Temperatures = []probe.TempReading{{Label: "pkg", Temp: 60}}
+	m.trends.observe("temp:pkg", 52, now.Add(-2*time.Minute))
+	m.trends.observe("temp:pkg", 60, now) // 4 °C/min: 120 °C in 15 min
+	if c, ok := m.currentAlertConds()["temprise:pkg"]; ok {
+		t.Errorf("a climb 15 minutes from critical warned: %q", c.msg)
 	}
 }
 
@@ -231,4 +295,67 @@ func keysOf(m map[string]alertCond) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// Capacity is an integer: one 1% step in a short window used to read as
+// 30%/h and warn on every step of a healthy 10%/h discharge.
+func TestBatteryDrainIgnoresSingleStep(t *testing.T) {
+	cfg := config.Default()
+	cfg.BattDrainWarnPctH = 25
+	m := NewModel(cfg)
+	m.powerSnap.Battery = probe.BatteryInfo{Present: true, Capacity: 59, Status: "Discharging"}
+
+	now := time.Now()
+	for i := 0; i <= 10; i++ { // 60% for ten minutes, then one step down
+		v := 60.0
+		if i == 10 {
+			v = 59
+		}
+		m.trends.observe("batt", v, now.Add(time.Duration(i-10)*time.Minute))
+	}
+	if c, ok := m.currentAlertConds()["batt:rate"]; ok {
+		t.Errorf("a single 1%% step raised %q", c.msg)
+	}
+}
+
+// A barely-moving disk gives an ETA of millions of hours; converting that to
+// a Duration overflowed negative on amd64 and read as "full in <1 min" CRIT.
+func TestDiskFillETAHugeIsNoAlert(t *testing.T) {
+	tr := newTrendTracker()
+	now := time.Now()
+	tr.observe("disk:/", 50, now.Add(-2*time.Minute))
+	tr.observe("disk:/", 50.0000001, now)
+	if eta, ok := tr.etaTo("disk:/", 50.0000001, 100); ok {
+		t.Errorf("ETA %v for an effectively flat disk", eta)
+	}
+}
+
+// After a suspend the monotonic clock has not moved, but the wall clock and
+// the battery have. The gap must start the series over, not read as a
+// fifteen-percent drop in a few minutes.
+func TestTrendRestartsAfterAGap(t *testing.T) {
+	tr := newTrendTracker()
+	t0 := time.Date(2026, 11, 1, 22, 0, 0, 0, time.UTC)
+	for i := range 11 {
+		tr.observe("batt", 80, t0.Add(time.Duration(i)*time.Minute))
+	}
+	// Eight hours of sleep, 15% gone.
+	wake := t0.Add(8 * time.Hour)
+	tr.observe("batt", 65, wake)
+	if _, ok := tr.rate("batt"); ok {
+		t.Error("a rate was computed across the suspend gap")
+	}
+	if len(tr.series["batt"]) != 1 {
+		t.Errorf("series kept %d points across the gap", len(tr.series["batt"]))
+	}
+
+	// A filesystem gone for longer than its window is forgotten.
+	tr.observe("disk:/media/usb", 10, t0)
+	tr.evict(wake)
+	if _, ok := tr.series["disk:/media/usb"]; ok {
+		t.Error("a vanished mount's series was kept")
+	}
+	if _, ok := tr.series["batt"]; !ok {
+		t.Error("a live series was evicted")
+	}
 }

@@ -2,6 +2,8 @@ package probe
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -34,6 +36,11 @@ type ProcInfo struct {
 	IOReadBps  float64
 	IOWriteBps float64
 	IOKnown    bool
+
+	// StartTime is /proc/<pid>/stat field 22 (clock ticks since boot). With
+	// the PID it identifies one process; pass both to the signal/renice
+	// helpers so a recycled PID is refused instead of hit.
+	StartTime uint64
 }
 
 // procBase is a var so tests can point the sampler at a fake /proc tree.
@@ -59,6 +66,7 @@ type procSample struct {
 	startTime uint64 // field 22: identifies the process across PID reuse
 	ioRead    uint64
 	ioWrite   uint64
+	ioOK      bool // /proc/pid/io was readable for this sample
 	at        time.Time
 }
 
@@ -147,20 +155,24 @@ func (s *ProcSampler) readProc(pid int32, memTotal uint64, now time.Time) (ProcI
 	info := ProcInfo{
 		PID:    pid,
 		PPID:   st.ppid,
-		Name:   st.comm,
+		Name:   Printable(st.comm),
 		Status: st.state,
 		MemRSS: st.rssPages * pageSize,
+
+		StartTime: st.startTime,
 	}
 	if memTotal > 0 {
 		info.MemPct = float32(float64(info.MemRSS) / float64(memTotal) * 100)
 	}
 
 	if b, err := os.ReadFile(filepath.Join(dir, "cmdline")); err == nil {
-		info.CmdLine = runeTrunc(cmdlineString(b), 200)
+		info.CmdLine = Printable(runeTrunc(cmdlineString(b), 200))
 		// comm is capped at 15 characters by the kernel; the executable's
-		// own name from argv[0] is the better label when it was cut.
+		// own name from argv[0] is the better label when it was cut — but
+		// only if it is that name, not an interpreter (python3 running
+		// networkd-dispatcher) or the first word of a path with spaces.
 		if utf8.RuneCountInString(info.Name) >= 15 {
-			if full := argv0Base(info.CmdLine); full != "" {
+			if full := argv0Base(info.CmdLine); full != "" && strings.HasPrefix(full, info.Name) {
 				info.Name = full
 			}
 		}
@@ -170,7 +182,7 @@ func (s *ProcSampler) readProc(pid int32, memTotal uint64, now time.Time) (ProcI
 
 	cur := procSample{cpuTicks: st.utime + st.stime, startTime: st.startTime, at: now}
 	if ioRead, ioWrite, ok := readProcIO(dir); ok {
-		cur.ioRead, cur.ioWrite = ioRead, ioWrite
+		cur.ioRead, cur.ioWrite, cur.ioOK = ioRead, ioWrite, true
 		info.IOKnown = true
 	}
 
@@ -179,11 +191,13 @@ func (s *ProcSampler) readProc(pid int32, memTotal uint64, now time.Time) (ProcI
 	// settles it, and it costs nothing — it is already in the stat we read.
 	if prev, ok := s.prev[pid]; ok && prev.startTime == st.startTime {
 		if dt := now.Sub(prev.at).Seconds(); dt > 0 {
-			info.CPUPct = float64(cur.cpuTicks-prev.cpuTicks) / clockTicks / dt * 100
-			if info.CPUPct < 0 {
-				info.CPUPct = 0
+			// uint64 counters: a backwards step would wrap to ~1e17 %.
+			if cur.cpuTicks >= prev.cpuTicks {
+				info.CPUPct = float64(cur.cpuTicks-prev.cpuTicks) / clockTicks / dt * 100
 			}
-			if info.IOKnown {
+			// Both samples must have read /proc/pid/io, or a zero prev turns
+			// the process's lifetime I/O into a one-interval rate.
+			if info.IOKnown && prev.ioOK {
 				info.IOReadBps = CounterRate(cur.ioRead, prev.ioRead, dt)
 				info.IOWriteBps = CounterRate(cur.ioWrite, prev.ioWrite, dt)
 			}
@@ -386,7 +400,8 @@ type ProcDetail struct {
 	MemRSS     uint64
 	MemVMS     uint64
 	MemSwap    uint64
-	CreateTime int64 // unix ms, 0 when unknown
+	CreateTime int64  // unix ms, 0 when unknown
+	StartTime  uint64 // as ProcInfo.StartTime; 0 when unknown
 	IORead     uint64
 	IOWrite    uint64
 	IOOK       bool
@@ -405,6 +420,7 @@ func GetProcDetail(pid int32) (ProcDetail, error) {
 	}
 
 	d := ProcDetail{PID: pid, FDs: -1}
+	d.StartTime, _ = ProcStartTime(pid)
 	d.Name, _ = p.Name()
 	d.User, _ = p.Username()
 	if st, _ := p.Status(); len(st) > 0 {
@@ -413,6 +429,8 @@ func GetProcDetail(pid int32) (ProcDetail, error) {
 	d.CmdLine, _ = p.Cmdline()
 	d.Exe, _ = p.Exe()
 	d.Cwd, _ = p.Cwd()
+	d.Name, d.User, d.CmdLine = Printable(d.Name), Printable(d.User), Printable(d.CmdLine)
+	d.Exe, d.Cwd = Printable(d.Exe), Printable(d.Cwd)
 	d.Nice = int32(getNice(pid))
 	d.Threads, _ = p.NumThreads()
 	if n, err := p.NumFDs(); err == nil {
@@ -429,37 +447,105 @@ func GetProcDetail(pid int32) (ProcDetail, error) {
 		d.Children = len(kids)
 	}
 	d.Conns = ConnectionsForPID(pid)
+	// Everything above was read after the start time: if the PID was
+	// recycled in between, the fields mix two processes.
+	if end, err := ProcStartTime(pid); err != nil || (d.StartTime != 0 && end != d.StartTime) {
+		return ProcDetail{}, ErrProcGone
+	}
 	return d, nil
 }
 
-// KillProcess sends SIGTERM (hard=false) or SIGKILL (hard=true) to pid.
-func KillProcess(pid int32, hard bool) error {
-	p, err := process.NewProcess(pid)
+// ErrProcGone is returned when a PID no longer names the process the caller
+// picked: it exited, or the kernel recycled the PID for something else.
+var ErrProcGone = errors.New("process has exited (PID gone or reused)")
+
+// ProcStartTime reads pid's start time (stat field 22).
+func ProcStartTime(pid int32) (uint64, error) {
+	b, err := os.ReadFile(filepath.Join(procBase, strconv.Itoa(int(pid)), "stat"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, ErrProcGone
+		}
+		return 0, err
+	}
+	st, ok := parseProcStat(b)
+	if !ok {
+		return 0, fmt.Errorf("unparseable /proc/%d/stat", pid)
+	}
+	return st.startTime, nil
+}
+
+// checkStart confirms pid still names the process that started at start.
+// start == 0 means the caller never learned it, so there is nothing to check.
+func checkStart(pid int32, start uint64) error {
+	if start == 0 {
+		return nil
+	}
+	got, err := ProcStartTime(pid)
 	if err != nil {
 		return err
 	}
+	if got != start {
+		return ErrProcGone
+	}
+	return nil
+}
+
+// signalProc sends sig to the process identified by (pid, start). A list
+// row or a confirm prompt can sit on screen for minutes, long enough for the
+// PID to be recycled, so the identity is checked through a pidfd: once
+// opened it pins that exact process, which makes check-then-signal race-free.
+// Where pidfd_open is unavailable it falls back to check-then-kill.
+func signalProc(pid int32, start uint64, sig unix.Signal) error {
+	if pid <= 0 {
+		return ErrProcGone // kill(0)/kill(-1) would hit a whole group
+	}
+	fd, err := unix.PidfdOpen(int(pid), 0)
+	switch err {
+	case nil:
+	case unix.ESRCH:
+		return ErrProcGone
+	case unix.ENOSYS, unix.EPERM:
+		// ENOSYS: kernel < 5.3. EPERM: pidfd_open has no permission check of
+		// its own, so this is a seccomp filter (Docker < 20.10, systemd
+		// SystemCallFilter=) — the plain kill path is still allowed there.
+		if err := checkStart(pid, start); err != nil {
+			return err
+		}
+		return unix.Kill(int(pid), sig)
+	default:
+		return err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	if err := checkStart(pid, start); err != nil {
+		return err
+	}
+	if err := unix.PidfdSendSignal(fd, sig, nil, 0); err != nil {
+		if err == unix.ESRCH {
+			return ErrProcGone
+		}
+		return err
+	}
+	return nil
+}
+
+// KillProcess sends SIGTERM (hard=false) or SIGKILL (hard=true) to the
+// process identified by (pid, start); see signalProc.
+func KillProcess(pid int32, start uint64, hard bool) error {
 	if hard {
-		return p.Kill()
+		return signalProc(pid, start, unix.SIGKILL)
 	}
-	return p.Terminate()
+	return signalProc(pid, start, unix.SIGTERM)
 }
 
-// SuspendProcess sends SIGSTOP to pid.
-func SuspendProcess(pid int32) error {
-	p, err := process.NewProcess(pid)
-	if err != nil {
-		return err
-	}
-	return p.Suspend()
+// SuspendProcess sends SIGSTOP to (pid, start).
+func SuspendProcess(pid int32, start uint64) error {
+	return signalProc(pid, start, unix.SIGSTOP)
 }
 
-// ResumeProcess sends SIGCONT to pid.
-func ResumeProcess(pid int32) error {
-	p, err := process.NewProcess(pid)
-	if err != nil {
-		return err
-	}
-	return p.Resume()
+// ResumeProcess sends SIGCONT to (pid, start).
+func ResumeProcess(pid int32, start uint64) error {
+	return signalProc(pid, start, unix.SIGCONT)
 }
 
 // getNice returns pid's real niceness (-20..19). getpriority(2) returns
@@ -490,7 +576,16 @@ func ClampNice(n int) int {
 
 // SetNice renices pid. Lowering niceness below 0 needs CAP_SYS_NICE / root;
 // the raw EPERM/EACCES error is returned for the UI to surface.
-func SetNice(pid int32, nice int) error {
+//
+// setpriority has no pidfd form, so the identity check leaves a window of a
+// few microseconds — against minutes for an unchecked PID.
+func SetNice(pid int32, start uint64, nice int) error {
+	if pid <= 0 {
+		return ErrProcGone // who=0 would renice ucmon itself
+	}
+	if err := checkStart(pid, start); err != nil {
+		return err
+	}
 	return syscall.Setpriority(syscall.PRIO_PROCESS, int(pid), ClampNice(nice))
 }
 

@@ -235,3 +235,23 @@ func TestReadPowerSupplyMissingTree(t *testing.T) {
 		t.Errorf("Capacity = %d, want -1 for unknown", bat.Capacity)
 	}
 }
+
+// A Bluetooth mouse's cell registers as a Battery scoped to the device; it
+// must not stand in for the pack, even when it sorts first.
+func TestPowerSupplySkipsPeripheralBatteries(t *testing.T) {
+	base := t.TempDir()
+	old := powerSupplyBase
+	powerSupplyBase = base
+	defer func() { powerSupplyBase = old }()
+
+	fakeSupply(t, base, "hid-00:11:22-battery", map[string]string{
+		"type": "Battery", "scope": "Device", "capacity": "90", "status": "Discharging",
+	})
+	fakeSupply(t, base, "BAT0", map[string]string{
+		"type": "Battery", "capacity": "42", "status": "Discharging",
+	})
+	bat, _, _ := readPowerSupply()
+	if !bat.Present || bat.Name != "BAT0" || bat.Capacity != 42 {
+		t.Errorf("battery = %+v, want the pack (BAT0)", bat)
+	}
+}

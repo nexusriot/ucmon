@@ -3,11 +3,13 @@ package ui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -195,16 +197,66 @@ func TestExporterServesBothFormats(t *testing.T) {
 func TestExporterCachesBetweenScrapes(t *testing.T) {
 	e := NewExporter(config.Default())
 
-	first, err := e.snapshot()
+	first, _, err := e.snapshot(context.Background())
 	if err != nil {
 		t.Fatalf("first scrape: %v", err)
 	}
-	second, err := e.snapshot()
+	second, _, err := e.snapshot(context.Background())
 	if err != nil {
 		t.Fatalf("second scrape: %v", err)
 	}
 	if first != second {
 		t.Error("two scrapes inside the minimum interval re-sampled the system")
+	}
+}
+
+// A collection stuck in the kernel must not take the exporter with it:
+// scrapes keep being answered from the last good snapshot, at most one
+// collection runs, and a scrape that has no snapshot to fall back on fails
+// fast instead of hanging.
+func TestExporterSurvivesAHungCollection(t *testing.T) {
+	e := NewExporter(config.Default())
+	e.wait = 100 * time.Millisecond
+	release := make(chan struct{})
+	defer close(release)
+	var calls atomic.Int32
+	e.collect = func(cfg config.Config) Model {
+		if calls.Add(1) > 1 {
+			<-release // the second collection hangs
+		}
+		m := testModel()
+		m.memSnap.UsedPct = float64(calls.Load())
+		return m
+	}
+
+	first, at, err := e.snapshot(context.Background())
+	if err != nil || first.memSnap.UsedPct != 1 {
+		t.Fatalf("first scrape: %v", err)
+	}
+	e.mu.Lock()
+	e.lastAt = at.Add(-time.Hour) // expire it
+	e.mu.Unlock()
+
+	for range 3 {
+		start := time.Now()
+		m, _, err := e.snapshot(context.Background())
+		if err != nil || m != first {
+			t.Fatalf("scrape during a hung collection: %v (fresh model %v)", err, m != first)
+		}
+		if d := time.Since(start); d > 2*time.Second {
+			t.Fatalf("a scrape waited %v on the hung collection", d)
+		}
+	}
+	if n := calls.Load(); n != 2 {
+		t.Errorf("%d collections started, want the one hung one", n)
+	}
+
+	// A fresh exporter whose first collection hangs answers with an error.
+	e2 := NewExporter(config.Default())
+	e2.wait = 100 * time.Millisecond
+	e2.collect = func(cfg config.Config) Model { <-release; return testModel() }
+	if _, _, err := e2.snapshot(context.Background()); !errors.Is(err, errNoSnapshot) {
+		t.Errorf("no snapshot yet: err = %v", err)
 	}
 }
 
@@ -290,4 +342,31 @@ func truncForTest(s string) string {
 		return s[:200] + "…"
 	}
 	return s
+}
+
+// Label values follow the exposition format's escaping, not Go's: a tab, a
+// control byte or invalid UTF-8 in one mount path or sensor label must not
+// make Prometheus reject the whole scrape.
+func TestPromLabelEscaping(t *testing.T) {
+	for in, want := range map[string]string{
+		"plain":         `"plain"`,
+		`back\slash`:    `"back\\slash"`,
+		`qu"ote`:        `"qu\"ote"`,
+		"new\nline":     `"new\nline"`,
+		"tab\there":     "\"tab\there\"",
+		"ctl\x01":       "\"ctl\x01\"",
+		"bad\xffutf8":   "\"bad\uFFFDutf8\"",
+		"soft\u00adhyp": "\"soft\u00adhyp\"",
+	} {
+		if got := promLabel(in); got != want {
+			t.Errorf("promLabel(%q) = %q, want %q", in, got, want)
+		}
+	}
+
+	m := testModel()
+	m.disks = []probe.DiskInfo{{Device: "/dev/sda1", MountPoint: "/mnt/odd\tname\xff", FSType: "ext4", Total: 100, Used: 10, UsedPct: 10}}
+	out := m.buildPrometheus()
+	if !strings.Contains(out, "mount=\"/mnt/odd\tname\uFFFD\"") || strings.Contains(out, `\t`) || strings.Contains(out, `\x`) {
+		t.Errorf("an odd mount path was escaped Go-style:\n%s", out)
+	}
 }

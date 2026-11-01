@@ -3,6 +3,7 @@ package probe
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -67,25 +68,36 @@ type CPUSampler struct {
 // 0% and an invalid breakdown, and every one after that is a real interval.
 func NewCPUSampler() *CPUSampler { return &CPUSampler{} }
 
-// Sample reads the CPU counters, temperatures and cpufreq policies once.
-func (s *CPUSampler) Sample() (CPUSnapshot, error) {
+// advance reads /proc/stat and swaps it in as the new baseline. The read
+// happens under the lock: two overlapping Samples that read first and locked
+// second could install the older reading last, and the next interval would
+// diff against it.
+func (s *CPUSampler) advance() (cur cpu.TimesStat, per []cpu.TimesStat, prevAll *cpu.TimesStat, prevPer []cpu.TimesStat, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	all, err := cpu.Times(false)
 	if err != nil {
-		return CPUSnapshot{}, err
+		return cur, nil, nil, nil, err
 	}
 	if len(all) == 0 {
-		return CPUSnapshot{}, errors.New("no aggregate cpu line in /proc/stat")
+		return cur, nil, nil, nil, errors.New("no aggregate cpu line in /proc/stat")
 	}
-	per, err := cpu.Times(true)
+	per, err = cpu.Times(true)
+	if err != nil {
+		return cur, nil, nil, nil, err
+	}
+	cur = all[0]
+	prevAll, prevPer = s.lastAll, s.lastPer
+	s.lastAll, s.lastPer = &cur, per
+	return cur, per, prevAll, prevPer, nil
+}
+
+// Sample reads the CPU counters, temperatures and cpufreq policies once.
+func (s *CPUSampler) Sample() (CPUSnapshot, error) {
+	cur, per, prevAll, prevPer, err := s.advance()
 	if err != nil {
 		return CPUSnapshot{}, err
 	}
-	cur := all[0]
-
-	s.mu.Lock()
-	prevAll, prevPer := s.lastAll, s.lastPer
-	s.lastAll, s.lastPer = &cur, per
-	s.mu.Unlock()
 
 	snap := CPUSnapshot{
 		PerCorePercent: make([]float64, len(per)),
@@ -193,8 +205,13 @@ func breakdownShare(b CPUBreakdown, label string) float64 {
 
 func readTemperatures() []TempReading {
 	// Try gopsutil sensors package first
+	// One unreadable hwmon file (a sensor whose device is down returns
+	// ENODATA) comes back as a *Warnings error alongside every good reading.
+	// Discarding the set for it flipped the labels to the thermal-zone names
+	// on that tick — new Prometheus series, new alert keys, broken history.
 	stats, err := sensors.SensorsTemperatures()
-	if err == nil && len(stats) > 0 {
+	var warn *sensors.Warnings
+	if (err == nil || errors.As(err, &warn)) && len(stats) > 0 {
 		var out []TempReading
 		for _, s := range stats {
 			if s.Temperature > 0 && s.Temperature < 150 {
@@ -205,12 +222,29 @@ func readTemperatures() []TempReading {
 			}
 		}
 		if len(out) > 0 {
-			return out
+			return uniqueTempLabels(out)
 		}
 	}
 
 	// Fallback: read thermal_zone sysfs (common on RPi/uConsole)
 	return readThermalZones()
+}
+
+// uniqueTempLabels suffixes repeated labels (#2, #3, …): the label keys
+// Prometheus series, alerts and history, and a duplicate series fails the
+// whole scrape.
+func uniqueTempLabels(in []TempReading) []TempReading {
+	used := map[string]bool{}
+	for i := range in {
+		label := in[i].Label
+		// A sensor may itself be called "x#2"; keep counting until free.
+		for c := 2; used[label]; c++ {
+			label = in[i].Label + "#" + strconv.Itoa(c)
+		}
+		used[label] = true
+		in[i].Label = label
+	}
+	return in
 }
 
 // thermalBase is a var so tests can point it at a fake sysfs tree.
@@ -232,6 +266,7 @@ func readThermalZones() []TempReading {
 	sort.Slice(names, func(i, j int) bool { return zoneIndex(names[i]) < zoneIndex(names[j]) })
 
 	var out []TempReading
+	seen := map[string]bool{}
 	for _, name := range names {
 		zpath := filepath.Join(thermalBase, name)
 
@@ -239,6 +274,13 @@ func readThermalZones() []TempReading {
 		if b, err := os.ReadFile(filepath.Join(zpath, "type")); err == nil {
 			label = strings.TrimSpace(string(b))
 		}
+		// Zones often share a type (two "acpitz" on x86). The label is the
+		// sensor's identity — Prometheus series, alert keys, history — and a
+		// duplicate series fails the whole scrape, so disambiguate it.
+		if seen[label] {
+			label += "/" + name
+		}
+		seen[label] = true
 
 		b, err := os.ReadFile(filepath.Join(zpath, "temp"))
 		if err != nil {
@@ -248,11 +290,16 @@ func readThermalZones() []TempReading {
 		if err != nil {
 			continue
 		}
-		// millidegrees -> degrees
-		if val > 1000 {
+		// Zones report millidegrees, except the odd driver that reports
+		// whole degrees. No real reading reaches 200 °C, so anything larger
+		// in magnitude is millidegrees — which also reads 500 as 0.5 °C, not
+		// 500 °C, and -5000 as -5 °C. A battery or ambient zone below
+		// freezing (a handheld used outdoors) is a real reading; exactly 0
+		// is what a disabled zone reports.
+		if math.Abs(val) >= 200 {
 			val /= 1000.0
 		}
-		if val > 0 && val < 150 {
+		if val != 0 && val > -40 && val < 150 {
 			out = append(out, TempReading{
 				Label: label,
 				Temp:  val,

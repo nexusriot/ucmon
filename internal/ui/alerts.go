@@ -6,6 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
@@ -53,6 +56,7 @@ type alertEntry struct {
 type activeCond struct {
 	cond    alertCond
 	missing int // consecutive updates the condition was absent
+	lower   int // consecutive updates it was present at a lower severity
 }
 
 // alertEngine tracks active conditions and an edge-triggered log of changes.
@@ -98,9 +102,24 @@ func (e *alertEngine) update(conds map[string]alertCond, now time.Time) []alertE
 			events = append(events, alertEntry{when: now, sev: c.sev, msg: c.msg})
 		case c.sev > prev.cond.sev:
 			events = append(events, alertEntry{when: now, sev: c.sev, msg: c.msg})
+		case c.sev < prev.cond.sev:
+			// Damp de-escalation like a clear: a reading wobbling across
+			// the crit line would otherwise drop to warn and re-raise CRIT
+			// (bell, alert_cmd, log line) on every crossing.
+			// While damped it stays what was raised — CRIT with the CRIT
+			// text, not CRIT over a "warm" message.
+			if prev.lower+1 < e.clearTicks {
+				prev.lower++
+				prev.missing = 0
+				e.active[k] = prev
+				continue
+			}
+			// The drop held: record it as an event, so the log, the hook
+			// and the eventual clear all describe a state that was announced.
+			events = append(events, alertEntry{when: now, sev: c.sev, msg: c.msg})
 		}
-		// De-escalation or text change is tracked silently; presence always
-		// resets the absent counter.
+		// Text change is tracked silently; presence always resets the
+		// absent counter.
 		e.active[k] = activeCond{cond: c}
 	}
 
@@ -191,9 +210,50 @@ func (m *Model) handleAlertEvents(events []alertEntry) {
 		}
 	}
 	if m.cfg.AlertCmd != "" {
+		dropped := 0
 		for _, ev := range events {
-			go runAlertCmd(m.cfg.AlertCmd, ev)
+			if !hooks.enqueue(m.cfg.AlertCmd, ev) {
+				dropped++
+			}
 		}
+		if dropped > 0 {
+			m.setNotice(errStyle.Render(fmt.Sprintf("alert_cmd is falling behind: %d event(s) dropped", dropped)))
+		}
+	}
+}
+
+// hookQueue runs alert_cmd for one event at a time, in order. Hooks used to
+// get a goroutine each: a slow webhook could then deliver CLEAR before the
+// RAISE it answers, and a flapping condition could stack hooks without
+// bound. A full queue drops events rather than blocking the UI.
+type hookQueue struct {
+	once sync.Once
+	ch   chan hookJob
+}
+
+type hookJob struct {
+	cmdline string
+	ev      alertEntry
+}
+
+const hookQueueLen = 64
+
+var hooks hookQueue
+
+func (q *hookQueue) enqueue(cmdline string, ev alertEntry) bool {
+	q.once.Do(func() {
+		q.ch = make(chan hookJob, hookQueueLen)
+		go func() {
+			for j := range q.ch {
+				runAlertCmd(j.cmdline, j.ev)
+			}
+		}()
+	})
+	select {
+	case q.ch <- hookJob{cmdline, ev}:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -235,11 +295,20 @@ func alertCmdEnv(ev alertEntry) []string {
 	}
 }
 
+// alertCmdTimeout bounds one hook run; a var so tests can shorten it.
+var alertCmdTimeout = 10 * time.Second
+
 func runAlertCmd(cmdline string, ev alertEntry) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), alertCmdTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", cmdline)
 	cmd.Env = append(os.Environ(), alertCmdEnv(ev)...)
+	// The hook runs in a process group of its own, and the timeout kills the
+	// group: killing just the shell would leave a hung `curl` it started
+	// running forever, one more per timed-out alert.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = time.Second
 	_ = cmd.Run()
 }
 
@@ -270,9 +339,25 @@ func (m Model) currentAlertConds() map[string]alertCond {
 			fmt.Sprintf("swap %.0f%% used ≥ %.0f%%", m.memSnap.SwapUsedPct, c.SwapWarnPct)}
 	}
 
-	// Filesystems. Skip squashfs (loop-mounted snaps sit at 100% by design).
+	// OOM kills and kernel-log events are events, not levels: each stays up
+	// for event_alert_minutes after it was last seen, timed against the
+	// latest tick (alertNow).
+	if w := m.eventWindow(); w > 0 {
+		m.oom.conds(conds, m.alertNow(), w)
+		m.klog.conds(conds, m.alertNow(), w, m.mountOf)
+	}
+
+	// Filesystems. Skip read-only images (snaps, ISOs, erofs): packed to
+	// size, they sit at 100% by design.
 	for _, d := range m.disks {
-		if d.FSType == "squashfs" {
+		if d.RemountedRO {
+			// errors=remount-ro: the kernel locked the filesystem after I/O
+			// errors. Everything that writes is already failing, and on an
+			// SD-booted board the card is usually on its way out.
+			conds["diskro:"+d.MountPoint] = alertCond{sevCrit,
+				fmt.Sprintf("%s (%s) remounted read-only — likely I/O errors; back up now", d.MountPoint, d.Device)}
+		}
+		if probe.ReadOnlyByDesign(d.FSType) {
 			continue
 		}
 		if d.UsedPct >= c.DiskWarnPct {
@@ -430,7 +515,7 @@ func (m Model) trendConds(conds map[string]alertCond) {
 	// 16 GB card the gap between "90% full" and "full" can be minutes.
 	if c.DiskFullWarnHours > 0 {
 		for _, d := range m.disks {
-			if d.FSType == "squashfs" || d.UsedPct >= 100 {
+			if probe.ReadOnlyByDesign(d.FSType) || d.UsedPct >= 100 {
 				continue
 			}
 			key := "disk:" + d.MountPoint
@@ -448,10 +533,21 @@ func (m Model) trendConds(conds map[string]alertCond) {
 	}
 
 	// A sensor climbing toward its own critical threshold. Catches a failed
-	// fan or a blocked vent before the throttle flags do.
+	// fan or a blocked vent before the throttle flags do. Only a climb that
+	// reaches critical within tempRiseHorizon counts: further out, a
+	// straight line through a few minutes of readings is a guess, and a
+	// desktop warming under load raised it on every burst. One alert per
+	// sensor chip — eight coretemp cores rising together are one event.
 	if c.TempRiseWarnCPerMin > 0 {
+		type rise struct {
+			label       string
+			perMin, now float64
+			eta         time.Duration
+			others      int
+		}
+		byChip := map[string]*rise{}
 		for _, t := range m.cpuSnap.Temperatures {
-			perHour, ok := m.trends.rate("temp:" + t.Label)
+			perHour, ok := m.trends.sustainedRate("temp:" + t.Label)
 			if !ok {
 				continue
 			}
@@ -459,13 +555,43 @@ func (m Model) trendConds(conds map[string]alertCond) {
 			if perMin < c.TempRiseWarnCPerMin || t.Temp >= c.TempCrit {
 				continue // already-critical sensors are the level alert's job
 			}
-			msg := fmt.Sprintf("%s rising %.1f°C/min (now %.0f°C)", t.Label, perMin, t.Temp)
-			if eta, ok := m.trends.etaTo("temp:"+t.Label, t.Temp, c.TempCrit); ok {
-				msg += fmt.Sprintf(" — %.0f°C in %s", c.TempCrit, humanETA(eta))
+			eta := time.Duration((c.TempCrit - t.Temp) / perMin * float64(time.Minute))
+			if eta > tempRiseHorizon {
+				continue
 			}
-			conds["temprise:"+t.Label] = alertCond{sevWarn, msg}
+			chip := sensorChip(t.Label)
+			if r := byChip[chip]; r != nil {
+				r.others++
+				if eta >= r.eta {
+					continue
+				}
+				*r = rise{t.Label, perMin, t.Temp, eta, r.others}
+				continue
+			}
+			byChip[chip] = &rise{t.Label, perMin, t.Temp, eta, 0}
+		}
+		for chip, r := range byChip {
+			msg := fmt.Sprintf("%s rising %.1f°C/min (now %.0f°C) — %.0f°C in %s",
+				r.label, r.perMin, r.now, c.TempCrit, humanETA(r.eta))
+			if r.others > 0 {
+				msg += fmt.Sprintf(" (+%d more %s sensors)", r.others, chip)
+			}
+			conds["temprise:"+chip] = alertCond{sevWarn, msg}
 		}
 	}
+}
+
+// tempRiseHorizon is how close critical must be for a climb to warn.
+const tempRiseHorizon = 10 * time.Minute
+
+// sensorChip is the device a sensor label belongs to — "coretemp" for
+// coretemp_core_3, "nvme" for nvme_sensor_1 — so a chip's sensors rising
+// together raise one alert. A label without a separator is its own chip.
+func sensorChip(label string) string {
+	if i := strings.IndexAny(label, "_-"); i > 0 {
+		return label[:i]
+	}
+	return label
 }
 
 // lossPct is the failure share of a ping success/failure window, in percent.

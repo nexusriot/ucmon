@@ -128,19 +128,9 @@ func runTUI(cfg config.Config, metricsAddr string) error {
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
 
-	if metricsAddr != "" {
-		go func() {
-			if err := ui.Serve(ctx, cfg, metricsAddr); err != nil {
-				// The monitor is the point; a failed exporter must not take
-				// it down, and stderr is behind the alt screen, so the
-				// message waits there until the TUI exits.
-				fmt.Fprintf(os.Stderr, "ucmon: metrics exporter: %v\n", err)
-			}
-		}()
-	}
-
 	model := ui.NewModel(cfg)
 	model.Restore()
+	model.FollowKernelLog()
 
 	p := tea.NewProgram(
 		model,
@@ -148,14 +138,51 @@ func runTUI(cfg config.Config, metricsAddr string) error {
 		tea.WithMouseCellMotion(),
 	)
 
-	final, err := p.Run()
-	if err != nil {
-		return err
+	// The monitor is the point; a failed exporter must not take it down. But
+	// stderr is behind the alt screen, and anything written there is gone
+	// when the TUI restores the terminal, so the failure is shown in the TUI
+	// and printed again once it exits.
+	exporterErr := make(chan error, 1)
+	if metricsAddr != "" {
+		go func() {
+			if err := ui.Serve(ctx, cfg, metricsAddr); err != nil {
+				exporterErr <- err
+				p.Send(ui.ErrorNotice(fmt.Errorf("metrics exporter: %w", err)))
+			}
+		}()
 	}
-	if m, ok := final.(ui.Model); ok {
-		if err := m.Save(); err != nil {
-			fmt.Fprintf(os.Stderr, "ucmon: could not save history: %v\n", err)
+
+	// Closing the terminal window or dropping an SSH session sends SIGHUP,
+	// whose default action kills the process before history is saved. Bubble
+	// Tea only handles SIGINT and SIGTERM, so treat a hangup as a quit.
+	// Under nohup the hangup is ignored on purpose; Notify would undo that.
+	hup := make(chan os.Signal, 1)
+	if !signal.Ignored(syscall.SIGHUP) {
+		signal.Notify(hup, syscall.SIGHUP)
+		defer signal.Stop(hup)
+	}
+	go func() {
+		select {
+		case <-hup:
+			p.Quit()
+		case <-ctx.Done():
+		}
+	}()
+
+	// Run hands back the last model even when it fails (the terminal went
+	// away mid-read), so save what was gathered either way — unless it never
+	// ran at all, when saving would only re-date the restored history as
+	// fresh.
+	final, err := p.Run()
+	if m, ok := final.(ui.Model); ok && m.Ran() {
+		if serr := m.Save(); serr != nil {
+			fmt.Fprintf(os.Stderr, "ucmon: could not save history: %v\n", serr)
 		}
 	}
-	return nil
+	select {
+	case xerr := <-exporterErr:
+		fmt.Fprintf(os.Stderr, "ucmon: metrics exporter: %v\n", xerr)
+	default:
+	}
+	return err
 }

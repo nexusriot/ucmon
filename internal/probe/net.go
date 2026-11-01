@@ -1,9 +1,10 @@
 package probe
 
 import (
-	"fmt"
 	"net"
+	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -75,12 +76,14 @@ func (s *NetSampler) Sample() (NetSnapshot, error) {
 
 	now := time.Now()
 
-	hi, _ := host.Info()
-	hostName := ""
+	// Only the hostname and uptime are wanted. host.Info gathers far more —
+	// platform and virtualization detection, and on Debian without
+	// /etc/lsb-release it runs the lsb_release Python script — on every
+	// fast tick.
+	hostName, _ := os.Hostname()
 	uptime := time.Duration(0)
-	if hi != nil {
-		hostName = hi.Hostname
-		uptime = time.Duration(hi.Uptime) * time.Second
+	if up, err := host.Uptime(); err == nil {
+		uptime = time.Duration(up) * time.Second
 	}
 
 	ifs, err := net.Interfaces()
@@ -203,13 +206,14 @@ func convertConns(conns []gnet.ConnectionStat) []ConnInfo {
 
 		// A Unix socket's "address" is its filesystem path with no port; an
 		// unnamed one has neither.
-		local := fmt.Sprintf("%s:%d", c.Laddr.IP, c.Laddr.Port)
+		// JoinHostPort brackets IPv6: "[::1]:631", not the ambiguous "::1:631".
+		local := net.JoinHostPort(c.Laddr.IP, strconv.Itoa(int(c.Laddr.Port)))
 		if proto == "UNIX" {
 			if local = c.Laddr.IP; local == "" {
 				local = "(unnamed)"
 			}
 		}
-		remote := fmt.Sprintf("%s:%d", c.Raddr.IP, c.Raddr.Port)
+		remote := net.JoinHostPort(c.Raddr.IP, strconv.Itoa(int(c.Raddr.Port)))
 		if c.Raddr.IP == "" {
 			remote = "-"
 		}
@@ -232,7 +236,7 @@ func convertConns(conns []gnet.ConnectionStat) []ConnInfo {
 			RemoteAddr: remote,
 			Status:     c.Status,
 			PID:        c.Pid,
-			Process:    name,
+			Process:    Printable(name),
 		})
 	}
 	return out

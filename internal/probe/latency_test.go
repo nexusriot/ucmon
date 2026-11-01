@@ -208,3 +208,15 @@ func TestPingOnceUnresolvable(t *testing.T) {
 func writeFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0o644)
 }
+
+// OpenVPN's split routes share the zero destination but not the zero mask;
+// the real default route is the one with both.
+func TestParseDefaultGatewayIgnoresSplitRoutes(t *testing.T) {
+	content := "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n" +
+		"tun0\t00000000\t0108080A\t0003\t0\t0\t0\t00000080\t0\t0\t0\n" + // 0.0.0.0/1 via 10.8.8.1
+		"wlan0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n"
+	gw, err := parseDefaultGateway(strings.NewReader(content))
+	if err != nil || gw != "192.168.1.1" {
+		t.Errorf("gateway = %q, %v; want 192.168.1.1, not the tunnel peer", gw, err)
+	}
+}

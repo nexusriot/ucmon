@@ -111,7 +111,10 @@ func SetBacklightPercent(device string, pct int) error {
 		return fmt.Errorf("cannot read max_brightness")
 	}
 
-	val := int(float64(pct) / 100 * float64(maxB))
+	// Round to match ReadBacklight: truncating here lands "+step" back on
+	// the same raw value when max_brightness is small (the uConsole's is 9),
+	// so the brightness-up key would never advance.
+	val := int(math.Round(float64(pct) / 100 * float64(maxB)))
 	if val < 1 && pct > 0 {
 		val = 1 // never fully blank the screen on a tiny positive percent
 	}

@@ -99,3 +99,12 @@ func TestStartupNoticeNamesUnknownKeys(t *testing.T) {
 		t.Error("the startup notice never reached the footer")
 	}
 }
+
+// A config that exists but cannot be read is a failure: the monitor would
+// silently run on defaults, and a provisioning check must catch that.
+func TestCheckConfigUnreadableFails(t *testing.T) {
+	dir := t.TempDir()
+	if report, ok := CheckConfig(dir); ok || !strings.Contains(report, "unreadable") {
+		t.Errorf("a directory as config: ok=%v\n%s", ok, report)
+	}
+}

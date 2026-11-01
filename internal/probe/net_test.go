@@ -57,7 +57,7 @@ func TestConvertConns(t *testing.T) {
 	if out[0].RemoteAddr != "-" {
 		t.Errorf("empty remote should render '-', got %q", out[0].RemoteAddr)
 	}
-	if out[1].Proto != "UDP6" || out[1].RemoteAddr != "ff02::fb:5353" {
+	if out[1].Proto != "UDP6" || out[1].RemoteAddr != "[ff02::fb]:5353" {
 		t.Errorf("conn[1] = %+v", out[1])
 	}
 }

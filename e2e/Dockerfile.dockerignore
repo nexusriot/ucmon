@@ -1,0 +1,9 @@
+# BuildKit reads <Dockerfile>.dockerignore next to the Dockerfile. Send only
+# what the build uses: dist/, coverage and editor state stay out, so they can
+# neither bloat the context nor leak into the image.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/
+!e2e/

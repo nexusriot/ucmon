@@ -140,3 +140,32 @@ func TestReportNameTruncationAndBoolWord(t *testing.T) {
 		t.Error("boolWord")
 	}
 }
+
+// Long names (Docker bridges, coretemp's package sensor) widen their column
+// instead of pushing their own row out of line.
+func TestReportColumnsFitLongNames(t *testing.T) {
+	m := testModel()
+	m.netSnap.Ifaces = []probe.IfaceInfo{
+		{Name: "lo", IsUp: true},
+		{Name: "br-0e84f8977e88", IsUp: true},
+	}
+	m.cpuSnap.Temperatures = []probe.TempReading{{Label: "acpitz", Temp: 30}, {Label: "coretemp_package_id_0", Temp: 50}}
+	r := m.buildReport(time.Now())
+	col := func(prefix, mark string) map[int]bool {
+		cols := map[int]bool{}
+		for _, line := range strings.Split(r, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), prefix) || (prefix == "" && strings.Contains(line, mark)) {
+				if i := strings.Index(line, mark); i >= 0 {
+					cols[utf8.RuneCountInString(line[:i])] = true
+				}
+			}
+		}
+		return cols
+	}
+	if c := col("", "↓"); len(c) != 1 {
+		t.Errorf("network rates start in %d different columns:\n%s", len(c), r)
+	}
+	if c := col("", "°C"); len(c) != 1 {
+		t.Errorf("temperatures end in %d different columns:\n%s", len(c), r)
+	}
+}

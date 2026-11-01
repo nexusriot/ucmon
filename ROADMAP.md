@@ -3,6 +3,138 @@
 Planned work and known limitations, roughly in priority order. See
 [DESIGN.md](DESIGN.md) for how the current features are built.
 
+## Shipped in 0.12.0
+
+**Read-only remount alert.** When ext4 hits I/O errors it remounts the
+filesystem read-only (`errors=remount-ro`, the Raspberry Pi OS default for
+`/`). On an SD-booted board that is usually the first visible sign of a dying
+card — and plain SD cards expose no wear counters, so nothing else warns. A
+mount that is read-only now while `/etc/fstab` declares it read-write, or
+while the same sampler saw the same device mounted read-write earlier, raises
+a critical `diskro:<mount>` alert; it is flagged in the Disk tab, the text
+report, the JSON snapshot (`read_only`, `remounted_ro`) and `/metrics`
+(`ucmon_filesystem_readonly`, `ucmon_filesystem_remounted_readonly`). The
+fstab half means it also fires for a remount that happened before ucmon
+started, and from the exporter and `--once`, which have no history. The live
+state comes from `/proc/self/mounts`, not gopsutil's mount options: those
+are mountinfo's per-mount flags, and an error remount flips only the
+superblock, so they keep reading `rw` on a filesystem the kernel has locked.
+
+**OOM-kill alert.** A process the kernel kills for lack of memory just
+vanishes; on a 1–4 GB board that is a browser tab or a build gone with no
+message. ucmon now reads the kernel's `oom_kill` counter (`/proc/vmstat`,
+Linux 4.13+, cgroup-limit kills included) and raises a critical alert for each
+kill, kept up for `event_alert_minutes` (default 10). The Memory tab, the report,
+`--once --json` (`memory.oom_kills`) and the exporter (`ucmon_oom_kills_total`)
+show the count, and `doctor` reports whether the counter exists. The e2e suite
+provokes a real OOM kill under a cgroup memory limit.
+
+**Kernel log alerts.** The TUI follows `/dev/kmsg` from startup and alerts on
+what only the kernel sees: storage I/O errors (block layer, MMC, ext4/FAT/
+btrfs/XFS — critical, and usually well before the read-only remount),
+under-voltage (warning — dips shorter than vcgencmd's sampling, and boards
+without vcgencmd), and the OOM killer's own report, which names the victim
+the counter cannot. Repeats extend one alert instead of raising a flood. The
+Disk and Power tabs keep a session tally, `doctor` reports whether the log is
+readable (`kernel.dmesg_restrict`), and `kernel_log_enabled` turns it off.
+The e2e sandbox binds a FIFO over `/dev/kmsg`, so the real non-blocking read
+path is tested with injected records and never sees the host's log.
+
+**Hermetic end-to-end suite** (`make e2e`, and a CI job): the real binary in
+a digest-pinned container with no network, a read-only root and real kernel
+mounts, driving the TUI on a pseudo-terminal — kill flow, resizes, the alert
+hook and log, history — and validating `/metrics` with `promtool`. Building
+it surfaced one more fix: when seccomp blocks `pidfd_open` (EPERM — Docker
+before 20.10, systemd `SystemCallFilter=`), signals now fall back to
+check-then-kill instead of failing. The signal tests rerun under seccomp
+profiles that refuse `pidfd_open` with EPERM and with ENOSYS, so that
+fallback stays covered.
+
+**History survives a closed terminal.** Closing the window or dropping the
+SSH session sends SIGHUP, whose default action killed ucmon before it saved
+`history_file`; on a handheld that is the usual way a session ends. A hangup
+is now treated as a quit, and history is saved even when Bubble Tea returns
+an error (the terminal vanishing mid-read).
+
+**Correctness.** Three review rounds; each finding below has a regression test:
+
+- **The process cursor follows its PID** instead of its row, so a refresh
+  re-ordering the list between selecting a process and pressing `K` can no
+  longer kill another one. Kill, renice, SIGSTOP and SIGCONT now check the
+  process start time; signals go through a pidfd so the check and the signal
+  cannot race (renice has no pidfd form and keeps a microsecond window). They
+  refuse a PID that has been recycled. The detail overlay says
+  "process exited" instead of showing — and acting on — whatever took over
+  its PID.
+- **Every scheduled fetch has an in-flight guard**, not just the four slow
+  ones. A hung NFS `statfs` or a stalled sensor read no longer piles up
+  goroutines, and a failed fetch clears its guard.
+- **Alerts:** a filesystem that was barely growing raised "full in <1 min"
+  CRIT (a `time.Duration` overflow on amd64); battery drain warned on every
+  1% step of a normal discharge (integer capacity in a 2-minute window, now
+  10 minutes); a reading wobbling across the crit line re-raised CRIT on
+  every crossing (de-escalation is now damped like a clear); the force-ro
+  eMMC boot partitions raised a permanent "replace the card"; a mounted ISO,
+  erofs or other read-only image (always 100% full) raised a permanent
+  "disk full" warning, since only squashfs was skipped.
+- **Probes:** the brightness `+` key stuck on the uConsole's 9-step panel
+  (the write truncated while the read rounded); EINTR from a resize or a
+  child exit counted as a lost ping; sensors that share a name produced
+  duplicate Prometheus series, which fails the whole scrape; `nan`/`inf`
+  config values silently disabled their alert; the governor key took a
+  few-millisecond CPU sample that recorded a fake 0% or 100%.
+- **Security:** process names, command lines, the SSID and the modem's
+  operator reached the terminal raw, so any local user could name a process
+  with an escape sequence and have it run by the terminal of whoever watched
+  ucmon (clipboard writes via OSC 52, retitling, repainted rows). Control
+  characters are now replaced before anything is drawn or written to a report.
+- **Exporter:** labels were escaped with Go's `%q`, whose `\t`/`\x01`
+  escapes the Prometheus parser rejects — one odd mount path or sensor label
+  failed the whole scrape. A collection stuck in the kernel held the lock and
+  hung every scrape after it; scrapes now fall back to the last snapshot
+  (`ucmon_snapshot_age_seconds` says how old). A failed exporter beside the
+  TUI is shown in it instead of vanishing behind the alternate screen.
+- **Alert delivery:** an `alert_cmd` timeout killed only the shell, leaving
+  what it started (a hung `curl`) running; hooks ran unbounded and unordered,
+  so a slow webhook could get CLEAR before RAISE. Hooks are now serialized in
+  a bounded queue and time out with their whole process group. A held
+  de-escalation is announced instead of changing the alert silently.
+- **After suspend** the monotonic clock had not moved but the battery had:
+  an overnight drain read as "empty in minutes" on wake. Trends now use the
+  wall clock and start over after a gap.
+- **Kernel log and OOM:** loop, optical and RAM disks raised "back up now";
+  one card raised up to three alerts (host, disk, partition); ext4's daily
+  restatement of an old error raised a fresh critical every day; events read
+  after a pause were dated at the resume; two OOM kills seconds apart were
+  each given both victims' names. All fixed, plus `disk_ignore` now covers a
+  disk's kernel errors and user-space records in the log are ignored.
+- **Probes:** one unreadable hwmon sensor discarded every reading and flipped
+  all labels to thermal-zone names for that tick; the network sampler ran
+  `host.Info` (and possibly the `lsb_release` script) every second; a
+  `vcgencmd` that every call fails showed 0 °C instead of "unavailable";
+  an OpenVPN split route was taken for the gateway; IPv6 connections printed
+  as `::1:631`; a Bluetooth mouse's battery could stand in for the pack; an
+  optical drive's `ro` flag read as a card that locked itself; a zone below
+  0 °C vanished; a long script name was replaced by its interpreter's.
+- **History** is fsynced before its rename (an SD card power cut left an empty
+  file) and written through a unique temp file; under `nohup` a hangup no
+  longer quits; config intervals are capped at an hour; `--check-config`
+  fails on an unreadable file instead of passing it.
+- **Packaging and CI:** `build-deb.sh` carried on after a failed build and
+  could package a stale binary, linked the native build against glibc, and
+  only worked from the repo root; `Installed-Size` was a constant. The e2e
+  package is now vetted and linted in CI, smoke steps fail instead of
+  hanging when an exporter never starts, and every job has a timeout.
+- **Found running it on a real 16-core desktop:** the CPU tab clipped every
+  temperature off a 40-row terminal; ordinary load bursts raised eight
+  "rising toward critical" warnings at a time (one per core, extrapolated 17
+  minutes out from a 45 s burst); kernel-log events were dated by
+  `CLOCK_MONOTONIC`, which after three days of uptime ran 8 s ahead of the
+  kernel's own clock, enough to miss the OOM victim's name; the help overlay
+  cut descriptions mid-word and split a section across its columns; sockets
+  whose owner could not be read showed PID 0; long interface and sensor names
+  broke the report's columns; processes tied at 0% sorted in text order.
+
 ## Shipped in 0.11.0
 
 The two "explain yourself" items: ucmon degrades gracefully in a dozen
@@ -159,13 +291,11 @@ process CPU% and disk I/O rates; first test suite (57 tests).
   filesystem row itself instead of listing raw block devices underneath it.
   "Which filesystem is being written to" is the question; "which of `dm-0`,
   `nvme0n1` and `nvme0n1p3`" is the current answer.
-- **Pin the process cursor to a PID, not a row index.** The list re-sorts by
-  CPU every `proc_interval`, and the cursor is an index into it, so the
-  selected process changes under you between refreshes — and the detail line
-  below the table follows it. htop keeps the selection on the process. The
-  same change fixes the mouse wheel on that tab: scrolling moves the viewport,
-  then the next refresh snaps it back to wherever the index-based cursor
-  landed.
+- **Mouse wheel on the Processes tab.** The cursor now stays on its PID
+  across refreshes (see 0.12.0), but every refresh still scrolls the
+  cursor back into view, undoing a wheel scroll. Scrolling should move the
+  cursor with the viewport, or the refresh should leave the viewport alone
+  while the cursor is off-screen.
 - **Group cores by cpufreq policy.** The per-core grid is a flat list, which
   is right for a CM4's four identical cores and wrong for a big.LITTLE board,
   where the interesting question is whether work is on the P-cores or the
@@ -196,9 +326,10 @@ process CPU% and disk I/O rates; first test suite (57 tests).
 - **Services tab** — failed/active systemd units via `systemctl` shell-out
   (same graceful-absence pattern as vcgencmd), with start/restart/stop behind
   the existing y/N confirm flow.
-- **Kernel log tail tab** — `dmesg --follow` style view with severity
-  coloring; under-voltage and OOM events land exactly there, pairing with the
-  Power tab and alert engine (e.g. alert on new `Under-voltage detected!`).
+- **Kernel log tail tab** — a `dmesg --follow` style view with severity
+  coloring. The follower and the alerts on it shipped in 0.12.0; the tab
+  would show everything else the log says, filtered to what matters on a
+  handheld (USB, power, thermal, storage).
 - **Staggered sampling** — proc/slow fetches all fire on the same tick when
   their multiples align (every 15 s by default), a small thundering herd on a
   CM4. In-flight guards (0.8.0) stop the herd from *compounding*, the header
@@ -248,7 +379,7 @@ process CPU% and disk I/O rates; first test suite (57 tests).
   `CAP_SYS_PTRACE` for processes you do not own; those rows show `-`. The
   counters are also block-layer totals, so a write served from page cache
   appears when it is flushed, not when it is issued.
-- **Predictive alerts** extrapolate a straight line from a two-minute window.
+- **Predictive alerts** extrapolate a straight line from a two-minute window (ten minutes for the battery).
   That is the right call for a battery or a filling filesystem and the wrong
   one for a bursty writer, which will raise and clear as the burst passes —
   `alert_clear_ticks` damps the flapping but does not make the slope wiser.
@@ -259,9 +390,17 @@ process CPU% and disk I/O rates; first test suite (57 tests).
   read-only otherwise (`(ro)` marker / hint line). `ucmon doctor` prints the
   exact rule for whichever of the two this host refuses.
 - **Alert cmd** runs `/bin/sh -c` with a 10 s timeout and no output capture;
-  failures are silent by design (the alert itself is already visible). There is
-  no cap on concurrent hooks — a condition flapping with `alert_clear_ticks = 1`
-  can hold several shells open at once.
+  failures are silent by design (the alert itself is already visible). Hooks
+  are serialized, so one that always takes the full 10 s caps delivery at six
+  events a minute; past a 64-event backlog, events are dropped with a notice.
+- **The exporter's alerts are per scrape.** Each collection is a fresh model,
+  so `ucmon_alerts_active` has no flap damping, no predictive alerts and no
+  ping-loss alerts (the loss window needs ten samples), and the remount check
+  can only use `/etc/fstab`. The TUI is the alerting surface; Prometheus
+  should alert on the raw series.
+- **The exporter binds every interface** when given a bare port (`9100` →
+  `:9100`) and has no authentication; `/snapshot` lists processes, users and
+  mounts. Give it `127.0.0.1:9100` unless the LAN is trusted.
 - **Config values are literal**: `splitValue` strips one matched pair of
   surrounding quotes and an unquoted trailing `#` comment, but does not
   interpret TOML escape sequences. Write shell hooks as literal strings
@@ -275,10 +414,6 @@ process CPU% and disk I/O rates; first test suite (57 tests).
   window — describe that one collection rather than the exporter's uptime. This is
   deliberate: sharing state with the monitor is what made a scrape corrupt the
   TUI's CPU readings before 0.10.1. Compute windows in Prometheus.
-- **The process cursor is a row index**, and the list re-sorts every
-  `proc_interval`, so the selection moves to whatever occupies that row next.
-  Scrolling the Processes tab with the mouse wheel is undone by the same
-  refresh, which scrolls the cursor back into view. See "Next up".
 - **Minimum terminal size** is 30×6; below that ucmon draws a one-line notice
   rather than a frame, because the chrome alone (header, footer, box border)
   costs 4 rows and an overflowing frame blanks the alt screen.

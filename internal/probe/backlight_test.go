@@ -3,6 +3,7 @@ package probe
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -70,8 +71,8 @@ func TestSetBacklightPercent(t *testing.T) {
 		t.Fatalf("SetBacklightPercent: %v", err)
 	}
 	b, _ := os.ReadFile(filepath.Join(base, "panel0", "brightness"))
-	if strings.TrimSpace(string(b)) != "127" { // 50% of 255
-		t.Errorf("brightness file = %q, want 127", string(b))
+	if strings.TrimSpace(string(b)) != "128" { // 50% of 255, rounded
+		t.Errorf("brightness file = %q, want 128", string(b))
 	}
 
 	// Values are clamped to 0–100.
@@ -190,5 +191,27 @@ func TestPickBacklightOrder(t *testing.T) {
 	fakeBacklight(t, base2, "acpi_video0", "40", "100")
 	if got := ReadBacklight("").Device; got != "acpi_video0" {
 		t.Errorf("picked %q, want acpi_video0 as the only device", got)
+	}
+}
+
+// With a small max_brightness (the uConsole's is 9), every "+step" from the
+// read-back percent must land on a higher raw value, or the key gets stuck.
+func TestSetBacklightPercentSmallMaxAdvances(t *testing.T) {
+	base := t.TempDir()
+	old := backlightBase
+	backlightBase = base
+	defer func() { backlightBase = old }()
+
+	for raw := 0; raw < 9; raw++ {
+		fakeBacklight(t, base, "panel0", strconv.Itoa(raw), "9")
+		bl := ReadBacklight("panel0")
+		if err := SetBacklightPercent("panel0", bl.Percent+10); err != nil {
+			t.Fatal(err)
+		}
+		b, _ := os.ReadFile(filepath.Join(base, "panel0", "brightness"))
+		got, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+		if got <= raw {
+			t.Errorf("raw %d (%d%%) +10%% wrote %d, want > %d", raw, bl.Percent, got, raw)
+		}
 	}
 }

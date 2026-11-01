@@ -3,7 +3,9 @@ package ui
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -131,5 +133,59 @@ func TestHandleAlertEventsBellDoesNotBlockDelivery(t *testing.T) {
 				t.Errorf("log not written (err=%v)", err)
 			}
 		})
+	}
+}
+
+// A timed-out hook is killed with everything it started: the shell's
+// children must not outlive the timeout.
+func TestRunAlertCmdTimeoutKillsTheGroup(t *testing.T) {
+	old := alertCmdTimeout
+	alertCmdTimeout = 300 * time.Millisecond
+	defer func() { alertCmdTimeout = old }()
+
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	start := time.Now()
+	runAlertCmd("sleep 30 & echo $! > "+pidFile+"; wait", alertAt(sevWarn, "x", false))
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("the hook ran %v past a 300ms timeout", d)
+	}
+	b, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	deadline := time.Now().Add(2 * time.Second)
+	for syscall.Kill(pid, 0) == nil {
+		if time.Now().After(deadline) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			t.Fatalf("the hook's child %d outlived the timeout", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// Hooks run one at a time, in the order the events happened.
+func TestAlertHooksRunInOrder(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "order")
+	m := testModel()
+	// The first event's hook is the slowest: run concurrently, they would
+	// finish in reverse.
+	m.cfg.AlertCmd = `sleep 0.$((4 - UCMON_ALERT_MSG)); echo "$UCMON_ALERT_STATE $UCMON_ALERT_MSG" >> ` + out
+	var evs []alertEntry
+	for i := range 5 {
+		evs = append(evs, alertAt(sevWarn, strconv.Itoa(i), i%2 == 1))
+	}
+	m.handleAlertEvents(evs)
+	want := "raise 0\nclear 1\nraise 2\nclear 3\nraise 4\n"
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		b, _ := os.ReadFile(out)
+		if string(b) == want {
+			return
+		}
+		if time.Now().After(deadline) || len(b) > len(want) {
+			t.Fatalf("hook order:\n%s\nwant:\n%s", b, want)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

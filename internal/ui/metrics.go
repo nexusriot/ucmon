@@ -56,6 +56,9 @@ type memJSON struct {
 	SwapTotalB uint64  `json:"swap_total_bytes"`
 	SwapUsedB  uint64  `json:"swap_used_bytes"`
 	SwapPct    float64 `json:"swap_used_pct"`
+	// OOMKills counts OOM-killer victims since boot; absent where the
+	// kernel does not expose the counter.
+	OOMKills *uint64 `json:"oom_kills,omitempty"`
 }
 
 type loadJSON struct {
@@ -99,6 +102,10 @@ type diskJSON struct {
 	UsedPct  float64 `json:"used_pct"`
 	ReadBps  float64 `json:"read_bps,omitempty"`
 	WriteBps float64 `json:"write_bps,omitempty"`
+	ReadOnly bool    `json:"read_only"`
+	// RemountedRO: read-only now although fstab or an earlier sample says
+	// read-write — the kernel's errors=remount-ro.
+	RemountedRO bool `json:"remounted_ro"`
 }
 
 type storageJSON struct {
@@ -200,6 +207,7 @@ func (m Model) snapshotJSON(now time.Time) SnapshotJSON {
 			SwapTotalB: m.memSnap.SwapTotal,
 			SwapUsedB:  m.memSnap.SwapUsed,
 			SwapPct:    m.memSnap.SwapUsedPct,
+			OOMKills:   oomKillsJSON(m.memSnap),
 		},
 		Load: loadJSON{
 			Load1: m.powerSnap.Load.Load1, Load5: m.powerSnap.Load.Load5,
@@ -207,7 +215,7 @@ func (m Model) snapshotJSON(now time.Time) SnapshotJSON {
 		},
 		Peaks: peaksJSON{
 			CPUPct: m.peaks.cpuPct, TempC: m.peaks.tempC, TempLabel: m.peaks.tempLabel,
-			Load1: m.peaks.load1, MemPct: m.peaks.memPct, BattMin: m.peaks.battMin,
+			Load1: m.peaks.load1, MemPct: m.peaks.memPct, BattMin: max(m.peaks.battMin, 0), // -1: no battery seen
 		},
 		Alerts: []alertJSON{},
 	}
@@ -268,7 +276,8 @@ func (m Model) snapshotJSON(now time.Time) SnapshotJSON {
 	}
 	for _, d := range m.disks {
 		dj := diskJSON{Mount: d.MountPoint, Device: d.Device, FSType: d.FSType,
-			TotalB: d.Total, UsedB: d.Used, UsedPct: d.UsedPct}
+			TotalB: d.Total, UsedB: d.Used, UsedPct: d.UsedPct,
+			ReadOnly: d.ReadOnly, RemountedRO: d.RemountedRO}
 		if io, ok := diskIOFor(ioByDev, d.Device); ok {
 			dj.ReadBps, dj.WriteBps = io.ReadBps, io.WriteBps
 		}
@@ -383,14 +392,14 @@ func (m Model) buildPrometheus() string {
 			{"user", bd.User}, {"system", bd.System}, {"nice", bd.Nice},
 			{"iowait", bd.Iowait}, {"irq", bd.IRQ}, {"steal", bd.Steal}, {"idle", bd.Idle},
 		} {
-			ss = append(ss, [2]string{fmt.Sprintf("{mode=%q}", c.mode), num(c.v)})
+			ss = append(ss, [2]string{fmt.Sprintf("{mode=%s}", promLabel(c.mode)), num(c.v)})
 		}
 		w("cpu_mode_percent", "CPU time by mode over the last interval.", "gauge", ss)
 	}
 
 	var temps [][2]string
 	for _, t := range m.cpuSnap.Temperatures {
-		temps = append(temps, [2]string{fmt.Sprintf("{sensor=%q}", t.Label), num(t.Temp)})
+		temps = append(temps, [2]string{fmt.Sprintf("{sensor=%s}", promLabel(t.Label)), num(t.Temp)})
 	}
 	sort.Slice(temps, func(i, j int) bool { return temps[i][0] < temps[j][0] })
 	w("temperature_celsius", "Temperature sensor readings.", "gauge", temps)
@@ -405,27 +414,35 @@ func (m Model) buildPrometheus() string {
 		w("swap_used_percent", "Swap in use.", "gauge",
 			[][2]string{{"", num(m.memSnap.SwapUsedPct)}})
 	}
+	if m.memSnap.OOMKillsOK {
+		w("oom_kills_total", "Processes killed by the kernel OOM killer since boot.", "counter",
+			[][2]string{{"", num(float64(m.memSnap.OOMKills))}})
+	}
 
 	w("load1", "1-minute load average.", "gauge",
 		[][2]string{{"", num(m.powerSnap.Load.Load1)}})
 
-	var disks, diskBytes [][2]string
+	var disks, diskBytes, diskRO, diskRemount [][2]string
 	for _, d := range m.disks {
-		lbl := fmt.Sprintf("{mount=%q,fstype=%q}", d.MountPoint, d.FSType)
+		lbl := fmt.Sprintf("{mount=%s,fstype=%s}", promLabel(d.MountPoint), promLabel(d.FSType))
 		disks = append(disks, [2]string{lbl, num(d.UsedPct)})
+		diskRO = append(diskRO, [2]string{lbl, boolMetric(d.ReadOnly)})
+		diskRemount = append(diskRemount, [2]string{lbl, boolMetric(d.RemountedRO)})
 		// d.Free, not Total-Used: the two differ by the root-reserved blocks,
 		// and this has to agree with the Disk tab and the JSON snapshot.
 		diskBytes = append(diskBytes, [2]string{lbl, num(float64(d.Free))})
 	}
 	w("filesystem_used_percent", "Filesystem utilisation.", "gauge", disks)
 	w("filesystem_free_bytes", "Filesystem free space.", "gauge", diskBytes)
+	w("filesystem_readonly", "1 when the filesystem is mounted read-only.", "gauge", diskRO)
+	w("filesystem_remounted_readonly", "1 when a filesystem meant to be read-write is read-only (errors=remount-ro).", "gauge", diskRemount)
 
 	var rx, tx, bad [][2]string
 	for _, ii := range m.netSnap.Ifaces {
 		if !ii.IsUp {
 			continue
 		}
-		lbl := fmt.Sprintf("{device=%q}", ii.Name)
+		lbl := fmt.Sprintf("{device=%s}", promLabel(ii.Name))
 		rx = append(rx, [2]string{lbl, num(ii.RxBps)})
 		tx = append(tx, [2]string{lbl, num(ii.TxBps)})
 		bad = append(bad, [2]string{lbl, num(float64(ii.BadFramesTotal()))})
@@ -437,7 +454,7 @@ func (m Model) buildPrometheus() string {
 	var wifi [][2]string
 	for _, ii := range m.netSnap.Ifaces {
 		if ii.IsUp && ii.WiFi.Present {
-			wifi = append(wifi, [2]string{fmt.Sprintf("{device=%q}", ii.Name), num(ii.WiFi.SignalDBm)})
+			wifi = append(wifi, [2]string{fmt.Sprintf("{device=%s}", promLabel(ii.Name)), num(ii.WiFi.SignalDBm)})
 		}
 	}
 	w("wifi_signal_dbm", "Wireless signal level.", "gauge", wifi)
@@ -467,14 +484,14 @@ func (m Model) buildPrometheus() string {
 	var wear [][2]string
 	for _, h := range m.storage {
 		if pct, ok := h.WearPct(); ok {
-			wear = append(wear, [2]string{fmt.Sprintf("{device=%q,kind=%q}", h.Device, h.Kind), num(pct)})
+			wear = append(wear, [2]string{fmt.Sprintf("{device=%s,kind=%s}", promLabel(h.Device), promLabel(h.Kind)), num(pct)})
 		}
 	}
 	w("storage_wear_percent", "Share of rated write endurance consumed.", "gauge", wear)
 
 	var rtt, loss [][2]string
 	for _, r := range m.pings {
-		lbl := fmt.Sprintf("{target=%q}", r.Target)
+		lbl := fmt.Sprintf("{target=%s}", promLabel(r.Target))
 		if r.OK {
 			rtt = append(rtt, [2]string{lbl, num(float64(r.RTT.Microseconds()) / 1000)})
 		}
@@ -492,7 +509,7 @@ func (m Model) buildPrometheus() string {
 			res  probe.PSIRes
 		}{{"cpu", m.psi.CPU}, {"memory", m.psi.Mem}, {"io", m.psi.IO}} {
 			if r.res.HasSome {
-				psi = append(psi, [2]string{fmt.Sprintf("{resource=%q}", r.name), num(r.res.SomeAvg10)})
+				psi = append(psi, [2]string{fmt.Sprintf("{resource=%s}", promLabel(r.name)), num(r.res.SomeAvg10)})
 			}
 		}
 		w("pressure_some_avg10", "PSI some-avg10 by resource.", "gauge", psi)
@@ -502,6 +519,40 @@ func (m Model) buildPrometheus() string {
 	w("alerts_active", "Alert conditions currently firing.", "gauge",
 		[][2]string{{"", strconv.Itoa(active)}})
 
+	return b.String()
+}
+
+func oomKillsJSON(s probe.MemSnapshot) *uint64 {
+	if !s.OOMKillsOK {
+		return nil
+	}
+	n := s.OOMKills
+	return &n
+}
+
+// promLabel quotes a label value the way the Prometheus text format wants
+// it. Go's %q is not that: it writes \t, \x01 and \u00ad escapes, which the
+// exposition parser rejects — failing the whole scrape over one odd mount
+// path or sensor label. Only backslash, double quote and newline are
+// escaped; invalid UTF-8 becomes U+FFFD.
+func promLabel(v string) string {
+	v = strings.ToValidUTF8(v, "\uFFFD")
+	var b strings.Builder
+	b.Grow(len(v) + 2)
+	b.WriteByte('"')
+	for _, r := range v {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
 	return b.String()
 }
 

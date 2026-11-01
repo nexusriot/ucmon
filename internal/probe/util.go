@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // suffixIndex is the number trailing a "<prefix><n>" sysfs name, or a large
@@ -66,4 +67,29 @@ func ClampHistory[T any](s []T, max int) []T {
 		return s
 	}
 	return s[len(s)-max:]
+}
+
+// Printable replaces control characters (C0, DEL, C1 — ESC among them) with
+// '?'. Process names, command lines, an SSID or a modem's operator name are
+// chosen by someone else: any local user can start a process named
+// "\x1b]52;c;…\a", and drawn verbatim that is an escape sequence run by the
+// terminal of whoever watches ucmon — clipboard writes, retitling, cursor
+// moves that repaint rows.
+func Printable(s string) string {
+	clean := true
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return '?'
+		}
+		return r
+	}, s)
 }

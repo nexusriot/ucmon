@@ -436,11 +436,12 @@ func TestSanitizeClampsNewKeys(t *testing.T) {
 	cfg.BattDrainWarnPctH = -5
 	cfg.DiskFullWarnHours = -1
 	cfg.TempRiseWarnCPerMin = -2
+	cfg.EventAlertMinutes = -3
 	cfg.HistoryLen = 2
 	cfg.ProcsCap = 0
 	cfg.Sanitize()
 
-	if cfg.BattDrainWarnPctH != 0 || cfg.DiskFullWarnHours != 0 || cfg.TempRiseWarnCPerMin != 0 {
+	if cfg.BattDrainWarnPctH != 0 || cfg.DiskFullWarnHours != 0 || cfg.TempRiseWarnCPerMin != 0 || cfg.EventAlertMinutes != 0 {
 		t.Errorf("negative rate thresholds survived: %+v", cfg)
 	}
 	if cfg.HistoryLen < 10 {
@@ -454,11 +455,46 @@ func TestSanitizeClampsNewKeys(t *testing.T) {
 	// interface, sensor and core for nothing.
 	cfg.HistoryLen = 1 << 20
 	cfg.ProcsCap = 1 << 20
+	cfg.EventAlertMinutes = 1e9
 	cfg.Sanitize()
+	if cfg.EventAlertMinutes != 24*60 {
+		t.Errorf("EventAlertMinutes = %v, want capped at a day", cfg.EventAlertMinutes)
+	}
 	if cfg.HistoryLen > 5000 {
 		t.Errorf("HistoryLen = %d, want a ceiling", cfg.HistoryLen)
 	}
 	if cfg.ProcsCap > 10000 {
 		t.Errorf("ProcsCap = %d, want a ceiling", cfg.ProcsCap)
+	}
+}
+
+// ParseFloat accepts "nan"/"inf"; a NaN threshold compares false against
+// everything and would silently disable its alert.
+func TestNonFiniteThresholdsRejected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ucmon.conf")
+	if err := os.WriteFile(path, []byte("temp_crit = nan\nmem_warn_pct = inf\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, def := LoadFrom(path), Default()
+	if cfg.TempCrit != def.TempCrit || cfg.MemWarnPct != def.MemWarnPct {
+		t.Errorf("non-finite values applied: temp_crit=%v mem_warn_pct=%v", cfg.TempCrit, cfg.MemWarnPct)
+	}
+}
+
+// An interval past an hour is not monitoring, and a huge bare number would
+// overflow time.Duration; a BOM from a Windows editor must not turn the
+// first key into an unknown one.
+func TestIntervalsCappedAndBOMIgnored(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ucmon.conf")
+	body := "\xef\xbb\xbffast_interval = 999999h\nslow_interval = 1e12\nproc_interval = 2s\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := LoadFrom(path)
+	if cfg.FastInterval != time.Hour || cfg.SlowInterval != time.Hour {
+		t.Errorf("intervals = %v / %v, want capped at an hour", cfg.FastInterval, cfg.SlowInterval)
+	}
+	if len(cfg.Unknown) != 0 {
+		t.Errorf("the BOM made a key unknown: %+v", cfg.Unknown)
 	}
 }
