@@ -23,21 +23,23 @@ DOCKER_BUILDKIT=1 docker build --file e2e/Dockerfile --tag "$image" .
 #  /dev/kmsg          a FIFO from the host, not the host's kernel log: tests
 #                     write kernel records into it, and ucmon never sees the
 #                     real log (which an unprivileged user may not read anyway)
+#  volumes            real kernel mounts that the fixture fstab describes:
+#                     one locked read-only against fstab, one read-only by
+#                     design, one read-write. Named per run and removed on
+#                     exit: Docker 29+ refuses readonly anonymous volumes.
 kmsgdir=$(mktemp -d)
-trap 'rm -rf "$kmsgdir"' EXIT
+vol=ucmon-e2e-$$
+trap 'rm -rf "$kmsgdir"; docker volume rm -f "$vol-locked" "$vol-meant-ro" "$vol-data" >/dev/null 2>&1 || true' EXIT
 mkfifo -m 666 "$kmsgdir/kmsg"
-#  volumes            real kernel mounts (anonymous, removed with --rm) that
-#                     the fixture fstab describes: one locked read-only
-#                     against fstab, one read-only by design, one read-write
 sandbox() {
 	docker run --rm --init \
 		--network none \
 		--read-only --tmpfs /tmp:rw,exec,mode=1777 \
 		--cap-drop ALL --security-opt no-new-privileges \
 		--memory 512m --memory-swap 512m \
-		--mount type=volume,dst=/mnt/locked,readonly \
-		--mount type=volume,dst=/mnt/meant-ro,readonly \
-		--mount type=volume,dst=/mnt/data \
+		--mount "type=volume,src=$vol-locked,dst=/mnt/locked,readonly" \
+		--mount "type=volume,src=$vol-meant-ro,dst=/mnt/meant-ro,readonly" \
+		--mount "type=volume,src=$vol-data,dst=/mnt/data" \
 		--mount "type=bind,src=$kmsgdir/kmsg,dst=/dev/kmsg" \
 		--env UCMON_E2E_SANDBOX=1 \
 		"$@"

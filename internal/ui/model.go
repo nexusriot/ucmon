@@ -1205,7 +1205,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "g":
 			if m.activeTab == tabCPU {
-				return m, m.cycleGovernor()
+				m.cycleGovernor()
+				return m, nil
 			}
 		case "f":
 			if m.activeTab == tabNet {
@@ -2890,21 +2891,21 @@ func wifiSummary(w probe.WiFiInfo) string {
 
 // cycleGovernor switches every cpufreq policy to the next available governor.
 // Permission errors surface as a footer notice with the udev/root hint.
-func (m *Model) cycleGovernor() tea.Cmd {
+func (m *Model) cycleGovernor() {
 	if len(m.cpuSnap.Freqs) == 0 {
 		m.setNotice(subtleStyle.Render("no cpufreq policies detected"))
-		return nil
+		return
 	}
 	first := m.cpuSnap.Freqs[0]
 	if len(first.Available) < 2 {
 		m.setNotice(subtleStyle.Render("no alternative governors available"))
-		return nil
+		return
 	}
 	next := probe.NextGovernor(first.Governor, first.Available)
 	for _, f := range m.cpuSnap.Freqs {
 		if err := probe.SetGovernor(f.Policy, next); err != nil {
 			m.setNotice(errStyle.Render("governor: " + err.Error()))
-			return nil
+			return
 		}
 	}
 	m.setNotice(okStyle.Render("governor → " + next))
@@ -2914,7 +2915,6 @@ func (m *Model) cycleGovernor() tea.Cmd {
 	for i := range m.cpuSnap.Freqs {
 		m.cpuSnap.Freqs[i].Governor = next
 	}
-	return nil
 }
 
 // adjustBacklight nudges screen brightness by delta percent and refreshes the

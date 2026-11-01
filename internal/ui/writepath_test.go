@@ -12,9 +12,7 @@ import (
 // the tick or let the UI claim a change that did not happen.
 func TestCycleGovernorNoPolicies(t *testing.T) {
 	m := testModel()
-	if cmd := m.cycleGovernor(); cmd != nil {
-		t.Error("a host without cpufreq should dispatch nothing")
-	}
+	m.cycleGovernor()
 	if n := m.notice.get(); !strings.Contains(n, "no cpufreq") {
 		t.Errorf("notice = %q", n)
 	}
@@ -25,9 +23,7 @@ func TestCycleGovernorSingleGovernor(t *testing.T) {
 	m.cpuSnap.Freqs = []probe.PolicyFreq{
 		{Policy: "policy0", Governor: "performance", Available: []string{"performance"}},
 	}
-	if cmd := m.cycleGovernor(); cmd != nil {
-		t.Error("nothing to cycle to should dispatch nothing")
-	}
+	m.cycleGovernor()
 	if n := m.notice.get(); !strings.Contains(n, "no alternative governors") {
 		t.Errorf("notice = %q", n)
 	}
@@ -43,9 +39,7 @@ func TestCycleGovernorWriteFailureIsReported(t *testing.T) {
 		Available: []string{"ondemand", "performance"},
 	}}
 
-	if cmd := m.cycleGovernor(); cmd != nil {
-		t.Error("a failed write should not dispatch a refresh")
-	}
+	m.cycleGovernor()
 	if n := m.notice.get(); !strings.Contains(n, "governor:") {
 		t.Errorf("notice = %q, want the write error", n)
 	}
