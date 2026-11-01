@@ -108,11 +108,14 @@ func TestKmsgWatcherOnFIFO(t *testing.T) {
 		}
 	}
 	usec := func(ago time.Duration) int64 { return int64((monotonicNow() - ago) / time.Microsecond) }
+	// A minute back, or half the uptime on a machine booted less than two
+	// minutes ago (a fresh CI runner): a stamp before boot reads as "now".
+	late := min(time.Minute, monotonicNow()/2)
 	write(fmt.Sprintf("6,1,%d,-;usb 1-1: new device\n", usec(0)))
 	write(fmt.Sprintf("3,2,%d,-;Buffer I/O error on dev mmcblk0p2, logical block 0\n SUBSYSTEM=block\n DEVICE=b179:2\n", usec(0)))
 	// User space writing into the log (facility 1: "user") is not the kernel.
 	write(fmt.Sprintf("11,3,%d,-;I/O error, dev sdz, sector 1\n", usec(0)))
-	write(fmt.Sprintf("2,4,%d,-;Under-volt", usec(time.Minute))) // split mid-record, logged a minute ago
+	write(fmt.Sprintf("2,4,%d,-;Under-volt", usec(late))) // split mid-record, logged a while ago
 	evs, err := w.Read()
 	if err != nil || len(evs) != 1 || evs[0].Device != "mmcblk0" || evs[0].Partition != "mmcblk0p2" {
 		t.Fatalf("first read: %+v, %v", evs, err)
@@ -126,8 +129,8 @@ func TestKmsgWatcherOnFIFO(t *testing.T) {
 		t.Fatalf("a record split across writes: %+v, %v", evs, err)
 	}
 	// Read late (a paused monitor, a backlog), it keeps the time it was logged.
-	if d := time.Since(evs[0].At); d < 55*time.Second || d > 70*time.Second {
-		t.Errorf("a record logged a minute ago is dated %v ago", d)
+	if d := time.Since(evs[0].At); d < late-late/10 || d > late+10*time.Second {
+		t.Errorf("a record logged %v ago is dated %v ago", late, d)
 	}
 
 	// A writer that never ends its line cannot grow the carry buffer.
